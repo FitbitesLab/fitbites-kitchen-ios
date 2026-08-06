@@ -12,6 +12,7 @@ import UIKit
 import CoreText
 import UniformTypeIdentifiers
 import PhotosUI
+import Network
 
 private enum AppSection {
     case kitchen
@@ -21,6 +22,7 @@ private enum AppSection {
 struct ContentView: View {
     @StateObject private var store = KitchenStore()
     @StateObject private var posStore = POSStore()
+    @StateObject private var printStore = PrintBridgeStore()
     @Environment(\.scenePhase) private var scenePhase
     private let startsPolling: Bool
     @State private var selectedSection: AppSection = .kitchen
@@ -232,6 +234,7 @@ struct ContentView: View {
             .onAppear {
                 if startsPolling {
                     store.start()
+                    printStore.start()
                 }
             }
             .onChange(of: scenePhase) { _, phase in
@@ -239,8 +242,10 @@ struct ContentView: View {
 
                 if phase == .active {
                     store.start()
+                    printStore.start()
                 } else if phase == .background {
                     store.stopPolling()
+                    printStore.stop()
                 }
             }
             .sheet(item: $selectedOrder) { order in
@@ -308,7 +313,7 @@ struct ContentView: View {
                 Text("Are you sure you want to cancel \(order.orderNumber)? This removes it from the active kitchen rail.")
             }
             .sheet(isPresented: $settingsOpen) {
-                SettingsView(store: store, posStore: posStore)
+                SettingsView(store: store, posStore: posStore, printStore: printStore)
                     .presentationDetents([.large])
             }
             .sheet(isPresented: $isPOSCheckoutOpen) {
@@ -322,8 +327,11 @@ struct ContentView: View {
                     productImageURL: { product in
                         posStore.imageURL(for: product)
                     },
-                    submit: { paymentMethod, source, reference, customer, discountPercent, notes in
-                        await posStore.submitSale(
+                    defaultPrintReceipt: { source in
+                        printStore.enabledSources.allows(source.receiptSourceKey)
+                    },
+                    submit: { paymentMethod, source, reference, customer, discountPercent, notes, shouldPrintReceipt in
+                        guard let response = await posStore.submitSale(
                             baseURL: store.baseURL,
                             token: store.kitchenToken,
                             paymentMethod: paymentMethod,
@@ -332,7 +340,16 @@ struct ContentView: View {
                             customer: customer,
                             discountPercent: discountPercent,
                             notes: notes
-                        )
+                        ) else {
+                            return false
+                        }
+
+                        printStore.setPrintIntent(saleID: response.saleID, shouldPrint: shouldPrintReceipt)
+                        if shouldPrintReceipt {
+                            await printStore.printSaleReceiptNow(saleID: response.saleID)
+                        }
+
+                        return true
                     }
                 )
             }
@@ -457,6 +474,628 @@ private enum OnlineOrderAction: Identifiable {
             return nil
         case .decline:
             return .destructive
+        }
+    }
+}
+
+@MainActor
+final class PrintBridgeStore: ObservableObject {
+    @Published var serverURL = UserDefaults.standard.string(forKey: "PrintBridgeServerURL") ?? "https://app.fitbites.com.vn"
+    @Published var printToken = UserDefaults.standard.string(forKey: "PrintBridgeToken") ?? ""
+    @Published var printerHost = UserDefaults.standard.string(forKey: "PrintBridgePrinterHost") ?? "192.168.1.92"
+    @Published var printerPort = UserDefaults.standard.integer(forKey: "PrintBridgePrinterPort") == 0
+        ? 9100
+        : UserDefaults.standard.integer(forKey: "PrintBridgePrinterPort")
+    @Published var paperWidth = UserDefaults.standard.integer(forKey: "PrintBridgePaperWidth") == 0
+        ? 80
+        : UserDefaults.standard.integer(forKey: "PrintBridgePaperWidth")
+    @Published var autoPrint = UserDefaults.standard.bool(forKey: "PrintBridgeAutoPrint")
+    @Published var enabledSources = PrintSourceSelection.load()
+    @Published var isConnected = false
+    @Published var isPrinting = false
+    @Published var statusMessage = "Printer not checked yet."
+
+    private var pollTimer: Timer?
+    private var isPollInFlight = false
+    private var autoPrintArmedAt = UserDefaults.standard.object(forKey: "PrintBridgeAutoPrintArmedAt") as? Date ?? Date()
+    private var skippedSaleIDs = Set(UserDefaults.standard.array(forKey: "PrintBridgeSkippedSaleIDs") as? [Int] ?? [])
+    private var allowedSaleIDs = Set(UserDefaults.standard.array(forKey: "PrintBridgeAllowedSaleIDs") as? [Int] ?? [])
+
+    func saveSettings(
+        serverURL: String,
+        token: String,
+        host: String,
+        port: Int,
+        paperWidth: Int,
+        autoPrint: Bool,
+        enabledSources: PrintSourceSelection
+    ) {
+        let isTurningAutoPrintOn = !self.autoPrint && autoPrint
+        self.serverURL = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.printToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.printerHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.printerPort = max(1, port)
+        self.paperWidth = paperWidth == 58 ? 58 : 80
+        self.autoPrint = autoPrint
+        self.enabledSources = enabledSources
+
+        if isTurningAutoPrintOn {
+            autoPrintArmedAt = Date()
+            UserDefaults.standard.set(autoPrintArmedAt, forKey: "PrintBridgeAutoPrintArmedAt")
+        }
+
+        UserDefaults.standard.set(self.serverURL, forKey: "PrintBridgeServerURL")
+        UserDefaults.standard.set(self.printToken, forKey: "PrintBridgeToken")
+        UserDefaults.standard.set(self.printerHost, forKey: "PrintBridgePrinterHost")
+        UserDefaults.standard.set(self.printerPort, forKey: "PrintBridgePrinterPort")
+        UserDefaults.standard.set(self.paperWidth, forKey: "PrintBridgePaperWidth")
+        UserDefaults.standard.set(self.autoPrint, forKey: "PrintBridgeAutoPrint")
+        self.enabledSources.save()
+
+        statusMessage = self.autoPrint ? "Auto-print ready for new receipts." : "Auto-print off."
+        start()
+    }
+
+    func start() {
+        pollTimer?.invalidate()
+
+        guard autoPrint else {
+            isConnected = false
+            return
+        }
+
+        let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.pollOnce()
+            }
+        }
+
+        pollTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        Task { await pollOnce() }
+    }
+
+    func stop() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        isPollInFlight = false
+    }
+
+    func printTestReceipt() async {
+        guard validateSettings() else { return }
+
+        isPrinting = true
+        statusMessage = "Sending test receipt..."
+
+        do {
+            let receipt = PrintReceiptFormatter.testReceipt()
+            let data = PrintReceiptFormatter.format(receipt, paperWidth: paperWidth)
+            try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
+            isConnected = true
+            statusMessage = "Test receipt sent."
+            Haptics.notification(.success)
+        } catch {
+            isConnected = false
+            statusMessage = error.localizedDescription
+            Haptics.notification(.error)
+        }
+
+        isPrinting = false
+    }
+
+    func setPrintIntent(saleID: Int, shouldPrint: Bool) {
+        if shouldPrint {
+            skippedSaleIDs.remove(saleID)
+            allowedSaleIDs.insert(saleID)
+        } else {
+            allowedSaleIDs.remove(saleID)
+            skippedSaleIDs.insert(saleID)
+        }
+
+        UserDefaults.standard.set(Array(skippedSaleIDs), forKey: "PrintBridgeSkippedSaleIDs")
+        UserDefaults.standard.set(Array(allowedSaleIDs), forKey: "PrintBridgeAllowedSaleIDs")
+    }
+
+    func printSaleReceiptNow(saleID: Int) async {
+        guard validateSettings() else { return }
+
+        isPrinting = true
+        statusMessage = "Printing sale #\(saleID)..."
+
+        do {
+            let client = PrintJobAPIClient(baseURL: serverURL, token: printToken)
+            let lookup = try await client.fetchPendingJobWithRetry(saleID: saleID)
+
+            guard let job = lookup.job else {
+                isConnected = true
+                statusMessage = "Sale saved. No receipt job found yet."
+                isPrinting = false
+                return
+            }
+
+            let claimed = try await client.claim(jobID: job.id, bridgeName: "emberos-ipad-manual")
+            let data = PrintReceiptFormatter.format(claimed.job.payload, paperWidth: paperWidth)
+            try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
+            _ = try await client.markPrinted(jobID: job.id)
+            allowedSaleIDs.remove(saleID)
+            skippedSaleIDs.remove(saleID)
+            UserDefaults.standard.set(Array(skippedSaleIDs), forKey: "PrintBridgeSkippedSaleIDs")
+            UserDefaults.standard.set(Array(allowedSaleIDs), forKey: "PrintBridgeAllowedSaleIDs")
+            isConnected = true
+            statusMessage = "Printed sale #\(saleID)."
+            Haptics.notification(.success)
+        } catch {
+            isConnected = false
+            statusMessage = error.localizedDescription
+            Haptics.notification(.error)
+        }
+
+        isPrinting = false
+    }
+
+    func pollOnce() async {
+        guard autoPrint, validateSettings(silent: true), !isPollInFlight else {
+            return
+        }
+
+        isPollInFlight = true
+        isPrinting = true
+
+        do {
+            let client = PrintJobAPIClient(baseURL: serverURL, token: printToken)
+            let pending = try await client.fetchPendingJobs().jobs
+            let printableJobs = pending.filter { job in
+                guard let createdAt = job.createdAt else {
+                    return false
+                }
+
+                guard createdAt >= autoPrintArmedAt else {
+                    return false
+                }
+
+                if let saleID = job.saleID {
+                    if skippedSaleIDs.contains(saleID) {
+                        return false
+                    }
+
+                    if allowedSaleIDs.contains(saleID) {
+                        return true
+                    }
+                }
+
+                return enabledSources.allows(job.payload.receipt.orderSource)
+            }
+
+            guard let job = printableJobs.first else {
+                isConnected = true
+                statusMessage = pending.isEmpty
+                    ? "No receipt waiting."
+                    : "No selected source waiting."
+                isPrinting = false
+                isPollInFlight = false
+                return
+            }
+
+            let claimed = try await client.claim(jobID: job.id, bridgeName: "emberos-ipad")
+            let data = PrintReceiptFormatter.format(claimed.job.payload, paperWidth: paperWidth)
+            try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
+            _ = try await client.markPrinted(jobID: job.id)
+            if let saleID = job.saleID {
+                allowedSaleIDs.remove(saleID)
+                skippedSaleIDs.remove(saleID)
+                UserDefaults.standard.set(Array(skippedSaleIDs), forKey: "PrintBridgeSkippedSaleIDs")
+                UserDefaults.standard.set(Array(allowedSaleIDs), forKey: "PrintBridgeAllowedSaleIDs")
+            }
+            isConnected = true
+            statusMessage = "Printed receipt #\(job.id)."
+        } catch {
+            isConnected = false
+            statusMessage = error.localizedDescription
+        }
+
+        isPrinting = false
+        isPollInFlight = false
+    }
+
+    private func validateSettings(silent: Bool = false) -> Bool {
+        let isValid = !serverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !printToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !printerHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        if !isValid, !silent {
+            statusMessage = "Add server, print key, and printer IP."
+            Haptics.notification(.error)
+        }
+
+        return isValid
+    }
+}
+
+struct PrintJobAPIClient {
+    let baseURL: String
+    let token: String
+
+    func fetchPendingJobs() async throws -> PrintJobsResponse {
+        try await request(path: "/api/print-jobs/pending", method: "GET", body: Optional<PrintClaimRequest>.none)
+    }
+
+    func claim(jobID: Int, bridgeName: String) async throws -> PrintJobResponse {
+        try await request(path: "/api/print-jobs/\(jobID)/claim", method: "POST", body: PrintClaimRequest(claimedBy: bridgeName))
+    }
+
+    func markPrinted(jobID: Int) async throws -> PrintJobResponse {
+        try await request(path: "/api/print-jobs/\(jobID)/printed", method: "POST", body: Optional<PrintClaimRequest>.none)
+    }
+
+    func fetchPendingJob(saleID: Int) async throws -> PrintJobLookupResponse {
+        try await request(path: "/api/print-jobs/sale/\(saleID)/pending", method: "GET", body: Optional<PrintClaimRequest>.none)
+    }
+
+    func fetchPendingJobWithRetry(saleID: Int) async throws -> PrintJobLookupResponse {
+        var latestLookup = try await fetchPendingJob(saleID: saleID)
+        guard latestLookup.job == nil else {
+            return latestLookup
+        }
+
+        for _ in 0..<5 {
+            try await Task.sleep(nanoseconds: 450_000_000)
+            latestLookup = try await fetchPendingJob(saleID: saleID)
+            if latestLookup.job != nil {
+                return latestLookup
+            }
+        }
+
+        return latestLookup
+    }
+
+    private func request<Response: Decodable, Body: Encodable>(path: String, method: String, body: Body?) async throws -> Response {
+        guard let url = URL(string: baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + path) else {
+            throw KitchenAPIError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = 12
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONEncoder().encode(body)
+        }
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw KitchenAPIError.invalidResponse
+        }
+
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            if httpResponse.statusCode == 403 {
+                throw KitchenAPIError.unauthorized
+            }
+
+            throw KitchenAPIError.server(httpResponse.statusCode, path)
+        }
+
+        return try JSONDecoder.kitchen.decode(Response.self, from: data)
+    }
+}
+
+struct NetworkReceiptPrinter {
+    let host: String
+    let port: Int
+
+    func print(_ data: Data) async throws {
+        let connection = NWConnection(
+            host: NWEndpoint.Host(host),
+            port: NWEndpoint.Port(rawValue: UInt16(port)) ?? 9100,
+            using: .tcp
+        )
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                var didResume = false
+
+                func resume(_ result: Result<Void, Error>) {
+                    guard !didResume else { return }
+                    didResume = true
+                    connection.cancel()
+                    continuation.resume(with: result)
+                }
+
+                connection.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        connection.send(content: data, completion: .contentProcessed { error in
+                            if let error {
+                                resume(.failure(error))
+                            } else {
+                                resume(.success(()))
+                            }
+                        })
+                    case .failed(let error):
+                        resume(.failure(error))
+                    case .cancelled:
+                        break
+                    default:
+                        break
+                    }
+                }
+
+                connection.start(queue: .global(qos: .userInitiated))
+            }
+        } onCancel: {
+            connection.cancel()
+        }
+    }
+}
+
+enum PrintReceiptFormatter {
+    private static let esc = UInt8(0x1b)
+    private static let gs = UInt8(0x1d)
+    private static let lf = UInt8(0x0a)
+
+    static func format(_ payload: PrintReceiptPayload, paperWidth: Int) -> Data {
+        let columns = paperWidth == 58 ? 32 : 48
+        var data = Data()
+
+        append(&data, [esc, 0x40])
+        alignCenter(&data)
+        bold(&data, true)
+        appendLine(&data, "FITBITES")
+        bold(&data, false)
+        appendLine(&data, "Health has never tasted this wrong.")
+        appendLine(&data, payload.store.address)
+        blank(&data)
+        divider(&data, columns: columns, character: "=")
+        alignLeft(&data)
+        appendLine(&data, pair("Receipt no.", payload.receipt.number, columns: columns))
+        appendLine(&data, pair("Date / time", formattedDate(payload.receipt.date), columns: columns))
+        appendLine(&data, pair("Cashier", payload.receipt.cashier ?? "-", columns: columns))
+        appendLine(&data, pair("Payment", payload.receipt.paymentMethod.humanized, columns: columns))
+        divider(&data, columns: columns, character: "=")
+        blank(&data)
+
+        for item in payload.items {
+            wrappedAmountLines("\(item.quantity) x \(item.name)", amount: money(item.lineTotal), columns: columns).forEach {
+                appendLine(&data, $0)
+            }
+
+            for topping in item.toppings {
+                wrappedAmountLines("   + \(topping.name)", amount: money(topping.lineTotal), columns: columns).forEach {
+                    appendLine(&data, $0)
+                }
+            }
+
+            blank(&data)
+        }
+
+        divider(&data, columns: columns)
+        appendLine(&data, pair("Subtotal", money(payload.totals.subtotal), columns: columns))
+
+        if payload.totals.discount > 0 {
+            appendLine(&data, pair("Discount", "-\(money(payload.totals.discount))", columns: columns))
+        }
+
+        if payload.totals.deliveryFee > 0 {
+            appendLine(&data, pair("Delivery", money(payload.totals.deliveryFee), columns: columns))
+        }
+
+        divider(&data, columns: columns)
+        bold(&data, true)
+        appendLine(&data, pair("TOTAL", money(payload.totals.total), columns: columns))
+        bold(&data, false)
+
+        if let customer = payload.customer, customer.name != nil || customer.phone != nil {
+            divider(&data, columns: columns)
+            appendLine(&data, "Customer: \(customer.name ?? "-")")
+            if let phone = customer.phone {
+                appendLine(&data, "Phone: \(phone)")
+            }
+        }
+
+        if let notes = payload.notes, !notes.isEmpty {
+            divider(&data, columns: columns)
+            wrap("Notes: \(notes)", columns: columns).forEach { appendLine(&data, $0) }
+        }
+
+        blank(&data)
+        alignCenter(&data)
+        divider(&data, columns: min(columns, 32))
+        bold(&data, true)
+        appendLine(&data, "Thank you, my Fitbites.")
+        bold(&data, false)
+        appendLine(&data, "See you soon.")
+        blank(&data)
+        blank(&data)
+        append(&data, [gs, 0x56, 0x42, 0x00])
+
+        return data
+    }
+
+    static func testReceipt() -> PrintReceiptPayload {
+        PrintReceiptPayload(
+            store: PrintReceiptStore(name: "Fitbites", address: "iPad printer test"),
+            receipt: PrintReceiptInfo(
+                number: "IPAD-TEST",
+                saleID: nil,
+                date: ISO8601DateFormatter().string(from: Date()),
+                cashier: "emberOS iPad",
+                paymentMethod: "test",
+                orderSource: nil
+            ),
+            customer: nil,
+            items: [
+                PrintReceiptItem(
+                    name: "Hello World. This is Ember and Goblin talking to you now.",
+                    sku: nil,
+                    category: nil,
+                    quantity: 1,
+                    baseUnitPrice: 0,
+                    unitPrice: 0,
+                    lineTotal: 0,
+                    toppings: []
+                ),
+                PrintReceiptItem(
+                    name: "Good news, a brand new iOS Fitbites app is coming.",
+                    sku: nil,
+                    category: nil,
+                    quantity: 1,
+                    baseUnitPrice: 0,
+                    unitPrice: 0,
+                    lineTotal: 0,
+                    toppings: []
+                ),
+                PrintReceiptItem(
+                    name: "Be ready.",
+                    sku: nil,
+                    category: nil,
+                    quantity: 1,
+                    baseUnitPrice: 0,
+                    unitPrice: 0,
+                    lineTotal: 0,
+                    toppings: []
+                ),
+            ],
+            totals: PrintReceiptTotals(subtotal: 0, discount: 0, discountPercent: 0, deliveryFee: 0, total: 0),
+            notes: nil
+        )
+    }
+
+    private static func append(_ data: inout Data, _ bytes: [UInt8]) {
+        data.append(contentsOf: bytes)
+    }
+
+    private static func appendLine(_ data: inout Data, _ text: String) {
+        data.append(Data(printerText(text).utf8))
+        data.append(lf)
+    }
+
+    private static func blank(_ data: inout Data) {
+        appendLine(&data, "")
+    }
+
+    private static func alignLeft(_ data: inout Data) {
+        append(&data, [esc, 0x61, 0x00])
+    }
+
+    private static func alignCenter(_ data: inout Data) {
+        append(&data, [esc, 0x61, 0x01])
+    }
+
+    private static func bold(_ data: inout Data, _ isOn: Bool) {
+        append(&data, [esc, 0x45, isOn ? 0x01 : 0x00])
+    }
+
+    private static func divider(_ data: inout Data, columns: Int, character: Character = "-") {
+        appendLine(&data, String(repeating: String(character), count: columns))
+    }
+
+    private static func pair(_ left: String, _ right: String, columns: Int) -> String {
+        let leftText = printerText(left)
+        let rightText = printerText(right)
+        let spaces = max(1, columns - leftText.count - rightText.count)
+        return leftText + String(repeating: " ", count: spaces) + rightText
+    }
+
+    private static func wrappedAmountLines(_ left: String, amount: String, columns: Int) -> [String] {
+        let amountWidth = amount.count
+        let textWidth = max(8, columns - amountWidth - 1)
+        let wrapped = wrap(left, columns: textWidth)
+
+        guard let first = wrapped.first else {
+            return [pair(left, amount, columns: columns)]
+        }
+
+        return [pair(first, amount, columns: columns)] + wrapped.dropFirst()
+    }
+
+    private static func wrap(_ value: String, columns: Int) -> [String] {
+        let words = printerText(value).split(separator: " ").map(String.init)
+        var lines: [String] = []
+        var current = ""
+
+        for word in words {
+            if current.isEmpty {
+                current = word
+            } else if current.count + 1 + word.count <= columns {
+                current += " " + word
+            } else {
+                lines.append(current)
+                current = word
+            }
+        }
+
+        if !current.isEmpty {
+            lines.append(current)
+        }
+
+        return lines.isEmpty ? [""] : lines
+    }
+
+    private static func money(_ value: Double) -> String {
+        "\(Int(value).formatted()) VND"
+    }
+
+    private static func formattedDate(_ value: String?) -> String {
+        guard let value, let date = ISO8601DateFormatter().date(from: value) else {
+            return value ?? "-"
+        }
+
+        return date.formatted(date: .numeric, time: .shortened)
+    }
+
+    private static func printerText(_ value: String) -> String {
+        value
+            .folding(options: .diacriticInsensitive, locale: .current)
+            .unicodeScalars
+            .filter { scalar in
+                scalar.isASCII && scalar.value >= 0x20 && scalar.value <= 0x7e
+            }
+            .map(String.init)
+            .joined()
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    }
+}
+
+struct PrintSourceSelection: Equatable {
+    var store: Bool = true
+    var website: Bool = true
+    var grab: Bool = false
+    var shopee: Bool = false
+
+    static func load() -> PrintSourceSelection {
+        if UserDefaults.standard.object(forKey: "PrintSourceStore") == nil {
+            return PrintSourceSelection()
+        }
+
+        return PrintSourceSelection(
+            store: UserDefaults.standard.bool(forKey: "PrintSourceStore"),
+            website: UserDefaults.standard.bool(forKey: "PrintSourceWebsite"),
+            grab: UserDefaults.standard.bool(forKey: "PrintSourceGrab"),
+            shopee: UserDefaults.standard.bool(forKey: "PrintSourceShopee")
+        )
+    }
+
+    func save() {
+        UserDefaults.standard.set(store, forKey: "PrintSourceStore")
+        UserDefaults.standard.set(website, forKey: "PrintSourceWebsite")
+        UserDefaults.standard.set(grab, forKey: "PrintSourceGrab")
+        UserDefaults.standard.set(shopee, forKey: "PrintSourceShopee")
+    }
+
+    func allows(_ source: String?) -> Bool {
+        switch (source ?? "pos").lowercased() {
+        case "pos", "store", "in_store":
+            return store
+        case "online_in_store", "online_pickup", "online_delivery", "website":
+            return website
+        case "grabfood", "grab":
+            return grab
+        case "shopeefood", "shopee":
+            return shopee
+        default:
+            return store
         }
     }
 }
@@ -831,10 +1470,10 @@ final class POSStore: ObservableObject {
         customer: POSCustomer?,
         discountPercent: Double,
         notes: String
-    ) async -> Bool {
+    ) async -> POSCreateSaleResponse? {
         guard !cartLines.isEmpty else {
             errorMessage = "Add at least one product before checkout."
-            return false
+            return nil
         }
 
         isSubmitting = true
@@ -867,13 +1506,13 @@ final class POSStore: ObservableObject {
             }
             Haptics.notification(.success)
             isSubmitting = false
-            return true
+            return response
         } catch {
             errorMessage = error.localizedDescription
             isConnected = false
             Haptics.notification(.error)
             isSubmitting = false
-            return false
+            return nil
         }
     }
 
@@ -4024,7 +4663,8 @@ private struct POSCheckoutSheet: View {
     let isSubmitting: Bool
     let accentColor: Color
     let productImageURL: (POSProduct) -> URL?
-    let submit: (POSPaymentMethod, POSOrderSource, String, POSCustomer?, Double, String) async -> Bool
+    let defaultPrintReceipt: (POSOrderSource) -> Bool
+    let submit: (POSPaymentMethod, POSOrderSource, String, POSCustomer?, Double, String, Bool) async -> Bool
     @Environment(\.dismiss) private var dismiss
     @State private var paymentMethod: POSPaymentMethod = .cash
     @State private var orderSource: POSOrderSource = .inStore
@@ -4032,6 +4672,7 @@ private struct POSCheckoutSheet: View {
     @State private var discountPercent = ""
     @State private var notes = ""
     @State private var selectedCustomer: POSCustomer?
+    @State private var shouldPrintReceipt = true
     @State private var customerSearch = ""
     @State private var customerResults: [POSCustomer] = []
     @State private var customerError: String?
@@ -4066,6 +4707,7 @@ private struct POSCheckoutSheet: View {
                         recapSection
                         customerSection
                         sourceSelector
+                        printReceiptSection
 
                         if orderSource != .inStore {
                             VStack(alignment: .leading, spacing: 8) {
@@ -4115,7 +4757,8 @@ private struct POSCheckoutSheet: View {
                                 externalReference,
                                 selectedCustomer,
                                 parsedDiscountPercent,
-                                notes
+                                notes,
+                                shouldPrintReceipt
                             )
                             if didSubmit {
                                 dismiss()
@@ -4160,6 +4803,11 @@ private struct POSCheckoutSheet: View {
                 } else {
                     paymentMethod = .cash
                 }
+
+                shouldPrintReceipt = defaultPrintReceipt(newSource)
+            }
+            .onAppear {
+                shouldPrintReceipt = defaultPrintReceipt(orderSource)
             }
         }
     }
@@ -4192,6 +4840,60 @@ private struct POSCheckoutSheet: View {
                 sourcePill(.shopeefood)
             }
         }
+    }
+
+    private var printReceiptSection: some View {
+        Button {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                shouldPrintReceipt.toggle()
+            }
+            Haptics.selectionChanged()
+        } label: {
+            HStack(spacing: 13) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(shouldPrintReceipt ? accentColor.opacity(0.14) : AppPalette.card)
+                        .frame(width: 42, height: 42)
+
+                    Image(systemName: shouldPrintReceipt ? "printer.fill" : "printer.slash")
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(shouldPrintReceipt ? accentColor : AppPalette.muted)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("PRINT RECEIPT")
+                        .font(GlacialFont.subheadline(.semibold))
+                        .tracking(1.6)
+                        .foregroundStyle(AppPalette.ink)
+
+                    Text(shouldPrintReceipt ? "Receipt will print after complete." : "No receipt for this sale.")
+                        .font(GlacialFont.caption())
+                        .foregroundStyle(AppPalette.muted)
+                }
+
+                Spacer()
+
+                ZStack(alignment: shouldPrintReceipt ? .trailing : .leading) {
+                    Capsule()
+                        .fill(shouldPrintReceipt ? accentColor.opacity(0.24) : AppPalette.line.opacity(0.65))
+                        .frame(width: 52, height: 30)
+
+                    Circle()
+                        .fill(shouldPrintReceipt ? accentColor : .white)
+                        .frame(width: 24, height: 24)
+                        .shadow(color: .black.opacity(0.14), radius: 4, y: 2)
+                        .padding(3)
+                }
+                .frame(width: 52, height: 30)
+            }
+            .padding(13)
+            .background(.white, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(shouldPrintReceipt ? accentColor.opacity(0.42) : AppPalette.line.opacity(0.75), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private var paymentSelector: some View {
@@ -5245,13 +5947,25 @@ private struct POSRecapEmptyLine: View {
 private struct SettingsView: View {
     @ObservedObject var store: KitchenStore
     @ObservedObject var posStore: POSStore
+    @ObservedObject var printStore: PrintBridgeStore
     @Environment(\.dismiss) private var dismiss
     @AppStorage("POSProductDisplayStyle") private var posProductDisplayStyleRaw = POSProductDisplayStyle.productCard.rawValue
     @AppStorage("POSAccentColor") private var posAccentColorRaw = POSAccentColor.ember.rawValue
     @State private var baseURL: String = ""
     @State private var token: String = ""
+    @State private var printServerURL: String = ""
+    @State private var printToken: String = ""
+    @State private var printerHost: String = ""
+    @State private var printerPort: String = "9100"
+    @State private var printerPaperWidth: String = "80"
+    @State private var autoPrint = false
+    @State private var printStoreSource = true
+    @State private var printWebsiteSource = true
+    @State private var printGrabSource = false
+    @State private var printShopeeSource = false
     @State private var previewTone: KitchenChimeTone?
     @State private var connectionOpen = false
+    @State private var printOpen = false
     @State private var soundOpen = false
     @State private var displayOpen = false
     @State private var catalogOpen = false
@@ -5320,6 +6034,113 @@ private struct SettingsView: View {
                             .foregroundStyle(AppPalette.red)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.vertical, 12)
+                        }
+                    }
+
+                    SettingsDisclosureCard(
+                        title: "Print",
+                        subtitle: printStore.autoPrint ? "Auto-print on · \(printStore.printerHost)" : "Auto-print off · \(printStore.printerHost)",
+                        icon: "printer",
+                        isExpanded: $printOpen,
+                        accentColor: selectedPOSAccentColor.color
+                    ) {
+                        VStack(spacing: 0) {
+                            SettingsTextFieldRow(title: "Server URL", text: $printServerURL, isSecure: false)
+                            SettingsDivider()
+                            SettingsTextFieldRow(title: "Print Key", text: $printToken, isSecure: true)
+                            SettingsDivider()
+                            SettingsTextFieldRow(title: "Printer IP", text: $printerHost, isSecure: false)
+                            SettingsDivider()
+
+                            HStack(spacing: 12) {
+                                SettingsCompactTextField(title: "Port", text: $printerPort, keyboard: .numberPad)
+                                SettingsCompactTextField(title: "Paper", text: $printerPaperWidth, keyboard: .numberPad)
+                            }
+                            .padding(.vertical, 12)
+
+                            SettingsDivider()
+
+                            Toggle(isOn: $autoPrint) {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "bolt.badge.automatic")
+                                        .font(.headline.weight(.semibold))
+                                        .foregroundStyle(selectedPOSAccentColor.color)
+                                        .frame(width: 28)
+
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("Auto-print")
+                                            .font(GlacialFont.body(.semibold))
+                                            .foregroundStyle(AppPalette.ink)
+
+                                        Text("Print receipt jobs when this iPad is open.")
+                                            .font(GlacialFont.caption())
+                                            .foregroundStyle(AppPalette.muted)
+                                    }
+                                }
+                            }
+                            .tint(selectedPOSAccentColor.color)
+                            .padding(.vertical, 12)
+
+                            SettingsDivider()
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("PRINT SOURCES")
+                                    .font(GlacialFont.caption(.bold))
+                                    .tracking(1.8)
+                                    .foregroundStyle(AppPalette.muted)
+
+                                VStack(spacing: 0) {
+                                    PrintSourceToggleRow(title: "STORE", subtitle: "Native POS and counter sales", isOn: $printStoreSource, accentColor: selectedPOSAccentColor.color)
+                                    SettingsDivider()
+                                    PrintSourceToggleRow(title: "WEBSITE", subtitle: "Online pickup and delivery", isOn: $printWebsiteSource, accentColor: selectedPOSAccentColor.color)
+                                    SettingsDivider()
+                                    PrintSourceToggleRow(title: "GRAB", subtitle: "Marketplace orders", isOn: $printGrabSource, accentColor: selectedPOSAccentColor.color)
+                                    SettingsDivider()
+                                    PrintSourceToggleRow(title: "SHOPEE", subtitle: "Marketplace orders", isOn: $printShopeeSource, accentColor: selectedPOSAccentColor.color)
+                                }
+                            }
+                            .padding(.vertical, 12)
+
+                            SettingsDivider()
+
+                            HStack(spacing: 12) {
+                                Image(systemName: printStore.isConnected ? "checkmark.circle" : "exclamationmark.triangle")
+                                    .font(.headline.weight(.semibold))
+                                    .foregroundStyle(printStore.isConnected ? AppPalette.green : AppPalette.red)
+
+                                Text(printStore.statusMessage)
+                                    .font(GlacialFont.caption(.semibold))
+                                    .foregroundStyle(AppPalette.muted)
+                                    .lineLimit(2)
+
+                                Spacer()
+                            }
+                            .padding(.vertical, 12)
+
+                            Button {
+                                savePrintSettings()
+                                Task { await printStore.printTestReceipt() }
+                            } label: {
+                                HStack(spacing: 10) {
+                                    if printStore.isPrinting {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                            .tint(.white)
+                                    } else {
+                                        Image(systemName: "printer.filled.and.paper")
+                                    }
+
+                                    Text("TEST PRINT")
+                                        .tracking(1.8)
+                                }
+                                .font(GlacialFont.caption(.bold))
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 13)
+                                .background(selectedPOSAccentColor.color, in: RoundedRectangle(cornerRadius: 8))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(printStore.isPrinting)
                         }
                     }
 
@@ -5434,6 +6255,7 @@ private struct SettingsView: View {
 
                     Button {
                         store.saveSettings(baseURL: baseURL, token: token)
+                        savePrintSettings()
                         dismiss()
                     } label: {
                         Text("SAVE")
@@ -5463,8 +6285,35 @@ private struct SettingsView: View {
             .onAppear {
                 baseURL = store.baseURL
                 token = store.kitchenToken
+                printServerURL = printStore.serverURL
+                printToken = printStore.printToken
+                printerHost = printStore.printerHost
+                printerPort = "\(printStore.printerPort)"
+                printerPaperWidth = "\(printStore.paperWidth)"
+                autoPrint = printStore.autoPrint
+                printStoreSource = printStore.enabledSources.store
+                printWebsiteSource = printStore.enabledSources.website
+                printGrabSource = printStore.enabledSources.grab
+                printShopeeSource = printStore.enabledSources.shopee
             }
         }
+    }
+
+    private func savePrintSettings() {
+        printStore.saveSettings(
+            serverURL: printServerURL,
+            token: printToken,
+            host: printerHost,
+            port: Int(printerPort) ?? 9100,
+            paperWidth: Int(printerPaperWidth) ?? 80,
+            autoPrint: autoPrint,
+            enabledSources: PrintSourceSelection(
+                store: printStoreSource,
+                website: printWebsiteSource,
+                grab: printGrabSource,
+                shopee: printShopeeSource
+            )
+        )
     }
 }
 
@@ -5560,6 +6409,82 @@ private struct SettingsTextFieldRow: View {
             }
         }
         .padding(.vertical, 12)
+    }
+}
+
+private struct SettingsCompactTextField: View {
+    let title: String
+    @Binding var text: String
+    let keyboard: UIKeyboardType
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title)
+                .font(GlacialFont.caption(.bold))
+                .tracking(1.4)
+                .foregroundStyle(AppPalette.muted)
+
+            TextField(title, text: $text)
+                .font(GlacialFont.subheadline(.semibold))
+                .foregroundStyle(AppPalette.ink)
+                .keyboardType(keyboard)
+                .textInputAutocapitalization(.never)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct PrintSourceToggleRow: View {
+    let title: String
+    let subtitle: String
+    @Binding var isOn: Bool
+    let accentColor: Color
+
+    var body: some View {
+        Toggle(isOn: $isOn) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(accentColor)
+                    .frame(width: 30, height: 30)
+                    .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(GlacialFont.subheadline(.semibold))
+                        .tracking(1.2)
+                        .foregroundStyle(AppPalette.ink)
+
+                    Text(subtitle)
+                        .font(GlacialFont.caption())
+                        .foregroundStyle(AppPalette.muted)
+                }
+            }
+        }
+        .tint(accentColor)
+        .padding(.vertical, 11)
+    }
+
+    private var icon: String {
+        switch title {
+        case "STORE":
+            return "cart"
+        case "WEBSITE":
+            return "globe"
+        case "GRAB":
+            return "bag"
+        case "SHOPEE":
+            return "shippingbox"
+        default:
+            return "printer"
+        }
     }
 }
 
@@ -6098,6 +7023,17 @@ enum POSOrderSource: String, CaseIterable, Identifiable {
             return "Shopee"
         }
     }
+
+    var receiptSourceKey: String {
+        switch self {
+        case .inStore:
+            return "pos"
+        case .grabfood:
+            return "grabfood"
+        case .shopeefood:
+            return "shopeefood"
+        }
+    }
 }
 
 enum POSPaymentMethod: String, CaseIterable, Identifiable {
@@ -6207,6 +7143,136 @@ struct POSCreateSaleResponse: Decodable {
         case message
         case saleID = "sale_id"
         case alreadyProcessed = "already_processed"
+    }
+}
+
+struct PrintJobsResponse: Decodable {
+    let jobs: [PrintJob]
+}
+
+struct PrintJobResponse: Decodable {
+    let job: PrintJob
+}
+
+struct PrintJobLookupResponse: Decodable {
+    let job: PrintJob?
+}
+
+struct PrintClaimRequest: Encodable {
+    let claimedBy: String
+
+    enum CodingKeys: String, CodingKey {
+        case claimedBy = "claimed_by"
+    }
+}
+
+struct PrintJob: Identifiable, Decodable {
+    let id: Int
+    let saleID: Int?
+    let status: String
+    let payload: PrintReceiptPayload
+    let createdAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case saleID = "sale_id"
+        case status
+        case payload
+        case createdAt = "created_at"
+    }
+}
+
+struct PrintReceiptPayload: Decodable {
+    let store: PrintReceiptStore
+    let receipt: PrintReceiptInfo
+    let customer: PrintReceiptCustomer?
+    let items: [PrintReceiptItem]
+    let totals: PrintReceiptTotals
+    let notes: String?
+}
+
+struct PrintReceiptStore: Decodable {
+    let name: String
+    let address: String
+}
+
+struct PrintReceiptInfo: Decodable {
+    let number: String
+    let saleID: Int?
+    let date: String?
+    let cashier: String?
+    let paymentMethod: String
+    let orderSource: String?
+
+    enum CodingKeys: String, CodingKey {
+        case number
+        case saleID = "sale_id"
+        case date
+        case cashier
+        case paymentMethod = "payment_method"
+        case orderSource = "order_source"
+    }
+}
+
+struct PrintReceiptCustomer: Decodable {
+    let id: Int?
+    let name: String?
+    let phone: String?
+}
+
+struct PrintReceiptItem: Decodable {
+    let name: String
+    let sku: String?
+    let category: String?
+    let quantity: Int
+    let baseUnitPrice: Double
+    let unitPrice: Double
+    let lineTotal: Double
+    let toppings: [PrintReceiptTopping]
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case sku
+        case category
+        case quantity
+        case baseUnitPrice = "base_unit_price"
+        case unitPrice = "unit_price"
+        case lineTotal = "line_total"
+        case toppings
+    }
+}
+
+struct PrintReceiptTopping: Decodable {
+    let name: String
+    let sku: String?
+    let category: String?
+    let quantity: Int
+    let unitPrice: Double
+    let lineTotal: Double
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case sku
+        case category
+        case quantity
+        case unitPrice = "unit_price"
+        case lineTotal = "line_total"
+    }
+}
+
+struct PrintReceiptTotals: Decodable {
+    let subtotal: Double
+    let discount: Double
+    let discountPercent: Double
+    let deliveryFee: Double
+    let total: Double
+
+    enum CodingKeys: String, CodingKey {
+        case subtotal
+        case discount
+        case discountPercent = "discount_percent"
+        case deliveryFee = "delivery_fee"
+        case total
     }
 }
 
@@ -6712,6 +7778,17 @@ private extension JSONDecoder {
 private extension Double {
     var currencyText: String {
         "\(Int(self).formatted()) VND"
+    }
+}
+
+private extension String {
+    var humanized: String {
+        replacingOccurrences(of: "_", with: " ")
+            .split(separator: " ")
+            .map { word in
+                word.prefix(1).uppercased() + word.dropFirst().lowercased()
+            }
+            .joined(separator: " ")
     }
 }
 
