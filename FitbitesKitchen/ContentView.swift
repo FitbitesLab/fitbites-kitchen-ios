@@ -10,6 +10,8 @@ import Combine
 import AVFoundation
 import UIKit
 import CoreText
+import UniformTypeIdentifiers
+import PhotosUI
 
 private enum AppSection {
     case kitchen
@@ -19,6 +21,7 @@ private enum AppSection {
 struct ContentView: View {
     @StateObject private var store = KitchenStore()
     @StateObject private var posStore = POSStore()
+    @Environment(\.scenePhase) private var scenePhase
     private let startsPolling: Bool
     @State private var selectedSection: AppSection = .kitchen
     @State private var selectedStatus: KitchenStatus? = nil
@@ -27,6 +30,14 @@ struct ContentView: View {
     @State private var pendingOnlineOrderAction: OnlineOrderAction?
     @State private var pendingKitchenCancelOrder: KitchenOrder?
     @State private var settingsOpen = false
+    @State private var isPOSShiftMenuOpen = false
+    @State private var isPOSStartShiftOpen = false
+    @State private var posCashMovementType: POSCashMovementType?
+    @State private var isPOSEndShiftOpen = false
+    @State private var isPOSCheckoutOpen = false
+    @State private var isPOSRecapOpen = false
+    @AppStorage("POSProductDisplayStyle") private var posProductDisplayStyleRaw = POSProductDisplayStyle.productCard.rawValue
+    @AppStorage("POSAccentColor") private var posAccentColorRaw = POSAccentColor.ember.rawValue
     @Namespace private var filterSelectionNamespace
 
     init(startsPolling: Bool = true) {
@@ -48,27 +59,27 @@ struct ContentView: View {
     }
 
     private var visibleOnlineOrders: [KitchenOnlineOrder] {
-        guard selectedSource == nil || selectedSource == .website else {
-            return []
-        }
-
-        guard selectedStatus == nil || selectedStatus == .pending else {
-            return []
-        }
-
         return store.onlineOrders
     }
 
     private var showsOnlineOrders: Bool {
-        selectedSource == nil || selectedSource == .website
-            ? selectedStatus == nil || selectedStatus == .pending
-            : false
+        true
+    }
+
+    private var selectedPOSAccentColor: POSAccentColor {
+        POSAccentColor(rawValue: posAccentColorRaw) ?? .ember
     }
 
     var body: some View {
         NavigationStack {
             ZStack(alignment: .top) {
                 AppPalette.background.ignoresSafeArea()
+
+                if selectedSection == .pos {
+                    POSProductAreaWallpaper()
+                        .ignoresSafeArea()
+                        .transition(.opacity)
+                }
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
@@ -77,17 +88,22 @@ struct ContentView: View {
                             readyCount: selectedSection == .kitchen ? store.summary.ready : posStore.categoryCount,
                             oldestMinutes: selectedSection == .kitchen ? store.oldestElapsedMinutes : nil,
                             isConnected: selectedSection == .kitchen ? store.isConnected : posStore.isConnected,
-                            section: selectedSection
+                            section: selectedSection,
+                            cartItemCount: posStore.cartItemCount,
+                            cartTotal: posStore.cartTotal,
+                            posAccentColor: selectedPOSAccentColor.color,
+                            onCart: { isPOSCheckoutOpen = true }
                         )
 
                         if selectedSection == .kitchen {
-                            MetricsStrip(summary: store.summary)
+                            MetricsStrip(summary: store.summary, accentColor: selectedPOSAccentColor.color)
 
                             FilterBar(
                                 selectedSource: $selectedSource,
                                 selectedStatus: $selectedStatus,
                                 sources: store.availableSources,
-                                namespace: filterSelectionNamespace
+                                namespace: filterSelectionNamespace,
+                                accentColor: selectedPOSAccentColor.color
                             )
 
                             if let message = store.errorMessage {
@@ -99,6 +115,7 @@ struct ContentView: View {
                             if showsOnlineOrders {
                                 OnlineOrderReviewSection(
                                     orders: visibleOnlineOrders,
+                                    accentColor: selectedPOSAccentColor.color,
                                     onAccept: { order in
                                         pendingOnlineOrderAction = .accept(order)
                                     },
@@ -112,13 +129,21 @@ struct ContentView: View {
                                 orders: filteredOrders,
                                 isInitialLoading: store.isInitialLoading,
                                 isRefreshing: store.isRefreshing,
+                                accentColor: selectedPOSAccentColor.color,
                                 onSelect: { selectedOrder = $0 },
                                 onStatus: { order, status in
                                     handleStatus(order: order, status: status)
                                 }
                             )
                         } else {
-                            POSDashboardView(store: posStore, baseURL: store.baseURL, token: store.kitchenToken)
+                            POSDashboardView(
+                                store: posStore,
+                                baseURL: store.baseURL,
+                                token: store.kitchenToken,
+                                displayStyle: POSProductDisplayStyle(rawValue: posProductDisplayStyleRaw) ?? .productCard,
+                                accentColor: selectedPOSAccentColor.color,
+                                isCheckoutOpen: $isPOSCheckoutOpen
+                            )
                         }
                     }
                     .padding(.horizontal, 18)
@@ -133,41 +158,70 @@ struct ContentView: View {
                     }
                 }
 
-                Menu {
-                    Button {
+                if let message = store.notificationMessage {
+                    InAppOrderNotification(message: message, accentColor: selectedPOSAccentColor.color) {
                         selectedSection = .kitchen
                         selectedSource = nil
                         selectedStatus = nil
-                        Task { await store.refresh(forceChime: false) }
-                    } label: {
-                        Label("Home", systemImage: "house")
+                        store.notificationMessage = nil
                     }
-
-                    Button {
-                        selectedSection = .pos
-                        Task { await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken) }
-                    } label: {
-                        Label("POS", systemImage: "cart")
-                    }
-
-                    Button {
-                        settingsOpen = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
-                    }
-                } label: {
-                    VStack(alignment: .center, spacing: 4) {
-                        Capsule()
-                            .frame(width: 16, height: 1.5)
-                        Capsule()
-                            .frame(width: 10, height: 1.5)
-                        Capsule()
-                            .frame(width: 16, height: 1.5)
-                    }
-                    .foregroundStyle(AppPalette.ink)
-                    .frame(width: 30, height: 30)
+                    .padding(.top, 18)
+                    .frame(maxWidth: .infinity, alignment: .top)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(3)
                 }
-                .buttonStyle(.plain)
+
+                HStack(spacing: 14) {
+                    if selectedSection == .pos, let bootstrap = posStore.bootstrap {
+                        POSOperatorButton(
+                            operator: bootstrap.operator,
+                            shift: bootstrap.shift,
+                            isSubmitting: posStore.isShiftSubmitting
+                        ) {
+                            isPOSShiftMenuOpen = true
+                        }
+                    }
+
+                    Menu {
+                        Button {
+                            selectedSection = .kitchen
+                            selectedSource = nil
+                            selectedStatus = nil
+                            Task { await store.refresh(forceChime: false) }
+                        } label: {
+                            MenuBadgeLabel(
+                                title: "Kitchen",
+                                systemImage: "house",
+                                count: store.waitingOnlineOrderCount,
+                                accentColor: selectedPOSAccentColor.color
+                            )
+                        }
+
+                        Button {
+                            selectedSection = .pos
+                            Task { await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken) }
+                        } label: {
+                            Label("POS", systemImage: "cart")
+                        }
+
+                        Button {
+                            selectedSection = .pos
+                            isPOSRecapOpen = true
+                            Task { await posStore.refreshRecap(baseURL: store.baseURL, token: store.kitchenToken) }
+                        } label: {
+                            Label("Recap", systemImage: "chart.bar.xaxis")
+                        }
+
+                        Button {
+                            settingsOpen = true
+                        } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
+                    } label: {
+                        TopMenuIcon(badgeCount: store.waitingOnlineOrderCount, accentColor: selectedPOSAccentColor.color)
+                    }
+                    .buttonStyle(.plain)
+                }
                 .padding(.top, 18)
                 .padding(.trailing, 22)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
@@ -175,15 +229,19 @@ struct ContentView: View {
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(.hidden, for: .navigationBar)
-            .task {
+            .onAppear {
                 if startsPolling {
                     store.start()
                 }
-
-                await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken)
             }
-            .onDisappear {
-                store.stop()
+            .onChange(of: scenePhase) { _, phase in
+                guard startsPolling else { return }
+
+                if phase == .active {
+                    store.start()
+                } else if phase == .background {
+                    store.stopPolling()
+                }
             }
             .sheet(item: $selectedOrder) { order in
                 OrderDetailView(order: order) { status in
@@ -250,8 +308,89 @@ struct ContentView: View {
                 Text("Are you sure you want to cancel \(order.orderNumber)? This removes it from the active kitchen rail.")
             }
             .sheet(isPresented: $settingsOpen) {
-                SettingsView(store: store)
-                    .presentationDetents([.medium])
+                SettingsView(store: store, posStore: posStore)
+                    .presentationDetents([.large])
+            }
+            .sheet(isPresented: $isPOSCheckoutOpen) {
+                POSCheckoutSheet(
+                    lines: posStore.cartLines,
+                    total: posStore.cartTotal,
+                    baseURL: store.baseURL,
+                    token: store.kitchenToken,
+                    isSubmitting: posStore.isSubmitting,
+                    accentColor: selectedPOSAccentColor.color,
+                    productImageURL: { product in
+                        posStore.imageURL(for: product)
+                    },
+                    submit: { paymentMethod, source, reference, customer, discountPercent, notes in
+                        await posStore.submitSale(
+                            baseURL: store.baseURL,
+                            token: store.kitchenToken,
+                            paymentMethod: paymentMethod,
+                            orderSource: source,
+                            externalReference: reference,
+                            customer: customer,
+                            discountPercent: discountPercent,
+                            notes: notes
+                        )
+                    }
+                )
+            }
+            .sheet(isPresented: $isPOSRecapOpen) {
+                POSRecapSheet(
+                    recap: posStore.recap,
+                    isLoading: posStore.isRecapLoading,
+                    errorMessage: posStore.recapErrorMessage,
+                    accentColor: selectedPOSAccentColor.color
+                ) {
+                    Task { await posStore.refreshRecap(baseURL: store.baseURL, token: store.kitchenToken) }
+                }
+                .presentationDetents([.large])
+            }
+            .sheet(isPresented: $isPOSShiftMenuOpen) {
+                if let bootstrap = posStore.bootstrap {
+                    POSShiftControlSheet(
+                        operator: bootstrap.operator,
+                        shift: bootstrap.shift,
+                        isSubmitting: posStore.isShiftSubmitting,
+                        accentColor: selectedPOSAccentColor.color,
+                        onOpenShift: {
+                            isPOSShiftMenuOpen = false
+                            isPOSStartShiftOpen = true
+                        },
+                        onCashIn: {
+                            isPOSShiftMenuOpen = false
+                            posCashMovementType = .deposit
+                        },
+                        onCashOut: {
+                            isPOSShiftMenuOpen = false
+                            posCashMovementType = .withdrawal
+                        },
+                        onCloseShift: {
+                            isPOSShiftMenuOpen = false
+                            isPOSEndShiftOpen = true
+                        }
+                    )
+                }
+            }
+            .sheet(isPresented: $isPOSStartShiftOpen) {
+                POSStartShiftSheet(isSubmitting: posStore.isShiftSubmitting, accentColor: selectedPOSAccentColor.color) { openingCash, notes in
+                    await posStore.startShift(baseURL: store.baseURL, token: store.kitchenToken, openingCash: openingCash, notes: notes)
+                }
+            }
+            .sheet(item: $posCashMovementType) { type in
+                POSCashMovementSheet(type: type, isSubmitting: posStore.isShiftSubmitting, accentColor: selectedPOSAccentColor.color) { amount, reason in
+                    await posStore.recordCashMovement(baseURL: store.baseURL, token: store.kitchenToken, type: type, amount: amount, reason: reason)
+                }
+            }
+            .sheet(isPresented: $isPOSEndShiftOpen) {
+                POSEndShiftSheet(
+                    expectedCash: posStore.bootstrap?.shift.recap?.expectedCash,
+                    isSubmitting: posStore.isShiftSubmitting,
+                    accentColor: selectedPOSAccentColor.color
+                ) { closingCash, notes in
+                    await posStore.endShift(baseURL: store.baseURL, token: store.kitchenToken, closingCash: closingCash, notes: notes)
+                }
             }
         }
         .onAppear {
@@ -331,18 +470,21 @@ final class KitchenStore: ObservableObject {
     @Published var isRefreshing = false
     @Published var isConnected = false
     @Published var errorMessage: String?
+    @Published var notificationMessage: String?
     @Published var baseURL = UserDefaults.standard.string(forKey: "KitchenBaseURL") ?? "http://127.0.0.1:8000"
     @Published var kitchenToken = UserDefaults.standard.string(forKey: "KitchenToken") ?? ""
     @Published var chimeTone = KitchenChimeTone(
         rawValue: UserDefaults.standard.string(forKey: "KitchenChimeTone") ?? ""
     ) ?? .fitbites
 
-    private var pollTask: Task<Void, Never>?
-    private var refreshTask: Task<Void, Never>?
+    private var pollTimer: Timer?
+    private var isRefreshInFlight = false
     private var knownOrderIDs = Set<Int>()
     private var knownOnlineOrderIDs = Set<Int>()
+    private var alertedOnlineOrderIDs = Set<Int>()
     private var hasLoadedOnce = false
     private var alertingOrderIDs = Set<Int>()
+    private var notificationTask: Task<Void, Never>?
     private let chime = KitchenChime()
 
     var oldestElapsedMinutes: Int? {
@@ -353,25 +495,35 @@ final class KitchenStore: ObservableObject {
         Array(Set(orders.map(\.source))).sorted { $0.rawValue < $1.rawValue }
     }
 
+    var waitingOnlineOrderCount: Int {
+        onlineOrders.filter { $0.status == .submitted }.count
+    }
+
     func start() {
-        stop()
+        pollTimer?.invalidate()
 
-        pollTask = Task { [weak self] in
-            guard let self else { return }
-            await refresh(forceChime: false)
+        Task { await refresh(forceChime: false) }
 
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(4))
-                await refresh(forceChime: true)
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.refresh(forceChime: true)
             }
         }
+
+        pollTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
     }
 
     func stop() {
-        pollTask?.cancel()
-        pollTask = nil
-        refreshTask?.cancel()
-        refreshTask = nil
+        stopPolling()
+        isRefreshInFlight = false
+        notificationTask?.cancel()
+        notificationTask = nil
         chime.stop()
     }
 
@@ -383,6 +535,7 @@ final class KitchenStore: ObservableObject {
 
         knownOrderIDs.removeAll()
         knownOnlineOrderIDs.removeAll()
+        alertedOnlineOrderIDs.removeAll()
         Task { await refresh(forceChime: false) }
     }
 
@@ -405,16 +558,13 @@ final class KitchenStore: ObservableObject {
     }
 
     func refresh(forceChime: Bool) async {
-        guard refreshTask == nil else {
+        guard !isRefreshInFlight else {
             return
         }
 
-        refreshTask = Task { [weak self] in
-            await self?.performRefresh(forceChime: forceChime)
-        }
-
-        await refreshTask?.value
-        refreshTask = nil
+        isRefreshInFlight = true
+        await performRefresh(forceChime: forceChime)
+        isRefreshInFlight = false
     }
 
     private func performRefresh(forceChime: Bool) async {
@@ -439,8 +589,14 @@ final class KitchenStore: ObservableObject {
             let kitchenPayload = try await client.fetchOrders()
             let incomingIDs = Set(kitchenPayload.orders.map(\.id))
             let incomingOnlineIDs = Set(onlinePayload.onlineOrders.map(\.id))
+            let submittedOnlineIDs = Set(
+                onlinePayload.onlineOrders
+                    .filter { $0.status == .submitted }
+                    .map(\.id)
+            )
             let previousActiveCount = orders.count + onlineOrders.count
             let newOnlineIDs = incomingOnlineIDs.subtracting(knownOnlineOrderIDs)
+            let unalertedSubmittedIDs = submittedOnlineIDs.subtracting(alertedOnlineOrderIDs)
             let alertingIDs = Set(kitchenPayload.orders.filter(\.isPastAlertThreshold).map(\.id))
             let newAlertingIDs = alertingIDs.subtracting(alertingOrderIDs)
 
@@ -449,29 +605,59 @@ final class KitchenStore: ObservableObject {
             summary = kitchenPayload.summary
             knownOrderIDs = incomingIDs
             knownOnlineOrderIDs = incomingOnlineIDs
+            alertedOnlineOrderIDs.formIntersection(submittedOnlineIDs)
             alertingOrderIDs = alertingIDs
             errorMessage = nil
             isConnected = true
             hasLoadedOnce = true
 
-            if forceChime && !newOnlineIDs.isEmpty {
+            if !unalertedSubmittedIDs.isEmpty {
+                alertedOnlineOrderIDs.formUnion(unalertedSubmittedIDs)
+                showNotification(
+                    unalertedSubmittedIDs.count == 1
+                        ? "You received a new order!"
+                        : "You received \(unalertedSubmittedIDs.count) new orders!"
+                )
                 chime.play(tone: chimeTone)
             }
 
             if !firstLoad && (
                 !newOnlineIDs.isEmpty ||
+                !unalertedSubmittedIDs.isEmpty ||
                 previousActiveCount > 0 && onlinePayload.onlineOrders.isEmpty && kitchenPayload.orders.isEmpty ||
                 !newAlertingIDs.isEmpty
             ) {
                 Haptics.notification(.success)
             }
         } catch {
+            if error is CancellationError {
+                return
+            }
+
+            if let urlError = error as? URLError, urlError.code == .cancelled {
+                return
+            }
+
             errorMessage = error.localizedDescription
             isConnected = false
         }
 
         isInitialLoading = false
         isRefreshing = false
+    }
+
+    private func showNotification(_ message: String) {
+        notificationTask?.cancel()
+        notificationMessage = message
+
+        notificationTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            await MainActor.run {
+                if self?.notificationMessage == message {
+                    self?.notificationMessage = nil
+                }
+            }
+        }
     }
 
     func update(order: KitchenOrder, status: KitchenStatus) async {
@@ -502,6 +688,7 @@ final class KitchenStore: ObservableObject {
         do {
             _ = try await KitchenAPIClient(baseURL: baseURL, token: kitchenToken).acceptOnlineOrder(orderID: order.id)
             knownOnlineOrderIDs.remove(order.id)
+            alertedOnlineOrderIDs.remove(order.id)
             await refresh(forceChime: false)
         } catch {
             errorMessage = error.localizedDescription
@@ -514,6 +701,7 @@ final class KitchenStore: ObservableObject {
         do {
             _ = try await KitchenAPIClient(baseURL: baseURL, token: kitchenToken).rejectOnlineOrder(orderID: order.id)
             knownOnlineOrderIDs.remove(order.id)
+            alertedOnlineOrderIDs.remove(order.id)
             await refresh(forceChime: false)
         } catch {
             errorMessage = error.localizedDescription
@@ -529,11 +717,20 @@ final class POSStore: ObservableObject {
     @Published var isRefreshing = false
     @Published var isSubmitting = false
     @Published var isShiftSubmitting = false
+    @Published var isRecapLoading = false
     @Published var isConnected = false
     @Published var errorMessage: String?
+    @Published var recapErrorMessage: String?
     @Published var saleMessage: String?
+    @Published var recap: POSRecap?
+    @Published var productImageOverrideURLs: [Int: URL] = [:]
 
     private var refreshTask: Task<Void, Never>?
+    private let imageOverridesDirectoryName = "POSProductImageOverrides"
+
+    init() {
+        loadProductImageOverrides()
+    }
 
     var productCount: Int {
         bootstrap?.catalog.products.count ?? 0
@@ -555,6 +752,39 @@ final class POSStore: ObservableObject {
         cartLines
             .filter { $0.product.id == product.id }
             .reduce(0) { $0 + $1.quantity }
+    }
+
+    func imageURL(for product: POSProduct) -> URL? {
+        productImageOverrideURLs[product.id] ?? product.imageURL
+    }
+
+    func setProductImageOverride(productID: Int, data: Data) async {
+        guard let image = UIImage(data: data),
+              let compressedData = image.normalizedForPOSCard().jpegData(compressionQuality: 0.84),
+              let directory = productImageOverridesDirectory(createIfNeeded: true) else {
+            errorMessage = "This image could not be saved."
+            Haptics.notification(.error)
+            return
+        }
+
+        let fileURL = directory.appendingPathComponent("product-\(productID).jpg")
+
+        do {
+            try compressedData.write(to: fileURL, options: [.atomic])
+            productImageOverrideURLs[productID] = fileURL
+            errorMessage = nil
+            Haptics.notification(.success)
+        } catch {
+            errorMessage = "This image could not be saved."
+            Haptics.notification(.error)
+        }
+    }
+
+    func clearProductImageOverride(productID: Int) {
+        guard let fileURL = productImageOverrideURLs[productID] else { return }
+        try? FileManager.default.removeItem(at: fileURL)
+        productImageOverrideURLs.removeValue(forKey: productID)
+        Haptics.impact(.light)
     }
 
     func add(product: POSProduct, toppings: [POSTopping]) {
@@ -632,6 +862,9 @@ final class POSStore: ObservableObject {
             saleMessage = response.message
             cartLines.removeAll()
             await refresh(baseURL: baseURL, token: token)
+            if recap != nil {
+                await refreshRecap(baseURL: baseURL, token: token)
+            }
             Haptics.notification(.success)
             isSubmitting = false
             return true
@@ -743,6 +976,62 @@ final class POSStore: ObservableObject {
         isInitialLoading = false
         isRefreshing = false
     }
+
+    func refreshRecap(baseURL: String, token: String) async {
+        guard !isRecapLoading else { return }
+
+        guard !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            recapErrorMessage = "Add the emberOS Key in Settings."
+            return
+        }
+
+        isRecapLoading = true
+        recapErrorMessage = nil
+
+        do {
+            recap = try await KitchenAPIClient(baseURL: baseURL, token: token).fetchPOSRecap().recap
+            isConnected = true
+        } catch {
+            recapErrorMessage = error.localizedDescription
+            isConnected = false
+        }
+
+        isRecapLoading = false
+    }
+
+    private func loadProductImageOverrides() {
+        guard let directory = productImageOverridesDirectory(createIfNeeded: false),
+              let files = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+              ) else {
+            return
+        }
+
+        var overrides: [Int: URL] = [:]
+        for file in files where file.lastPathComponent.hasPrefix("product-") {
+            let idText = file.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "product-", with: "")
+            if let id = Int(idText) {
+                overrides[id] = file
+            }
+        }
+
+        productImageOverrideURLs = overrides
+    }
+
+    private func productImageOverridesDirectory(createIfNeeded: Bool) -> URL? {
+        guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+
+        let directory = documents.appendingPathComponent(imageOverridesDirectoryName, isDirectory: true)
+        if createIfNeeded {
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+
+        return directory
+    }
 }
 
 struct KitchenAPIClient {
@@ -751,6 +1040,10 @@ struct KitchenAPIClient {
 
     func fetchPOSBootstrap() async throws -> POSBootstrapResponse {
         try await request(path: "/api/pos/bootstrap", method: "GET", body: Optional<KitchenStatusRequest>.none)
+    }
+
+    func fetchPOSRecap() async throws -> POSRecapResponse {
+        try await request(path: "/api/pos/recap", method: "GET", body: Optional<KitchenStatusRequest>.none)
     }
 
     func submitPOSSale(_ sale: POSCreateSaleRequest) async throws -> POSCreateSaleResponse {
@@ -1019,6 +1312,10 @@ private struct HeaderView: View {
     let oldestMinutes: Int?
     let isConnected: Bool
     let section: AppSection
+    let cartItemCount: Int
+    let cartTotal: Double
+    let posAccentColor: Color
+    let onCart: () -> Void
 
     var body: some View {
         HStack(alignment: .center, spacing: 18) {
@@ -1033,26 +1330,25 @@ private struct HeaderView: View {
 
             Spacer()
 
-            HStack(spacing: 14) {
-                Image("EmberOSMark")
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 52, height: 52)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-
-                VStack(alignment: .trailing, spacing: 5) {
-                    Text("\(activeCount)")
-                        .font(GlacialFont.custom(42, .bold))
-                        .foregroundStyle(AppPalette.ink)
-                    Text(statusText)
-                        .font(GlacialFont.caption(.bold))
-                        .foregroundStyle(section == .kitchen && readyCount > 0 ? AppPalette.green : AppPalette.orange)
-                    ConnectionDot(isConnected: isConnected)
-                }
+            switch section {
+            case .kitchen:
+                KitchenHeaderStatus(
+                    activeCount: activeCount,
+                    readyCount: readyCount,
+                    statusText: statusText,
+                    isConnected: isConnected,
+                    accentColor: posAccentColor
+                )
+            case .pos:
+                POSHeaderCartSummary(
+                    itemCount: cartItemCount,
+                    total: cartTotal,
+                    isConnected: isConnected,
+                    accentColor: posAccentColor,
+                    onCart: onCart
+                )
+                .offset(y: 8)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 14)
-            .background(.white, in: RoundedRectangle(cornerRadius: 8))
         }
     }
 
@@ -1068,6 +1364,192 @@ private struct HeaderView: View {
         case .pos:
             return "\(readyCount) categories"
         }
+    }
+}
+
+private struct TopMenuIcon: View {
+    let badgeCount: Int
+    let accentColor: Color
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            VStack(alignment: .center, spacing: 4) {
+                Capsule()
+                    .frame(width: 16, height: 1.5)
+                Capsule()
+                    .frame(width: 10, height: 1.5)
+                Capsule()
+                    .frame(width: 16, height: 1.5)
+            }
+            .foregroundStyle(AppPalette.ink)
+            .frame(width: 30, height: 30)
+
+            if badgeCount > 0 {
+                Text("\(min(badgeCount, 9))")
+                    .font(GlacialFont.caption2(.bold))
+                    .foregroundStyle(.white)
+                    .frame(minWidth: 16, minHeight: 16)
+                    .background(accentColor, in: Circle())
+                    .offset(x: 4, y: -2)
+            }
+        }
+        .animation(.snappy(duration: 0.18), value: badgeCount)
+    }
+}
+
+private struct MenuBadgeLabel: View {
+    let title: String
+    let systemImage: String
+    let count: Int
+    let accentColor: Color
+
+    var body: some View {
+        Label {
+            HStack {
+                Text(title)
+                if count > 0 {
+                    Text("\(count)")
+                        .font(GlacialFont.caption2(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(accentColor, in: Capsule())
+                }
+            }
+        } icon: {
+            Image(systemName: systemImage)
+        }
+    }
+}
+
+private struct InAppOrderNotification: View {
+    let message: String
+    let accentColor: Color
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: "bell.badge")
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
+
+                Text(message)
+                    .font(GlacialFont.subheadline(.semibold))
+                    .foregroundStyle(AppPalette.ink)
+
+                Spacer(minLength: 8)
+
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(accentColor)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 420)
+            .background(.white, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(accentColor.opacity(0.28), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.08), radius: 18, y: 10)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct KitchenHeaderStatus: View {
+    let activeCount: Int
+    let readyCount: Int
+    let statusText: String
+    let isConnected: Bool
+    let accentColor: Color
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Image("EmberOSMark")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 52, height: 52)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            VStack(alignment: .trailing, spacing: 5) {
+                Text("\(activeCount)")
+                    .font(GlacialFont.custom(42, .bold))
+                    .foregroundStyle(AppPalette.ink)
+                Text(statusText)
+                    .font(GlacialFont.caption(.bold))
+                    .foregroundStyle(readyCount > 0 ? AppPalette.green : accentColor)
+                ConnectionDot(isConnected: isConnected)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(.white, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct POSHeaderCartSummary: View {
+    let itemCount: Int
+    let total: Double
+    let isConnected: Bool
+    let accentColor: Color
+    let onCart: () -> Void
+
+    var body: some View {
+        Button(action: onCart) {
+            HStack(spacing: 12) {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "bag")
+                        .font(.system(size: 27, weight: .light))
+                        .foregroundStyle(accentColor)
+                        .frame(width: 45, height: 42)
+
+                    Text("\(itemCount)")
+                        .font(GlacialFont.caption2(.bold))
+                        .foregroundStyle(.white)
+                        .frame(minWidth: 17, minHeight: 17)
+                        .background(accentColor, in: Circle())
+                        .offset(x: 4, y: -1)
+                }
+                .frame(width: 55, height: 48)
+
+                Spacer(minLength: 16)
+
+                VStack(alignment: .trailing, spacing: 5) {
+                    Text(cartLabel)
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.7)
+                        .foregroundStyle(AppPalette.ink)
+                    Text("\(Int(total).formatted()) VND")
+                        .font(GlacialFont.caption(.bold))
+                        .foregroundStyle(accentColor)
+                    ConnectionDot(isConnected: isConnected)
+                }
+            }
+            .frame(width: 220, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(.white, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(itemCount == 0)
+        .opacity(itemCount == 0 ? 0.72 : 1)
+        .accessibilityLabel("POS cart")
+    }
+
+    private var cartLabel: String {
+        if itemCount == 0 {
+            return "CART"
+        }
+
+        return itemCount == 1 ? "1 ITEM" : "\(itemCount) ITEMS"
     }
 }
 
@@ -1088,10 +1570,11 @@ private struct ConnectionDot: View {
 
 private struct MetricsStrip: View {
     let summary: KitchenSummary
+    let accentColor: Color
 
     var body: some View {
         HStack(spacing: 12) {
-            MetricCard(title: "Pending", value: "\(summary.pending)", icon: "bell.badge", tint: AppPalette.orange)
+            MetricCard(title: "Pending", value: "\(summary.pending)", icon: "bell.badge", tint: accentColor)
             MetricCard(title: "Preparing", value: "\(summary.preparing)", icon: "flame.fill", tint: AppPalette.red)
             MetricCard(title: "Ready", value: "\(summary.ready)", icon: "checkmark.seal.fill", tint: AppPalette.green)
             MetricCard(title: "Held", value: "\(summary.held)", icon: "pause.fill", tint: AppPalette.blue)
@@ -1143,16 +1626,17 @@ private struct FilterBar: View {
     @Binding var selectedStatus: KitchenStatus?
     let sources: [KitchenSource]
     let namespace: Namespace.ID
+    let accentColor: Color
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    FilterChip(title: "active", isSelected: selectedStatus == nil, namespace: namespace) {
+                    FilterChip(title: "active", isSelected: selectedStatus == nil, namespace: namespace, accentColor: accentColor) {
                         selectStatus(nil)
                     }
                     ForEach(KitchenStatus.activeFilters) { status in
-                        FilterChip(title: status.label.lowercased(), isSelected: selectedStatus == status, namespace: namespace) {
+                        FilterChip(title: status.label.lowercased(), isSelected: selectedStatus == status, namespace: namespace, accentColor: accentColor) {
                             selectStatus(status)
                         }
                     }
@@ -1176,6 +1660,7 @@ private struct FilterChip: View {
     let title: String
     let isSelected: Bool
     let namespace: Namespace.ID
+    let accentColor: Color
     let action: () -> Void
 
     var body: some View {
@@ -1188,7 +1673,7 @@ private struct FilterChip: View {
                 .background {
                     if isSelected {
                         RoundedRectangle(cornerRadius: 8)
-                            .fill(AppPalette.orange)
+                            .fill(accentColor)
                             .matchedGeometryEffect(id: "filter-selection", in: namespace)
                     }
                 }
@@ -1334,6 +1819,7 @@ private struct SourcePattern: Shape {
 
 private struct OnlineOrderReviewSection: View {
     let orders: [KitchenOnlineOrder]
+    let accentColor: Color
     let onAccept: (KitchenOnlineOrder) -> Void
     let onDecline: (KitchenOnlineOrder) -> Void
 
@@ -1346,7 +1832,7 @@ private struct OnlineOrderReviewSection: View {
                 Spacer()
                 Text("\(orders.count) waiting")
                     .font(GlacialFont.footnote(.semibold))
-                    .foregroundStyle(orders.isEmpty ? AppPalette.muted : AppPalette.orange)
+                    .foregroundStyle(orders.isEmpty ? AppPalette.muted : accentColor)
             }
 
             if orders.isEmpty {
@@ -1365,6 +1851,7 @@ private struct OnlineOrderReviewSection: View {
                     ForEach(orders, id: \.id) { order in
                         OnlineOrderCard(
                             order: order,
+                            accentColor: accentColor,
                             onAccept: { onAccept(order) },
                             onDecline: { onDecline(order) }
                         )
@@ -1377,6 +1864,7 @@ private struct OnlineOrderReviewSection: View {
 
 private struct OnlineOrderCard: View {
     let order: KitchenOnlineOrder
+    let accentColor: Color
     let onAccept: () -> Void
     let onDecline: () -> Void
 
@@ -1393,7 +1881,7 @@ private struct OnlineOrderCard: View {
                     Spacer(minLength: 6)
                     Text(order.elapsedText)
                         .font(GlacialFont.caption(.bold))
-                        .foregroundStyle(AppPalette.orange)
+                        .foregroundStyle(accentColor)
                 }
 
                 Text(order.customerDisplay)
@@ -1407,7 +1895,7 @@ private struct OnlineOrderCard: View {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("\(item.quantity)x")
                             .font(GlacialFont.caption(.bold))
-                            .foregroundStyle(AppPalette.orange)
+                            .foregroundStyle(accentColor)
                             .frame(width: 30, alignment: .leading)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(item.productName)
@@ -1464,7 +1952,7 @@ private struct OnlineOrderCard: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.white)
-                    .background(AppPalette.orange, in: RoundedRectangle(cornerRadius: 8))
+                    .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
                 }
             } else {
                 HStack(spacing: 10) {
@@ -1501,6 +1989,7 @@ private struct QueueSection: View {
     let orders: [KitchenOrder]
     let isInitialLoading: Bool
     let isRefreshing: Bool
+    let accentColor: Color
     let onSelect: (KitchenOrder) -> Void
     let onStatus: (KitchenOrder, KitchenStatus) -> Void
 
@@ -1515,7 +2004,7 @@ private struct QueueSection: View {
                     if isRefreshing {
                         ProgressView()
                             .controlSize(.mini)
-                            .tint(AppPalette.orange)
+                            .tint(accentColor)
                     }
 
                     Text(isInitialLoading && orders.isEmpty ? "loading" : "\(orders.count) tickets")
@@ -1525,7 +2014,7 @@ private struct QueueSection: View {
             }
 
             if orders.isEmpty && isInitialLoading {
-                InitialLoadingView()
+                InitialLoadingView(accentColor: accentColor)
             } else if orders.isEmpty {
                 EmptyKitchenView()
             } else {
@@ -1540,11 +2029,13 @@ private struct QueueSection: View {
 }
 
 private struct InitialLoadingView: View {
+    let accentColor: Color
+
     var body: some View {
         VStack(spacing: 12) {
             ProgressView()
                 .controlSize(.large)
-                .tint(AppPalette.orange)
+                .tint(accentColor)
             Text("Loading kitchen rail")
                 .font(GlacialFont.headline(.semibold))
                 .foregroundStyle(AppPalette.ink)
@@ -1574,27 +2065,235 @@ private struct EmptyKitchenView: View {
     }
 }
 
+private enum POSProductDisplayStyle: String, CaseIterable, Identifiable {
+    case productCard
+    case grabGrid
+    case simpleList
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .productCard: "Card"
+        case .grabGrid: "Grid"
+        case .simpleList: "Row"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .productCard: "rectangle.portrait.on.rectangle.portrait"
+        case .grabGrid: "square.grid.2x2"
+        case .simpleList: "list.bullet"
+        }
+    }
+}
+
+private enum POSAccentColor: String, CaseIterable, Identifiable {
+    case ember
+    case cocoa
+    case matcha
+    case midnight
+    case graphite
+    case berry
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .ember: "Ember"
+        case .cocoa: "Cocoa"
+        case .matcha: "Matcha"
+        case .midnight: "Midnight"
+        case .graphite: "Graphite"
+        case .berry: "Berry"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .ember: Color(red: 197 / 255, green: 90 / 255, blue: 39 / 255)
+        case .cocoa: Color(red: 0.45, green: 0.25, blue: 0.16)
+        case .matcha: Color(red: 0.35, green: 0.47, blue: 0.29)
+        case .midnight: Color(red: 0.08, green: 0.18, blue: 0.34)
+        case .graphite: Color(red: 0.16, green: 0.17, blue: 0.17)
+        case .berry: Color(red: 0.54, green: 0.22, blue: 0.30)
+        }
+    }
+}
+
+private enum POSCardSize: String, CaseIterable {
+    case small
+    case medium
+    case big
+
+    var label: String {
+        switch self {
+        case .small: "Small"
+        case .medium: "Medium"
+        case .big: "Big"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .small: "S"
+        case .medium: "M"
+        case .big: "L"
+        }
+    }
+
+    var columnSpan: Int {
+        switch self {
+        case .small: 1
+        case .medium, .big: 2
+        }
+    }
+
+    var rowSpan: Int {
+        switch self {
+        case .small, .medium: 1
+        case .big: 2
+        }
+    }
+
+    var next: POSCardSize {
+        switch self {
+        case .small: .medium
+        case .medium: .big
+        case .big: .small
+        }
+    }
+}
+
 private struct POSDashboardView: View {
     @ObservedObject var store: POSStore
     let baseURL: String
     let token: String
+    let displayStyle: POSProductDisplayStyle
+    let accentColor: Color
+    @Binding var isCheckoutOpen: Bool
     @State private var selectedCategory: String?
     @State private var selectedProduct: POSProduct?
-    @State private var isCheckoutOpen = false
-    @State private var isStartShiftOpen = false
-    @State private var cashMovementType: POSCashMovementType?
-    @State private var isEndShiftOpen = false
+    @State private var isArrangeMode = false
+    @State private var wobblePhase = false
+    @State private var arrangedCategoryNames: [String] = []
+    @State private var arrangedProductIDsByScope: [String: [Int]] = [:]
+    @State private var draggingCategoryName: String?
+    @State private var draggingProductID: Int?
+    @State private var lastCategoryDropTarget: String?
+    @State private var lastProductDropTarget: Int?
+    @State private var productAnimationToken = UUID()
+    @State private var productCardSizes: [Int: POSCardSize] = [:]
+    @State private var productGridWidth: CGFloat = 720
+    @Namespace private var categorySelectionNamespace
+
+    private let allProductsScope = "__all_products__"
 
     private var categories: [POSCategory] {
-        store.bootstrap?.catalog.categories ?? []
+        let source = store.bootstrap?.catalog.categories ?? []
+        guard !arrangedCategoryNames.isEmpty else {
+            return source
+        }
+
+        let categoryByName = Dictionary(uniqueKeysWithValues: source.map { ($0.name, $0) })
+        let arranged = arrangedCategoryNames.compactMap { categoryByName[$0] }
+        let missing = source.filter { !arrangedCategoryNames.contains($0.name) }
+        return arranged + missing
     }
 
     private var products: [POSProduct] {
-        guard let selectedCategory else {
-            return store.bootstrap?.catalog.products ?? []
+        guard let selectedCategory else { return [] }
+
+        let source = store.bootstrap?.catalog.products.filter { $0.category == selectedCategory } ?? []
+        return orderedProducts(source, scope: selectedCategory)
+    }
+
+    private func orderedProducts(_ source: [POSProduct], scope: String) -> [POSProduct] {
+        guard let arrangedIDs = arrangedProductIDsByScope[scope], !arrangedIDs.isEmpty else {
+            return source
         }
 
-        return store.bootstrap?.catalog.products.filter { $0.category == selectedCategory } ?? []
+        let productByID = Dictionary(uniqueKeysWithValues: source.map { ($0.id, $0) })
+        let arranged = arrangedIDs.compactMap { productByID[$0] }
+        let missing = source.filter { !arrangedIDs.contains($0.id) }
+        return arranged + missing
+    }
+
+    private func arrangeScope(for category: String?) -> String {
+        category ?? allProductsScope
+    }
+
+    private struct ProductTilePlacement: Identifiable {
+        let product: POSProduct
+        let x: CGFloat
+        let y: CGFloat
+        let width: CGFloat
+        let height: CGFloat
+
+        var id: Int { product.id }
+    }
+
+    private func productTilePlacements(width: CGFloat, spacing: CGFloat) -> (placements: [ProductTilePlacement], height: CGFloat) {
+        let columns = 4
+        let cell = max(72, (width - (spacing * CGFloat(columns - 1))) / CGFloat(columns))
+        var placements: [ProductTilePlacement] = []
+        var occupied: Set<String> = []
+
+        for product in products {
+            let cardSize = productCardSize(for: product)
+            let columnSpan = min(max(1, cardSize.columnSpan), columns)
+            let rowSpan = max(1, cardSize.rowSpan)
+            let slot = firstAvailableProductTileSlot(columnSpan: columnSpan, rowSpan: rowSpan, columns: columns, occupied: occupied)
+
+            for row in slot.row..<(slot.row + rowSpan) {
+                for column in slot.column..<(slot.column + columnSpan) {
+                    occupied.insert(productTileKey(row: row, column: column))
+                }
+            }
+
+            let tileWidth = (cell * CGFloat(columnSpan)) + (spacing * CGFloat(columnSpan - 1))
+            let tileHeight = (cell * CGFloat(rowSpan)) + (spacing * CGFloat(rowSpan - 1))
+
+            placements.append(ProductTilePlacement(
+                product: product,
+                x: CGFloat(slot.column) * (cell + spacing),
+                y: CGFloat(slot.row) * (cell + spacing),
+                width: tileWidth,
+                height: tileHeight
+            ))
+        }
+
+        let height = placements.map { $0.y + $0.height }.max() ?? 0
+        return (placements, height)
+    }
+
+    private func firstAvailableProductTileSlot(columnSpan: Int, rowSpan: Int, columns: Int, occupied: Set<String>) -> (row: Int, column: Int) {
+        for row in 0..<10_000 {
+            for column in 0...(columns - columnSpan) {
+                if canPlaceProductTile(row: row, column: column, columnSpan: columnSpan, rowSpan: rowSpan, occupied: occupied) {
+                    return (row, column)
+                }
+            }
+        }
+
+        return (0, 0)
+    }
+
+    private func canPlaceProductTile(row: Int, column: Int, columnSpan: Int, rowSpan: Int, occupied: Set<String>) -> Bool {
+        for checkRow in row..<(row + rowSpan) {
+            for checkColumn in column..<(column + columnSpan) {
+                if occupied.contains(productTileKey(row: checkRow, column: checkColumn)) {
+                    return false
+                }
+            }
+        }
+
+        return true
+    }
+
+    private func productTileKey(row: Int, column: Int) -> String {
+        "\(row)-\(column)"
     }
 
     var body: some View {
@@ -1623,133 +2322,446 @@ private struct POSDashboardView: View {
             }
 
             if store.isInitialLoading {
-                InitialLoadingView()
-            } else if let bootstrap = store.bootstrap {
-                POSShiftCard(
-                    operator: bootstrap.operator,
-                    shift: bootstrap.shift,
-                    isSubmitting: store.isShiftSubmitting,
-                    onOpenShift: { isStartShiftOpen = true },
-                    onCashIn: { cashMovementType = .deposit },
-                    onCashOut: { cashMovementType = .withdrawal },
-                    onCloseShift: { isEndShiftOpen = true }
-                )
-
+                InitialLoadingView(accentColor: accentColor)
+            } else if store.bootstrap != nil {
                 VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Orders")
-                                .font(GlacialFont.custom(42, .semibold))
-                                .foregroundStyle(AppPalette.ink)
-                            Text("Queue")
-                                .font(GlacialFont.custom(30, .regular))
-                                .foregroundStyle(AppPalette.orange)
+                    HStack(alignment: .center, spacing: 12) {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 10) {
+                                ForEach(categories) { category in
+                                    POSCategoryChip(
+                                        title: category.name.uppercased(),
+                                        isSelected: selectedCategory == category.name,
+                                        isArranging: isArrangeMode,
+                                        wobblePhase: wobblePhase,
+                                        namespace: categorySelectionNamespace,
+                                        accentColor: accentColor
+                                    ) {
+                                        withAnimation(.spring(response: 0.34, dampingFraction: 0.78, blendDuration: 0.05)) {
+                                            selectedCategory = category.name
+                                            productAnimationToken = UUID()
+                                        }
+                                    } onArrange: {
+                                        enterArrangeMode()
+                                    }
+                                    .onDrag {
+                                        enterArrangeMode()
+                                        draggingCategoryName = category.name
+                                        return NSItemProvider(object: category.name as NSString)
+                                    }
+                                    .onDrop(
+                                        of: [UTType.text],
+                                        delegate: POSCategoryDropDelegate(
+                                            targetName: category.name,
+                                            draggingName: $draggingCategoryName,
+                                            lastDropTarget: $lastCategoryDropTarget,
+                                            categoryNames: $arrangedCategoryNames
+                                        )
+                                    )
+                                }
+                            }
+                            .padding(.vertical, 2)
                         }
-
-                        Spacer()
 
                         if store.isRefreshing {
                             ProgressView()
-                                .tint(AppPalette.orange)
+                                .tint(accentColor)
                         }
-                    }
 
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 10) {
-                            POSCategoryChip(title: "all", isSelected: selectedCategory == nil) {
-                                withAnimation(.snappy(duration: 0.22)) {
-                                    selectedCategory = nil
-                                }
+                        if isArrangeMode {
+                            Button {
+                                finishArrangeMode()
+                            } label: {
+                                Text("done")
+                                    .font(GlacialFont.caption(.bold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 9)
+                                    .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
                             }
-
-                            ForEach(categories) { category in
-                                POSCategoryChip(
-                                    title: category.name.lowercased(),
-                                    isSelected: selectedCategory == category.name
-                                ) {
-                                    withAnimation(.snappy(duration: 0.22)) {
-                                        selectedCategory = category.name
-                                    }
-                                }
-                            }
+                            .buttonStyle(.plain)
                         }
-                        .padding(.vertical, 2)
                     }
                 }
-                .padding(18)
+                .padding(.vertical, 18)
                 .background(.white, in: RoundedRectangle(cornerRadius: 8))
 
-                HStack(alignment: .top, spacing: 14) {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), spacing: 14)], spacing: 14) {
-                        ForEach(products) { product in
-                            POSProductCard(
-                                product: product,
-                                quantityInCart: store.quantityInCart(for: product)
-                            ) {
-                                selectedProduct = product
+                ZStack {
+                    switch displayStyle {
+                    case .productCard:
+                        let spacing: CGFloat = 14
+                        let layout = productTilePlacements(width: productGridWidth, spacing: spacing)
+
+                        ZStack(alignment: .topLeading) {
+                            GeometryReader { proxy in
+                                Color.clear
+                                    .onAppear {
+                                        productGridWidth = max(1, proxy.size.width)
+                                    }
+                                    .onChange(of: proxy.size.width) { _, width in
+                                        productGridWidth = max(1, width)
+                                    }
+                            }
+
+                            ForEach(layout.placements) { placement in
+                                posProductCard(for: placement.product)
+                                    .frame(width: placement.width, height: placement.height)
+                                    .contentShape(RoundedRectangle(cornerRadius: 8))
+                                    .position(x: placement.x + (placement.width / 2), y: placement.y + (placement.height / 2))
+                                    .modifier(productReorderModifier(for: placement.product))
+                            }
+                        }
+                        .frame(height: max(layout.height, 1), alignment: .topLeading)
+                    case .grabGrid:
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
+                            ForEach(products) { product in
+                                POSCompactProductCard(
+                                    product: product,
+                                    imageURL: store.imageURL(for: product),
+                                    quantityInCart: store.quantityInCart(for: product),
+                                    accentColor: accentColor,
+                                    isArranging: isArrangeMode,
+                                    wobblePhase: wobblePhase
+                                ) {
+                                    handleProductTap(product)
+                                } onArrange: {
+                                    enterArrangeMode()
+                                }
+                                .modifier(productReorderModifier(for: product))
+                            }
+                        }
+                    case .simpleList:
+                        VStack(spacing: 10) {
+                            ForEach(products) { product in
+                                POSProductListRow(
+                                    product: product,
+                                    imageURL: store.imageURL(for: product),
+                                    quantityInCart: store.quantityInCart(for: product),
+                                    accentColor: accentColor,
+                                    isArranging: isArrangeMode,
+                                    wobblePhase: wobblePhase
+                                ) {
+                                    handleProductTap(product)
+                                } onArrange: {
+                                    enterArrangeMode()
+                                }
+                                .modifier(productReorderModifier(for: product))
                             }
                         }
                     }
-
-                    POSCartPanel(
-                        lines: store.cartLines,
-                        total: store.cartTotal,
-                        onIncrement: store.increment(line:),
-                        onDecrement: store.decrement(line:),
-                        onClear: store.clearCart,
-                        onCheckout: { isCheckoutOpen = true }
-                    )
-                    .frame(width: 300)
                 }
+                .transition(.asymmetric(
+                    insertion: .move(edge: .trailing).combined(with: .opacity),
+                    removal: .move(edge: .leading).combined(with: .opacity)
+                ))
+                .animation(.spring(response: 0.42, dampingFraction: 0.82), value: productAnimationToken)
             } else {
                 EmptyKitchenView()
             }
         }
         .sheet(item: $selectedProduct) { product in
-            POSProductSheet(product: product) { toppings in
+            POSProductSheet(product: product, imageURL: store.imageURL(for: product), accentColor: accentColor) { toppings in
                 store.add(product: product, toppings: toppings)
                 selectedProduct = nil
             }
         }
-        .sheet(isPresented: $isCheckoutOpen) {
-            POSCheckoutSheet(
-                lines: store.cartLines,
-                total: store.cartTotal,
-                baseURL: baseURL,
-                token: token,
-                isSubmitting: store.isSubmitting,
-                submit: { paymentMethod, source, reference, customer, discountPercent, notes in
-                    await store.submitSale(
-                        baseURL: baseURL,
-                        token: token,
-                        paymentMethod: paymentMethod,
-                        orderSource: source,
-                        externalReference: reference,
-                        customer: customer,
-                        discountPercent: discountPercent,
-                        notes: notes
-                    )
-                }
+        .onChange(of: store.bootstrap) { _, bootstrap in
+            guard let catalog = bootstrap?.catalog else { return }
+            syncArrangeOrders(catalog: catalog)
+        }
+        .onChange(of: displayStyle) { _, _ in
+            productAnimationToken = UUID()
+        }
+    }
+
+    private func posProductCard(for product: POSProduct) -> some View {
+        POSProductCard(
+            product: product,
+            imageURL: store.imageURL(for: product),
+            quantityInCart: store.quantityInCart(for: product),
+            cardSize: productCardSize(for: product),
+            accentColor: accentColor,
+            isArranging: isArrangeMode,
+            wobblePhase: wobblePhase
+        ) {
+            handleProductTap(product)
+        } onArrange: {
+            enterArrangeMode()
+        } onCycleSize: {
+            cycleProductCardSize(product)
+        }
+    }
+
+    private func handleProductTap(_ product: POSProduct) {
+        if isArrangeMode {
+            cycleProductCardSize(product)
+        } else {
+            selectedProduct = product
+        }
+    }
+
+    private func productCardSize(for product: POSProduct) -> POSCardSize {
+        productCardSizes[product.id] ?? .small
+    }
+
+    private func cycleProductCardSize(_ product: POSProduct) {
+        guard displayStyle == .productCard else {
+            Haptics.impact(.light)
+            return
+        }
+
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
+            productCardSizes[product.id] = productCardSize(for: product).next
+            productAnimationToken = UUID()
+        }
+        Haptics.selectionChanged()
+    }
+
+    private func productReorderModifier(for product: POSProduct) -> some ViewModifier {
+        POSProductReorderModifier(
+            productID: product.id,
+            scope: arrangeScope(for: selectedCategory),
+            draggingProductID: $draggingProductID,
+            lastDropTarget: $lastProductDropTarget,
+            productIDsByScope: $arrangedProductIDsByScope,
+            onBeginDrag: { enterArrangeMode() }
+        )
+    }
+
+    private func syncArrangeOrders(catalog: POSCatalog) {
+        if arrangedCategoryNames.isEmpty {
+            arrangedCategoryNames = catalog.categories.map(\.name)
+        } else {
+            arrangedCategoryNames = arrangedCategoryNames.filter { name in
+                catalog.categories.contains { $0.name == name }
+            }
+            for category in catalog.categories where !arrangedCategoryNames.contains(category.name) {
+                arrangedCategoryNames.append(category.name)
+            }
+        }
+
+        let allIDs = catalog.products.map(\.id)
+        arrangedProductIDsByScope[allProductsScope] = normalizedOrder(
+            existing: arrangedProductIDsByScope[allProductsScope],
+            source: allIDs
+        )
+
+        for category in catalog.categories {
+            let productIDs = catalog.products.filter { $0.category == category.name }.map(\.id)
+            arrangedProductIDsByScope[category.name] = normalizedOrder(
+                existing: arrangedProductIDsByScope[category.name],
+                source: productIDs
             )
         }
-        .sheet(isPresented: $isStartShiftOpen) {
-            POSStartShiftSheet(isSubmitting: store.isShiftSubmitting) { openingCash, notes in
-                await store.startShift(baseURL: baseURL, token: token, openingCash: openingCash, notes: notes)
-            }
+
+        let categoryNames = catalog.categories.map(\.name)
+        if selectedCategory == nil || !categoryNames.contains(selectedCategory ?? "") {
+            selectedCategory = categoryNames.first
+            productAnimationToken = UUID()
         }
-        .sheet(item: $cashMovementType) { type in
-            POSCashMovementSheet(type: type, isSubmitting: store.isShiftSubmitting) { amount, reason in
-                await store.recordCashMovement(baseURL: baseURL, token: token, type: type, amount: amount, reason: reason)
-            }
+    }
+
+    private func normalizedOrder(existing: [Int]?, source: [Int]) -> [Int] {
+        guard let existing, !existing.isEmpty else {
+            return source
         }
-        .sheet(isPresented: $isEndShiftOpen) {
-            POSEndShiftSheet(
-                expectedCash: store.bootstrap?.shift.recap?.expectedCash,
-                isSubmitting: store.isShiftSubmitting
-            ) { closingCash, notes in
-                await store.endShift(baseURL: baseURL, token: token, closingCash: closingCash, notes: notes)
-            }
+
+        let sourceSet = Set(source)
+        var next = existing.filter { sourceSet.contains($0) }
+        for id in source where !next.contains(id) {
+            next.append(id)
         }
+        return next
+    }
+
+    private func enterArrangeMode() {
+        guard !isArrangeMode else { return }
+        Haptics.notification(.success)
+        withAnimation(.snappy(duration: 0.22)) {
+            isArrangeMode = true
+            wobblePhase = true
+        }
+    }
+
+    private func finishArrangeMode() {
+        withAnimation(.snappy(duration: 0.2)) {
+            isArrangeMode = false
+            wobblePhase = false
+            draggingCategoryName = nil
+            draggingProductID = nil
+            lastCategoryDropTarget = nil
+            lastProductDropTarget = nil
+        }
+    }
+
+    private func canMoveCategory(_ name: String, offset: Int) -> Bool {
+        guard let index = arrangedCategoryNames.firstIndex(of: name) else { return false }
+        return arrangedCategoryNames.indices.contains(index + offset)
+    }
+
+    private func moveCategory(_ name: String, offset: Int) {
+        guard let index = arrangedCategoryNames.firstIndex(of: name) else { return }
+        let destination = index + offset
+        guard arrangedCategoryNames.indices.contains(destination) else { return }
+
+        withAnimation(.snappy(duration: 0.2)) {
+            arrangedCategoryNames.swapAt(index, destination)
+        }
+        Haptics.impact(.light)
+    }
+
+    private func canMoveProduct(_ id: Int, offset: Int) -> Bool {
+        let scope = arrangeScope(for: selectedCategory)
+        guard let order = arrangedProductIDsByScope[scope],
+              let index = order.firstIndex(of: id) else {
+            return false
+        }
+        return order.indices.contains(index + offset)
+    }
+
+    private func moveProduct(_ id: Int, offset: Int) {
+        let scope = arrangeScope(for: selectedCategory)
+        guard var order = arrangedProductIDsByScope[scope],
+              let index = order.firstIndex(of: id) else {
+            return
+        }
+
+        let destination = index + offset
+        guard order.indices.contains(destination) else { return }
+
+        withAnimation(.snappy(duration: 0.2)) {
+            order.swapAt(index, destination)
+            arrangedProductIDsByScope[scope] = order
+        }
+        Haptics.impact(.light)
+    }
+}
+
+private struct POSCategoryDropDelegate: DropDelegate {
+    let targetName: String
+    @Binding var draggingName: String?
+    @Binding var lastDropTarget: String?
+    @Binding var categoryNames: [String]
+
+    func dropEntered(info: DropInfo) {
+        guard let draggingName,
+              draggingName != targetName,
+              let fromIndex = categoryNames.firstIndex(of: draggingName),
+              let toIndex = categoryNames.firstIndex(of: targetName) else {
+            return
+        }
+
+        lastDropTarget = targetName
+        withAnimation(.snappy(duration: 0.18)) {
+            categoryNames.move(
+                fromOffsets: IndexSet(integer: fromIndex),
+                toOffset: toIndex > fromIndex ? toIndex + 1 : toIndex
+            )
+        }
+        Haptics.impact(.light)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingName = nil
+        lastDropTarget = nil
+        return true
+    }
+}
+
+private struct POSProductReorderModifier: ViewModifier {
+    let productID: Int
+    let scope: String
+    @Binding var draggingProductID: Int?
+    @Binding var lastDropTarget: Int?
+    @Binding var productIDsByScope: [String: [Int]]
+    let onBeginDrag: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onDrag {
+                onBeginDrag()
+                draggingProductID = productID
+                return NSItemProvider(object: "\(productID)" as NSString)
+            }
+            .onDrop(
+                of: [UTType.text],
+                delegate: POSProductDropDelegate(
+                    targetID: productID,
+                    scope: scope,
+                    draggingProductID: $draggingProductID,
+                    lastDropTarget: $lastDropTarget,
+                    productIDsByScope: $productIDsByScope
+                )
+            )
+    }
+}
+
+private struct POSProductDropDelegate: DropDelegate {
+    let targetID: Int
+    let scope: String
+    @Binding var draggingProductID: Int?
+    @Binding var lastDropTarget: Int?
+    @Binding var productIDsByScope: [String: [Int]]
+
+    func dropEntered(info: DropInfo) {
+        guard let draggingProductID,
+              draggingProductID != targetID,
+              var order = productIDsByScope[scope],
+              let fromIndex = order.firstIndex(of: draggingProductID),
+              let toIndex = order.firstIndex(of: targetID) else {
+            return
+        }
+
+        lastDropTarget = targetID
+        withAnimation(.snappy(duration: 0.18)) {
+            order.move(
+                fromOffsets: IndexSet(integer: fromIndex),
+                toOffset: toIndex > fromIndex ? toIndex + 1 : toIndex
+            )
+            productIDsByScope[scope] = order
+        }
+        Haptics.impact(.light)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingProductID = nil
+        lastDropTarget = nil
+        return true
+    }
+}
+
+private struct POSOperatorButton: View {
+    let `operator`: POSOperator
+    let shift: POSShiftEnvelope
+    let isSubmitting: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack(alignment: .bottomTrailing) {
+                Image(systemName: "person.crop.circle")
+                    .font(.system(size: 24, weight: .light))
+                    .foregroundStyle(AppPalette.ink)
+
+                Circle()
+                    .fill(shift.isOpen ? AppPalette.green : AppPalette.orange)
+                    .frame(width: 7, height: 7)
+                    .overlay(Circle().stroke(.white, lineWidth: 1.4))
+            }
+            .frame(width: 30, height: 30)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("POS operator \(`operator`.name)")
+        .disabled(isSubmitting)
+        .opacity(isSubmitting ? 0.68 : 1)
     }
 }
 
@@ -1757,6 +2769,7 @@ private struct POSShiftCard: View {
     let `operator`: POSOperator
     let shift: POSShiftEnvelope
     let isSubmitting: Bool
+    let accentColor: Color
     let onOpenShift: () -> Void
     let onCashIn: () -> Void
     let onCashOut: () -> Void
@@ -1818,6 +2831,186 @@ private struct POSShiftCard: View {
     }
 }
 
+private struct POSShiftControlSheet: View {
+    let `operator`: POSOperator
+    let shift: POSShiftEnvelope
+    let isSubmitting: Bool
+    let accentColor: Color
+    let onOpenShift: () -> Void
+    let onCashIn: () -> Void
+    let onCashOut: () -> Void
+    let onCloseShift: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .center, spacing: 13) {
+                    Image(systemName: "person.crop.circle.badge.checkmark")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(accentColor)
+                        .frame(width: 42, height: 42)
+                        .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("OPERATOR")
+                            .font(GlacialFont.caption(.bold))
+                            .tracking(2)
+                            .foregroundStyle(accentColor)
+                        Text(`operator`.name.uppercased())
+                            .font(GlacialFont.custom(28, .medium))
+                            .tracking(1.4)
+                            .foregroundStyle(AppPalette.ink)
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                )
+
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(shift.isOpen ? "SHIFT OPEN" : "SHIFT CLOSED")
+                                .font(GlacialFont.subheadline(.medium))
+                                .tracking(1.8)
+                                .foregroundStyle(AppPalette.ink)
+                            if let activeShift = shift.shift {
+                                Text("Shift #\(activeShift.id)")
+                                    .font(GlacialFont.caption())
+                                    .foregroundStyle(AppPalette.muted)
+                            }
+                        }
+
+                        Spacer()
+
+                        Text(shift.isOpen ? "ready" : "closed")
+                            .font(GlacialFont.caption(.bold))
+                            .textCase(.uppercase)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .foregroundStyle(shift.isOpen ? AppPalette.green : accentColor)
+                            .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                    }
+
+                    if let recap = shift.recap {
+                        HStack(spacing: 10) {
+                            POSShiftRecapTile(title: "ORDERS", value: "\(recap.orders)")
+                            POSShiftRecapTile(title: "REVENUE", value: "\(Int(recap.revenue).formatted())")
+                            POSShiftRecapTile(title: "CASH", value: "\(Int(recap.expectedCash).formatted())")
+                        }
+                    }
+                }
+                .padding(16)
+                .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line.opacity(0.8), lineWidth: 1)
+                )
+
+                VStack(spacing: 10) {
+                    if shift.isOpen {
+                        POSShiftMenuButton(title: "CASH IN", icon: "plus", isSubmitting: isSubmitting, accentColor: accentColor, action: onCashIn)
+                        POSShiftMenuButton(title: "CASH OUT", icon: "minus", isSubmitting: isSubmitting, accentColor: accentColor, action: onCashOut)
+                        POSShiftMenuButton(title: "CLOSE SHIFT", icon: "lock", isSubmitting: isSubmitting, accentColor: accentColor, tone: .danger, action: onCloseShift)
+                    } else {
+                        POSShiftMenuButton(title: "OPEN SHIFT", icon: "lock.open", isSubmitting: isSubmitting, accentColor: accentColor, action: onOpenShift)
+                    }
+                }
+
+                Spacer()
+            }
+            .padding(20)
+            .background(AppPalette.background.ignoresSafeArea())
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text("AUTHENTICATION")
+                        .font(GlacialFont.subheadline(.medium))
+                        .tracking(2.4)
+                        .foregroundStyle(AppPalette.ink)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("SAVE") {
+                        dismiss()
+                    }
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(1.8)
+                    .foregroundStyle(accentColor)
+                }
+            }
+        }
+    }
+}
+
+private struct POSShiftRecapTile: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(value)
+                .font(GlacialFont.subheadline(.semibold))
+                .foregroundStyle(AppPalette.ink)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+            Text(title)
+                .font(GlacialFont.caption2(.bold))
+                .foregroundStyle(AppPalette.muted)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct POSShiftMenuButton: View {
+    enum Tone {
+        case normal
+        case danger
+    }
+
+    let title: String
+    let icon: String
+    let isSubmitting: Bool
+    let accentColor: Color
+    var tone: Tone = .normal
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 26, height: 26)
+                    .foregroundStyle(tone == .danger ? AppPalette.red : accentColor)
+                    .background((tone == .danger ? AppPalette.red : accentColor).opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
+                Text(title)
+                    .font(GlacialFont.subheadline(.medium))
+                    .tracking(1.2)
+                    .foregroundStyle(AppPalette.ink)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(AppPalette.muted)
+            }
+            .padding(14)
+            .background(.white, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(AppPalette.line.opacity(0.8), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isSubmitting)
+        .opacity(isSubmitting ? 0.65 : 1)
+    }
+}
+
 private struct POSMiniButton: View {
     enum Tone {
         case normal
@@ -1846,6 +3039,7 @@ private struct POSMiniButton: View {
 
 private struct POSStartShiftSheet: View {
     let isSubmitting: Bool
+    let accentColor: Color
     let submit: (Double, String) async -> Bool
     @Environment(\.dismiss) private var dismiss
     @State private var openingCash = ""
@@ -1853,10 +3047,10 @@ private struct POSStartShiftSheet: View {
 
     var body: some View {
         POSShiftFormShell(
-            title: "Open shift",
-            primaryLabel: "open shift",
+            title: "OPEN SHIFT",
             isSubmitting: isSubmitting,
             canSubmit: parsedOpeningCash != nil,
+            accentColor: accentColor,
             submit: {
                 guard let amount = parsedOpeningCash else { return false }
                 return await submit(amount, notes)
@@ -1875,6 +3069,7 @@ private struct POSStartShiftSheet: View {
 private struct POSCashMovementSheet: View {
     let type: POSCashMovementType
     let isSubmitting: Bool
+    let accentColor: Color
     let submit: (Double, String) async -> Bool
     @Environment(\.dismiss) private var dismiss
     @State private var amount = ""
@@ -1882,10 +3077,10 @@ private struct POSCashMovementSheet: View {
 
     var body: some View {
         POSShiftFormShell(
-            title: type.title,
-            primaryLabel: type.buttonLabel,
+            title: type.title.uppercased(),
             isSubmitting: isSubmitting,
             canSubmit: parsedAmount != nil && !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            accentColor: accentColor,
             submit: {
                 guard let parsedAmount else { return false }
                 return await submit(parsedAmount, reason)
@@ -1908,6 +3103,7 @@ private struct POSCashMovementSheet: View {
 private struct POSEndShiftSheet: View {
     let expectedCash: Double?
     let isSubmitting: Bool
+    let accentColor: Color
     let submit: (Double?, String) async -> Bool
     @Environment(\.dismiss) private var dismiss
     @State private var closingCash = ""
@@ -1915,10 +3111,10 @@ private struct POSEndShiftSheet: View {
 
     var body: some View {
         POSShiftFormShell(
-            title: "Close shift",
-            primaryLabel: "close shift",
+            title: "CLOSE SHIFT",
             isSubmitting: isSubmitting,
             canSubmit: closingCash.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || parsedClosingCash != nil,
+            accentColor: accentColor,
             submit: {
                 await submit(parsedClosingCash, notes)
             }
@@ -1950,9 +3146,9 @@ private struct POSEndShiftSheet: View {
 
 private struct POSShiftFormShell<Content: View>: View {
     let title: String
-    let primaryLabel: String
     let isSubmitting: Bool
     let canSubmit: Bool
+    let accentColor: Color
     let submit: () async -> Bool
     @ViewBuilder let content: Content
     @Environment(\.dismiss) private var dismiss
@@ -1980,14 +3176,14 @@ private struct POSShiftFormShell<Content: View>: View {
                                 ProgressView()
                                     .tint(.white)
                             }
-                            Text(isSubmitting ? "saving" : primaryLabel)
+                            Text(isSubmitting ? "SAVING" : "SAVE")
                                 .font(GlacialFont.caption(.bold))
                                 .tracking(2.2)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 15)
                         .foregroundStyle(.white)
-                        .background(AppPalette.orange, in: RoundedRectangle(cornerRadius: 8))
+                        .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
                     }
                     .buttonStyle(.plain)
                     .disabled(isSubmitting || !canSubmit)
@@ -1997,9 +3193,15 @@ private struct POSShiftFormShell<Content: View>: View {
                 .background(.white)
             }
             .background(AppPalette.background.ignoresSafeArea())
-            .navigationTitle(title)
+            .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text(title)
+                        .font(GlacialFont.subheadline(.medium))
+                        .tracking(2.4)
+                        .foregroundStyle(AppPalette.ink)
+                }
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Close") {
                         dismiss()
@@ -2072,111 +3274,372 @@ private extension String {
     }
 }
 
+private extension UIImage {
+    func normalizedForPOSCard() -> UIImage {
+        let maxSide: CGFloat = 1600
+        let largestSide = max(size.width, size.height)
+        let scale = largestSide > maxSide ? maxSide / largestSide : 1
+        let targetSize = CGSize(width: size.width * scale, height: size.height * scale)
+
+        let renderer = UIGraphicsImageRenderer(size: targetSize)
+        return renderer.image { _ in
+            draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+    }
+}
+
 private struct POSCategoryChip: View {
     let title: String
     let isSelected: Bool
+    let isArranging: Bool
+    let wobblePhase: Bool
+    let namespace: Namespace.ID
+    let accentColor: Color
     let action: () -> Void
+    let onArrange: () -> Void
 
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(GlacialFont.caption(.bold))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
+                .font(GlacialFont.subheadline(.bold))
+                .tracking(1.4)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .padding(.horizontal, 17)
+                .frame(height: 40)
                 .foregroundStyle(isSelected ? .white : AppPalette.ink)
-                .background(isSelected ? AppPalette.red : AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                .background {
+                    if isSelected {
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(accentColor)
+                            .matchedGeometryEffect(id: "pos-category-selection", in: namespace)
+                    }
+                }
         }
         .buttonStyle(.plain)
+        .scaleEffect(isArranging ? 0.985 : 1)
+        .animation(.snappy(duration: 0.18), value: isArranging)
+    }
+}
+
+private struct POSProductAreaWallpaper: View {
+    var body: some View {
+        GeometryReader { proxy in
+            Image("POSLightWallpaper")
+                .resizable()
+                .scaledToFill()
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .opacity(0.28)
+                .overlay(.white.opacity(0.62))
+                .clipped()
+        }
+        .allowsHitTesting(false)
     }
 }
 
 private struct POSProductCard: View {
     let product: POSProduct
+    let imageURL: URL?
     let quantityInCart: Int
+    let cardSize: POSCardSize
+    let accentColor: Color
+    let isArranging: Bool
+    let wobblePhase: Bool
     let action: () -> Void
+    let onArrange: () -> Void
+    let onCycleSize: () -> Void
 
     var body: some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .top, spacing: 10) {
-                    AsyncImage(url: product.imageURL) { phase in
-                        switch phase {
-                        case .success(let image):
-                            image
-                                .resizable()
-                                .scaledToFill()
-                        case .failure:
-                            Image(systemName: "fork.knife")
-                                .font(.title2)
-                                .foregroundStyle(AppPalette.orange)
-                        case .empty:
-                            ProgressView()
-                                .tint(AppPalette.orange)
-                        @unknown default:
-                            EmptyView()
-                        }
-                    }
-                    .frame(width: 66, height: 66)
-                    .background(.white, in: RoundedRectangle(cornerRadius: 8))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            GeometryReader { proxy in
+                ZStack(alignment: .bottomLeading) {
+                    POSProductImage(url: imageURL)
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .clipped()
+
+                    LinearGradient(
+                        colors: [
+                            .black.opacity(0.02),
+                            .black.opacity(0.22),
+                            .black.opacity(0.64)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(width: proxy.size.width, height: proxy.size.height)
 
                     VStack(alignment: .leading, spacing: 5) {
                         Text(product.name.uppercased())
                             .font(GlacialFont.headline(.semibold))
-                            .foregroundStyle(AppPalette.ink)
-                            .lineLimit(2)
-                        Text(product.category)
-                            .font(GlacialFont.caption())
-                            .foregroundStyle(AppPalette.muted)
-                    }
-
-                    Spacer()
-
-                    if quantityInCart > 0 {
-                        Text("\(quantityInCart)")
-                            .font(GlacialFont.caption(.bold))
+                            .tracking(1.1)
                             .foregroundStyle(.white)
-                            .frame(width: 26, height: 26)
-                            .background(AppPalette.orange, in: Circle())
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .padding(14)
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .bottomLeading)
+
+                    VStack {
+                        HStack {
+                            Spacer()
+
+                            if !isArranging {
+                                ZStack(alignment: .topTrailing) {
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 16, weight: .semibold))
+                                        .foregroundStyle(.white)
+                                        .frame(width: 38, height: 38)
+                                        .background(accentColor.opacity(0.94), in: Circle())
+
+                                    if quantityInCart > 0 {
+                                        Text("\(quantityInCart)")
+                                            .font(GlacialFont.caption2(.bold))
+                                            .foregroundStyle(accentColor)
+                                            .frame(minWidth: 17, minHeight: 17)
+                                            .background(.white, in: Circle())
+                                            .offset(x: 3, y: -3)
+                                    }
+                                }
+                            }
+                        }
+                        Spacer()
+                    }
+                    .padding(12)
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+
+                    if isArranging {
+                        VStack {
+                            HStack {
+                                Button(action: onCycleSize) {
+                                    Text(cardSize.shortLabel)
+                                        .font(GlacialFont.caption(.bold))
+                                            .foregroundStyle(.white)
+                                            .frame(width: 30, height: 30)
+                                            .background(.ultraThinMaterial, in: Circle())
+                                            .overlay(
+                                                Circle()
+                                                    .fill(accentColor.opacity(0.78))
+                                                    .blendMode(.plusLighter)
+                                            )
+                                        .overlay(
+                                            Circle()
+                                                .stroke(.white.opacity(0.42), lineWidth: 1)
+                                        )
+                                        .shadow(color: .black.opacity(0.18), radius: 8, y: 4)
+                                }
+                                .buttonStyle(.plain)
+
+                                Spacer()
+                            }
+                            Spacer()
+                        }
+                        .padding(12)
+                        .frame(width: proxy.size.width, height: proxy.size.height)
                     }
                 }
-
-                HStack {
-                    Text("\(Int(product.price).formatted()) VND")
-                        .font(GlacialFont.subheadline(.semibold))
-                        .foregroundStyle(AppPalette.orange)
-
-                    Spacer()
-
-                    Text("\(Int(product.currentStock).formatted()) \(product.unit)")
-                        .font(GlacialFont.caption(.bold))
-                        .foregroundStyle(product.currentStock > 0 ? AppPalette.green : AppPalette.red)
-                }
-
-                Divider()
-
-                HStack {
-                    Label("\(product.toppings.count) toppings", systemImage: "plus.square")
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                }
-                .font(GlacialFont.caption())
-                .foregroundStyle(AppPalette.muted)
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
             }
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.white, in: RoundedRectangle(cornerRadius: 8))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(quantityInCart > 0 ? AppPalette.orange.opacity(0.8) : AppPalette.line.opacity(0.8), lineWidth: 1)
+                    .stroke(quantityInCart > 0 ? accentColor.opacity(0.8) : AppPalette.line.opacity(0.8), lineWidth: 1)
             )
+            .scaleEffect(isArranging ? 0.992 : 1)
+            .animation(.snappy(duration: 0.18), value: isArranging)
         }
         .buttonStyle(.plain)
     }
 }
 
+private struct POSCompactProductCard: View {
+    let product: POSProduct
+    let imageURL: URL?
+    let quantityInCart: Int
+    let accentColor: Color
+    let isArranging: Bool
+    let wobblePhase: Bool
+    let action: () -> Void
+    let onArrange: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 8) {
+                ZStack(alignment: .bottomLeading) {
+                    POSProductImage(url: imageURL)
+                        .frame(maxWidth: .infinity, minHeight: 118, maxHeight: 118)
+                        .clipped()
+
+                    LinearGradient(
+                        colors: [.black.opacity(0), .black.opacity(0.56)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+
+                    HStack(alignment: .bottom, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(product.name.uppercased())
+                                .font(GlacialFont.subheadline(.semibold))
+                                .tracking(0.8)
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+
+                        Spacer()
+
+                        if !isArranging {
+                            Image(systemName: "plus")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 31, height: 31)
+                                .background(accentColor.opacity(0.96), in: Circle())
+                        }
+                    }
+                    .padding(10)
+
+                    EmptyView()
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .background(.white, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(quantityInCart > 0 ? accentColor.opacity(0.8) : AppPalette.line.opacity(0.78), lineWidth: 1)
+            )
+            .overlay(alignment: .topTrailing) {
+                if quantityInCart > 0, !isArranging {
+                    Text("\(quantityInCart)")
+                        .font(GlacialFont.caption2(.bold))
+                        .foregroundStyle(.white)
+                        .frame(minWidth: 20, minHeight: 20)
+                        .background(accentColor, in: Circle())
+                        .padding(7)
+                }
+            }
+            .scaleEffect(isArranging ? 0.992 : 1)
+            .animation(.snappy(duration: 0.18), value: isArranging)
+        }
+        .buttonStyle(.plain)
+    }
+
+}
+
+private struct POSProductListRow: View {
+    let product: POSProduct
+    let imageURL: URL?
+    let quantityInCart: Int
+    let accentColor: Color
+    let isArranging: Bool
+    let wobblePhase: Bool
+    let action: () -> Void
+    let onArrange: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 13) {
+                POSProductImage(url: imageURL)
+                    .frame(width: 82, height: 82)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(product.name.uppercased())
+                        .font(GlacialFont.headline(.semibold))
+                        .tracking(0.7)
+                        .foregroundStyle(AppPalette.ink)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+
+                    Text("\(Int(product.price).formatted()) VND")
+                        .font(GlacialFont.subheadline(.semibold))
+                        .foregroundStyle(accentColor)
+                }
+
+                Spacer()
+
+                if !isArranging {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 34, height: 34)
+                            .background(accentColor, in: Circle())
+
+                        if quantityInCart > 0 {
+                            Text("\(quantityInCart)")
+                                .font(GlacialFont.caption2(.bold))
+                                .foregroundStyle(accentColor)
+                                .frame(minWidth: 17, minHeight: 17)
+                                .background(.white, in: Circle())
+                                .offset(x: 3, y: -3)
+                        }
+                    }
+                }
+            }
+            .padding(10)
+            .background(.white, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(quantityInCart > 0 ? accentColor.opacity(0.8) : AppPalette.line.opacity(0.75), lineWidth: 1)
+            )
+            .scaleEffect(isArranging ? 0.992 : 1)
+            .animation(.snappy(duration: 0.18), value: isArranging)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct POSProductImage: View {
+    let url: URL?
+
+    var body: some View {
+        if let url, url.isFileURL {
+            if let image = UIImage(contentsOfFile: url.path) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                POSProductImageFallback()
+            }
+        } else {
+            AsyncImage(url: url) { phase in
+                switch phase {
+                case .success(let image):
+                    image
+                        .resizable()
+                        .scaledToFill()
+                case .failure:
+                    POSProductImageFallback()
+                case .empty:
+                    ZStack {
+                        AppPalette.card
+                        ProgressView()
+                            .tint(AppPalette.orange)
+                    }
+                @unknown default:
+                    AppPalette.card
+                }
+            }
+        }
+    }
+}
+
+private struct POSProductImageFallback: View {
+    var body: some View {
+        ZStack {
+            AppPalette.card
+            Image(systemName: "fork.knife")
+                .font(.title3)
+                .foregroundStyle(AppPalette.orange)
+        }
+    }
+}
+
 private struct POSProductSheet: View {
     let product: POSProduct
+    let imageURL: URL?
+    let accentColor: Color
     let onAdd: ([POSTopping]) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var selectedToppingIDs = Set<Int>()
@@ -2205,7 +3668,7 @@ private struct POSProductSheet: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 26) {
                     productHeader
 
                     if toppingGroups.isEmpty {
@@ -2218,34 +3681,35 @@ private struct POSProductSheet: View {
                     } else {
                         ForEach(toppingGroups, id: \.0) { group in
                             VStack(alignment: .leading, spacing: 10) {
+                                Divider()
+                                    .background(AppPalette.line.opacity(0.8))
+
                                 Text(group.0.uppercased())
                                     .font(GlacialFont.caption(.bold))
                                     .tracking(1.8)
-                                    .foregroundStyle(AppPalette.orange)
+                                    .foregroundStyle(accentColor)
+                                    .padding(.top, 4)
 
                                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 10)], spacing: 10) {
                                     ForEach(group.1) { topping in
                                         POSToppingOption(
                                             topping: topping,
-                                            isSelected: selectedToppingIDs.contains(topping.id)
+                                            isSelected: selectedToppingIDs.contains(topping.id),
+                                            accentColor: accentColor
                                         ) {
                                             toggle(topping)
                                         }
                                     }
                                 }
                             }
-                            .padding(16)
-                            .background(.white, in: RoundedRectangle(cornerRadius: 8))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(AppPalette.line.opacity(0.8), lineWidth: 1)
-                            )
+                            .padding(.top, 2)
                         }
                     }
                 }
-                .padding(20)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 20)
             }
-            .background(AppPalette.background.ignoresSafeArea())
+            .background(Color.white.ignoresSafeArea())
             .navigationTitle("Customize")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -2255,23 +3719,23 @@ private struct POSProductSheet: View {
                     }
                     .foregroundStyle(AppPalette.ink)
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Text("\(Int(total).formatted()) VND")
-                        .font(GlacialFont.subheadline(.semibold))
-                        .foregroundStyle(AppPalette.orange)
-                }
             }
             .safeAreaInset(edge: .bottom) {
                 Button {
                     onAdd(selectedToppings)
                 } label: {
-                    Text("Add to cart")
-                        .font(GlacialFont.caption(.bold))
-                        .tracking(2.4)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 15)
-                        .foregroundStyle(.white)
-                        .background(AppPalette.orange, in: RoundedRectangle(cornerRadius: 8))
+                    HStack {
+                        Text("Add to cart")
+                        Spacer()
+                        Text("\(Int(total).formatted()) VND")
+                    }
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(1.8)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 15)
+                    .padding(.horizontal, 18)
+                    .foregroundStyle(.white)
+                    .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
                 }
                 .buttonStyle(.plain)
                 .padding(20)
@@ -2281,54 +3745,45 @@ private struct POSProductSheet: View {
     }
 
     private var productHeader: some View {
-        HStack(alignment: .top, spacing: 16) {
-            AsyncImage(url: product.imageURL) { phase in
-                switch phase {
-                case .success(let image):
-                    image
-                        .resizable()
-                        .scaledToFill()
-                case .failure:
-                    Image(systemName: "fork.knife")
-                        .font(.largeTitle)
-                        .foregroundStyle(AppPalette.orange)
-                case .empty:
-                    ProgressView()
-                        .tint(AppPalette.orange)
-                @unknown default:
-                    EmptyView()
-                }
-            }
-            .frame(width: 130, height: 130)
-            .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+        VStack(alignment: .leading, spacing: 0) {
+            ZStack(alignment: .bottomLeading) {
+                POSProductImage(url: imageURL)
+                .frame(maxWidth: .infinity, minHeight: 310, maxHeight: 310)
+                .clipped()
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text(product.category.uppercased())
-                    .font(GlacialFont.caption(.bold))
-                    .tracking(1.6)
-                    .foregroundStyle(AppPalette.orange)
-                Text(product.name.uppercased())
-                    .font(GlacialFont.custom(32, .semibold))
-                    .foregroundStyle(AppPalette.ink)
-                    .lineLimit(2)
-                Text("\(Int(product.price).formatted()) VND")
-                    .font(GlacialFont.title3(.semibold))
-                    .foregroundStyle(AppPalette.orange)
-                if let description = product.description, !description.isEmpty {
-                    Text(description)
-                        .font(GlacialFont.subheadline())
-                        .foregroundStyle(AppPalette.muted)
-                        .lineLimit(3)
+                LinearGradient(
+                    colors: [.black.opacity(0.0), .black.opacity(0.24), .black.opacity(0.68)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(product.category.uppercased())
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.8)
+                        .foregroundStyle(.white.opacity(0.82))
+                    Text(product.name.uppercased())
+                        .font(GlacialFont.custom(34, .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                    Text("\(Int(product.price).formatted()) VND")
+                        .font(GlacialFont.title3(.semibold))
+                        .foregroundStyle(.white.opacity(0.94))
                 }
+                .padding(20)
+            }
+
+            if let description = product.description, !description.isEmpty {
+                Text(description)
+                    .font(GlacialFont.subheadline())
+                    .foregroundStyle(AppPalette.muted)
+                    .lineLimit(4)
+                    .padding(.horizontal, 2)
+                    .padding(.top, 16)
             }
         }
-        .padding(18)
-        .background(.white, in: RoundedRectangle(cornerRadius: 8))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(AppPalette.line.opacity(0.8), lineWidth: 1)
-        )
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.top, 14)
     }
 
     private func toggle(_ topping: POSTopping) {
@@ -2345,6 +3800,7 @@ private struct POSProductSheet: View {
 private struct POSToppingOption: View {
     let topping: POSTopping
     let isSelected: Bool
+    let accentColor: Color
     let action: () -> Void
 
     var body: some View {
@@ -2364,9 +3820,54 @@ private struct POSToppingOption: View {
             .foregroundStyle(isSelected ? .white : AppPalette.ink)
             .padding(.horizontal, 12)
             .padding(.vertical, 12)
-            .background(isSelected ? AppPalette.orange : AppPalette.card, in: RoundedRectangle(cornerRadius: 7))
+            .background(isSelected ? accentColor : AppPalette.card, in: RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct POSCartAccessButton: View {
+    let itemCount: Int
+    let total: Double
+    let onCheckout: () -> Void
+
+    var body: some View {
+        Button(action: onCheckout) {
+            HStack(spacing: 12) {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "bag")
+                        .font(.system(size: 21, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 42, height: 42)
+
+                    Text("\(itemCount)")
+                        .font(GlacialFont.caption2(.bold))
+                        .foregroundStyle(AppPalette.orange)
+                        .frame(minWidth: 18, minHeight: 18)
+                        .background(.white, in: Circle())
+                        .offset(x: 7, y: -6)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("checkout")
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(2)
+                    Text("\(Int(total).formatted()) VND")
+                        .font(GlacialFont.subheadline(.semibold))
+                }
+
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.bold))
+            }
+            .foregroundStyle(.white)
+            .padding(.leading, 12)
+            .padding(.trailing, 16)
+            .padding(.vertical, 10)
+            .background(AppPalette.orange, in: RoundedRectangle(cornerRadius: 8))
+            .shadow(color: AppPalette.orange.opacity(0.24), radius: 16, y: 8)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Checkout \(itemCount) items")
     }
 }
 
@@ -2521,6 +4022,8 @@ private struct POSCheckoutSheet: View {
     let baseURL: String
     let token: String
     let isSubmitting: Bool
+    let accentColor: Color
+    let productImageURL: (POSProduct) -> URL?
     let submit: (POSPaymentMethod, POSOrderSource, String, POSCustomer?, Double, String) async -> Bool
     @Environment(\.dismiss) private var dismiss
     @State private var paymentMethod: POSPaymentMethod = .cash
@@ -2560,16 +4063,7 @@ private struct POSCheckoutSheet: View {
             VStack(spacing: 0) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("review")
-                                .font(GlacialFont.caption(.bold))
-                                .tracking(2)
-                                .foregroundStyle(AppPalette.orange)
-                            Text("\(lines.reduce(0) { $0 + $1.quantity }) items")
-                                .font(GlacialFont.custom(34, .semibold))
-                                .foregroundStyle(AppPalette.ink)
-                        }
-
+                        recapSection
                         customerSection
                         sourceSelector
 
@@ -2590,12 +4084,6 @@ private struct POSCheckoutSheet: View {
                         paymentSelector
                         discountSection
                         notesSection
-
-                        VStack(spacing: 10) {
-                            ForEach(lines) { line in
-                                POSCheckoutLine(line: line)
-                            }
-                        }
                     }
                     .padding(20)
                 }
@@ -2605,7 +4093,7 @@ private struct POSCheckoutSheet: View {
                     VStack(spacing: 6) {
                         POSCheckoutTotalRow(title: "subtotal", value: total)
                         if parsedDiscountPercent > 0 {
-                            POSCheckoutTotalRow(title: "discount \(String(format: "%.1f", parsedDiscountPercent))%", value: -discountAmount, tint: AppPalette.orange)
+                            POSCheckoutTotalRow(title: "discount \(String(format: "%.1f", parsedDiscountPercent))%", value: -discountAmount, tint: accentColor)
                         }
                         HStack(alignment: .firstTextBaseline) {
                             Text("TOTAL")
@@ -2639,14 +4127,14 @@ private struct POSCheckoutSheet: View {
                                 ProgressView()
                                     .tint(.white)
                             }
-                            Text(isSubmitting ? "sending" : "send sale")
+                            Text(isSubmitting ? "COMPLETING" : "COMPLETE")
                                 .font(GlacialFont.caption(.bold))
                                 .tracking(2.2)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 15)
                         .foregroundStyle(.white)
-                        .background(AppPalette.orange, in: RoundedRectangle(cornerRadius: 8))
+                        .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
                     }
                     .buttonStyle(.plain)
                     .disabled(isSubmitting)
@@ -2656,7 +4144,7 @@ private struct POSCheckoutSheet: View {
                 .background(.white)
             }
             .background(AppPalette.background.ignoresSafeArea())
-            .navigationTitle("Checkout")
+            .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -2676,8 +4164,28 @@ private struct POSCheckoutSheet: View {
         }
     }
 
+    private var recapSection: some View {
+        POSCheckoutChoiceGroup(title: "order recap") {
+            VStack(spacing: 0) {
+                ForEach(Array(lines.enumerated()), id: \.element.id) { index, line in
+                    POSCheckoutRecapLine(
+                        index: index + 1,
+                        line: line,
+                        imageURL: productImageURL(line.product)
+                    )
+
+                    if index < lines.count - 1 {
+                        Divider()
+                            .background(AppPalette.line.opacity(0.8))
+                            .padding(.vertical, 10)
+                    }
+                }
+            }
+        }
+    }
+
     private var sourceSelector: some View {
-        POSCheckoutChoiceGroup(title: "source") {
+        POSCheckoutChoiceGroup(title: "order source") {
             HStack(spacing: 10) {
                 sourcePill(.inStore)
                 sourcePill(.grabfood)
@@ -2702,7 +4210,7 @@ private struct POSCheckoutSheet: View {
     }
 
     private var customerSection: some View {
-        POSCheckoutChoiceGroup(title: "customer") {
+        POSCheckoutChoiceGroup(title: "customer info") {
             VStack(alignment: .leading, spacing: 12) {
                 if let selectedCustomer {
                     HStack(spacing: 10) {
@@ -2719,14 +4227,14 @@ private struct POSCheckoutSheet: View {
                             self.selectedCustomer = nil
                         }
                         .font(GlacialFont.caption(.bold))
-                        .foregroundStyle(AppPalette.orange)
+                        .foregroundStyle(accentColor)
                     }
                     .padding(12)
-                    .background(AppPalette.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                    .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
                 }
 
                 HStack(spacing: 8) {
-                    TextField("Name, phone, email", text: $customerSearch)
+                    TextField("name, phone number, email", text: $customerSearch)
                         .font(GlacialFont.subheadline())
                         .textInputAutocapitalization(.words)
                         .padding(12)
@@ -2748,7 +4256,7 @@ private struct POSCheckoutSheet: View {
                     .font(GlacialFont.subheadline(.bold))
                     .frame(width: 46, height: 44)
                     .foregroundStyle(.white)
-                    .background(AppPalette.orange, in: RoundedRectangle(cornerRadius: 8))
+                    .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
                     .buttonStyle(.plain)
                     .disabled(isSearchingCustomer)
                 }
@@ -2762,7 +4270,7 @@ private struct POSCheckoutSheet: View {
                 if !customerResults.isEmpty {
                     VStack(spacing: 8) {
                         ForEach(customerResults) { customer in
-                            POSCustomerResultRow(customer: customer) {
+                            POSCustomerResultRow(customer: customer, accentColor: accentColor) {
                                 selectedCustomer = customer
                                 customerResults = []
                                 customerSearch = customer.name
@@ -2778,20 +4286,24 @@ private struct POSCheckoutSheet: View {
                 } label: {
                     HStack {
                         Image(systemName: isCreateCustomerOpen ? "minus" : "plus")
-                        Text(isCreateCustomerOpen ? "hide new customer" : "new customer")
+                            .frame(width: isCreateCustomerOpen ? 18 : nil)
+                        if !isCreateCustomerOpen {
+                            Text("NEW CUSTOMER")
+                        }
                     }
                     .font(GlacialFont.caption(.bold))
-                    .foregroundStyle(AppPalette.orange)
+                    .tracking(isCreateCustomerOpen ? 0 : 1.6)
+                    .foregroundStyle(accentColor)
                 }
                 .buttonStyle(.plain)
 
                 if isCreateCustomerOpen {
                     VStack(spacing: 8) {
-                        TextField("Customer name", text: $newCustomerName)
+                        TextField("name", text: $newCustomerName)
                             .textInputAutocapitalization(.words)
-                        TextField("Phone", text: $newCustomerPhone)
+                        TextField("phone number", text: $newCustomerPhone)
                             .keyboardType(.phonePad)
-                        TextField("Email optional", text: $newCustomerEmail)
+                        TextField("email optional", text: $newCustomerEmail)
                             .keyboardType(.emailAddress)
                             .textInputAutocapitalization(.never)
                         Button {
@@ -2840,7 +4352,7 @@ private struct POSCheckoutSheet: View {
     }
 
     private var notesSection: some View {
-        POSCheckoutChoiceGroup(title: "notes") {
+        POSCheckoutChoiceGroup(title: "order notes") {
             TextField("Optional order note", text: $notes, axis: .vertical)
                 .font(GlacialFont.subheadline())
                 .lineLimit(2...4)
@@ -2850,13 +4362,13 @@ private struct POSCheckoutSheet: View {
     }
 
     private func sourcePill(_ source: POSOrderSource) -> some View {
-        POSCheckoutPill(title: source.label, isSelected: orderSource == source) {
+        POSCheckoutPill(title: source.label, isSelected: orderSource == source, accentColor: accentColor) {
             orderSource = source
         }
     }
 
     private func paymentPill(_ method: POSPaymentMethod) -> some View {
-        POSCheckoutPill(title: method.label, isSelected: paymentMethod == method) {
+        POSCheckoutPill(title: method.label, isSelected: paymentMethod == method, accentColor: accentColor) {
             paymentMethod = method
         }
     }
@@ -2921,13 +4433,14 @@ private struct POSCheckoutSheet: View {
 
 private struct POSCustomerResultRow: View {
     let customer: POSCustomer
+    let accentColor: Color
     let onSelect: () -> Void
 
     var body: some View {
         Button(action: onSelect) {
             HStack(spacing: 10) {
                 Image(systemName: "person.crop.circle")
-                    .foregroundStyle(AppPalette.orange)
+                    .foregroundStyle(accentColor)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(customer.name)
                         .font(GlacialFont.subheadline(.semibold))
@@ -2939,7 +4452,7 @@ private struct POSCustomerResultRow: View {
                 Spacer()
                 Text("Level \(customer.level)")
                     .font(GlacialFont.caption(.bold))
-                    .foregroundStyle(AppPalette.orange)
+                    .foregroundStyle(accentColor)
             }
             .padding(10)
             .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
@@ -2992,52 +4505,88 @@ private struct POSCheckoutChoiceGroup<Content: View>: View {
 private struct POSCheckoutPill: View {
     let title: String
     let isSelected: Bool
+    let accentColor: Color
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            Text(title.lowercased())
+            Text(title.uppercased())
                 .font(GlacialFont.caption(.bold))
+                .tracking(1.1)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 9)
                 .frame(maxWidth: .infinity)
                 .foregroundStyle(isSelected ? .white : AppPalette.ink)
-                .background(isSelected ? AppPalette.orange : AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                .background(isSelected ? accentColor : AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
     }
 }
 
-private struct POSCheckoutLine: View {
+private struct POSCheckoutRecapLine: View {
+    let index: Int
     let line: POSCartLine
+    let imageURL: URL?
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Text("\(line.quantity)x")
-                .font(GlacialFont.caption(.bold))
-                .foregroundStyle(AppPalette.orange)
-                .frame(width: 34, alignment: .leading)
+        HStack(alignment: .top, spacing: 12) {
+            POSProductImage(url: imageURL)
+                .frame(width: 58, height: 58)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line.opacity(0.75), lineWidth: 1)
+                )
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(line.product.name)
-                    .font(GlacialFont.subheadline(.semibold))
-                    .foregroundStyle(AppPalette.ink)
-                if !line.toppings.isEmpty {
-                    Text(line.toppings.map(\.name).joined(separator: ", "))
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text("\(index). \(line.product.name)")
+                        .font(GlacialFont.subheadline(.semibold))
+                        .foregroundStyle(AppPalette.ink)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.74)
+
+                    Spacer(minLength: 8)
+
+                    Text("\(Int(line.product.price * Double(line.quantity)).formatted()) VND")
+                        .font(GlacialFont.subheadline(.semibold))
+                        .foregroundStyle(AppPalette.ink)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
+                }
+
+                if line.quantity > 1 {
+                    Text("quantity \(line.quantity)")
+                        .font(GlacialFont.caption(.bold))
+                        .foregroundStyle(AppPalette.orange)
+                }
+
+                if line.toppings.isEmpty {
+                    Text("no toppings")
                         .font(GlacialFont.caption())
                         .foregroundStyle(AppPalette.muted)
-                        .lineLimit(2)
+                } else {
+                    VStack(spacing: 5) {
+                        ForEach(line.toppings) { topping in
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                Text("+ \(topping.name)")
+                                    .font(GlacialFont.caption())
+                                    .foregroundStyle(AppPalette.muted)
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.78)
+
+                                Spacer(minLength: 8)
+
+                                Text("\(Int(topping.price * Double(line.quantity)).formatted()) VND")
+                                    .font(GlacialFont.caption(.semibold))
+                                    .foregroundStyle(AppPalette.orange)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
                 }
             }
-
-            Spacer()
-
-            Text("\(Int(line.lineTotal).formatted())")
-                .font(GlacialFont.subheadline(.semibold))
-                .foregroundStyle(AppPalette.ink)
         }
-        .padding(14)
-        .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -3365,56 +4914,552 @@ private struct StatusBadge: View {
     }
 }
 
-private struct SettingsView: View {
-    @ObservedObject var store: KitchenStore
+private struct POSRecapSheet: View {
+    let recap: POSRecap?
+    let isLoading: Bool
+    let errorMessage: String?
+    let accentColor: Color
+    let refresh: () -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var baseURL: String = ""
-    @State private var token: String = ""
-    @State private var previewTone: KitchenChimeTone?
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section("Ember OS") {
-                    TextField("Base URL", text: $baseURL)
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.URL)
-                    SecureField("Kitchen token", text: $token)
-                        .textInputAutocapitalization(.never)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if let recap {
+                        POSRecapHero(summary: recap.summary, accentColor: accentColor)
+
+                        HStack(spacing: 10) {
+                            POSRecapMiniMetric(title: "ORDERS", value: "\(recap.summary.ordersCount)", icon: "receipt", accentColor: accentColor)
+                            POSRecapMiniMetric(title: "AVERAGE", value: recap.summary.averageTicket.currencyText, icon: "chart.line.uptrend.xyaxis", accentColor: accentColor)
+                        }
+
+                        POSRecapSplitSection(title: "PAYMENT", emptyText: "No payments yet today.", splits: recap.paymentSplit, accentColor: accentColor)
+                        POSRecapSplitSection(title: "SOURCE", emptyText: "No sources yet today.", splits: recap.sourceSplit, accentColor: accentColor)
+                        POSRecapBestSellersSection(bestSellers: recap.bestSellers, accentColor: accentColor)
+                    } else if isLoading {
+                        VStack(spacing: 14) {
+                            ProgressView()
+                                .tint(accentColor)
+                            Text("LOADING RECAP")
+                                .font(GlacialFont.caption(.bold))
+                                .tracking(2)
+                                .foregroundStyle(AppPalette.muted)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 260)
+                    }
+
+                    if let errorMessage {
+                        ErrorBanner(message: errorMessage, retry: refresh)
+                    }
+
+                    Button {
+                        refresh()
+                    } label: {
+                        HStack(spacing: 8) {
+                            if isLoading {
+                                ProgressView()
+                                    .tint(.white)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+
+                            Text(isLoading ? "REFRESHING" : "REFRESH")
+                        }
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(2.2)
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isLoading)
+                }
+                .padding(18)
+            }
+            .background(Color.white.ignoresSafeArea())
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Close") {
+                        dismiss()
+                    }
+                    .foregroundStyle(AppPalette.ink)
                 }
 
-                Section("Sound") {
-                    ForEach(KitchenChimeTone.allCases) { tone in
-                        ChimeToneRow(
-                            tone: tone,
-                            isSaved: tone == store.chimeTone,
-                            isPreviewing: tone == previewTone
-                        ) {
-                            if previewTone == tone, store.chimeTone != tone {
-                                store.saveChimeTone(tone)
-                            } else {
-                                previewTone = tone
-                                store.previewChimeTone(tone)
-                            }
+                ToolbarItem(placement: .principal) {
+                    Text("RECAP")
+                        .font(GlacialFont.subheadline(.medium))
+                        .tracking(2.4)
+                        .foregroundStyle(AppPalette.ink)
+                }
+            }
+            .onAppear {
+                if recap == nil {
+                    refresh()
+                }
+            }
+        }
+    }
+}
+
+private struct POSRecapHero: View {
+    let summary: POSRecapSummary
+    let accentColor: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("TODAY")
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(2.2)
+                        .foregroundStyle(accentColor)
+
+                    Text(summary.salesTotal.currencyText)
+                        .font(GlacialFont.custom(38, .semibold))
+                        .foregroundStyle(AppPalette.ink)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                }
+
+                Spacer()
+
+                Image(systemName: "chart.bar.doc.horizontal")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(accentColor)
+                    .frame(width: 54, height: 54)
+                    .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            Text("SALES TOTAL")
+                .font(GlacialFont.caption(.bold))
+                .tracking(2)
+                .foregroundStyle(AppPalette.muted)
+        }
+        .padding(18)
+        .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+        )
+    }
+}
+
+private struct POSRecapMiniMetric: View {
+    let title: String
+    let value: String
+    let icon: String
+    let accentColor: Color
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(accentColor)
+                .frame(width: 34, height: 34)
+                .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(GlacialFont.caption2(.bold))
+                    .tracking(1.6)
+                    .foregroundStyle(AppPalette.muted)
+
+                Text(value)
+                    .font(GlacialFont.headline(.semibold))
+                    .foregroundStyle(AppPalette.ink)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.76)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity)
+        .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+        )
+    }
+}
+
+private struct POSRecapSplitSection: View {
+    let title: String
+    let emptyText: String
+    let splits: [POSRecapSplit]
+    let accentColor: Color
+
+    var body: some View {
+        POSRecapCard(title: title, icon: title == "PAYMENT" ? "creditcard" : "point.3.connected.trianglepath.dotted") {
+            if splits.isEmpty {
+                POSRecapEmptyLine(text: emptyText)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(splits.enumerated()), id: \.element.id) { index, split in
+                        POSRecapSplitRow(split: split, accentColor: accentColor)
+
+                        if index < splits.count - 1 {
+                            SettingsDivider()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct POSRecapCard<Content: View>: View {
+    let title: String
+    let icon: String
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 9) {
+                Image(systemName: icon)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(AppPalette.muted)
+
+                Text(title)
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(2.2)
+                    .foregroundStyle(AppPalette.ink)
+            }
+
+            content()
+        }
+        .padding(14)
+        .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+        )
+    }
+}
+
+private struct POSRecapSplitRow: View {
+    let split: POSRecapSplit
+    let accentColor: Color
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(split.label.uppercased())
+                    .font(GlacialFont.subheadline(.semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(AppPalette.ink)
+                    .lineLimit(1)
+
+                Text("\(split.ordersCount) \(split.ordersCount == 1 ? "order" : "orders")")
+                    .font(GlacialFont.caption())
+                    .foregroundStyle(AppPalette.muted)
+            }
+
+            Spacer()
+
+            Text(split.salesTotal.currencyText)
+                .font(GlacialFont.subheadline(.semibold))
+                .foregroundStyle(accentColor)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+        }
+        .padding(.vertical, 11)
+    }
+}
+
+private struct POSRecapBestSellersSection: View {
+    let bestSellers: [POSBestSeller]
+    let accentColor: Color
+
+    var body: some View {
+        POSRecapCard(title: "BEST SELLERS", icon: "sparkles") {
+            if bestSellers.isEmpty {
+                POSRecapEmptyLine(text: "No products sold yet today.")
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(bestSellers.enumerated()), id: \.element.id) { index, seller in
+                        POSBestSellerRow(rank: index + 1, seller: seller, accentColor: accentColor)
+
+                        if index < bestSellers.count - 1 {
+                            SettingsDivider()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct POSBestSellerRow: View {
+    let rank: Int
+    let seller: POSBestSeller
+    let accentColor: Color
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("\(rank)")
+                .font(GlacialFont.caption(.bold))
+                .foregroundStyle(.white)
+                .frame(width: 28, height: 28)
+                .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(seller.productName)
+                    .font(GlacialFont.subheadline(.semibold))
+                    .foregroundStyle(AppPalette.ink)
+                    .lineLimit(1)
+
+                Text("\(seller.quantity.formatted()) sold")
+                    .font(GlacialFont.caption())
+                    .foregroundStyle(AppPalette.muted)
+            }
+
+            Spacer()
+
+            Text(seller.salesTotal.currencyText)
+                .font(GlacialFont.subheadline(.semibold))
+                .foregroundStyle(accentColor)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+        }
+        .padding(.vertical, 11)
+    }
+}
+
+private struct POSRecapEmptyLine: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(GlacialFont.subheadline())
+            .foregroundStyle(AppPalette.muted)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 12)
+    }
+}
+
+private struct SettingsView: View {
+    @ObservedObject var store: KitchenStore
+    @ObservedObject var posStore: POSStore
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("POSProductDisplayStyle") private var posProductDisplayStyleRaw = POSProductDisplayStyle.productCard.rawValue
+    @AppStorage("POSAccentColor") private var posAccentColorRaw = POSAccentColor.ember.rawValue
+    @State private var baseURL: String = ""
+    @State private var token: String = ""
+    @State private var previewTone: KitchenChimeTone?
+    @State private var connectionOpen = false
+    @State private var soundOpen = false
+    @State private var displayOpen = false
+    @State private var catalogOpen = false
+
+    private var selectedPOSDisplayStyle: POSProductDisplayStyle {
+        POSProductDisplayStyle(rawValue: posProductDisplayStyleRaw) ?? .productCard
+    }
+
+    private var selectedPOSAccentColor: POSAccentColor {
+        POSAccentColor(rawValue: posAccentColorRaw) ?? .ember
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    SettingsDisclosureCard(
+                        title: "emberOS",
+                        subtitle: "Server and device token",
+                        icon: "bolt.horizontal.circle",
+                        isExpanded: $connectionOpen,
+                        accentColor: selectedPOSAccentColor.color
+                    ) {
+                        VStack(spacing: 0) {
+                            SettingsTextFieldRow(title: "Base URL", text: $baseURL, isSecure: false)
+                            SettingsDivider()
+                            SettingsTextFieldRow(title: "emberOS Key", text: $token, isSecure: true)
                         }
                     }
 
-                    Button("Stop Preview") {
-                        previewTone = nil
-                        store.stopChime()
-                    }
-                    .foregroundStyle(AppPalette.red)
-                }
+                    SettingsDisclosureCard(
+                        title: "Sound",
+                        subtitle: store.chimeTone.label,
+                        icon: "speaker.wave.2",
+                        isExpanded: $soundOpen,
+                        accentColor: selectedPOSAccentColor.color
+                    ) {
+                        VStack(spacing: 0) {
+                            ForEach(Array(KitchenChimeTone.allCases.enumerated()), id: \.element.id) { index, tone in
+                                ChimeToneRow(
+                                    tone: tone,
+                                    isSaved: tone == store.chimeTone,
+                                    isPreviewing: tone == previewTone,
+                                    accentColor: selectedPOSAccentColor.color
+                                ) {
+                                    if previewTone == tone, store.chimeTone != tone {
+                                        store.saveChimeTone(tone)
+                                    } else {
+                                        previewTone = tone
+                                        store.previewChimeTone(tone)
+                                    }
+                                }
 
-                Section {
-                    Button("Save and Refresh") {
+                                if index < KitchenChimeTone.allCases.count - 1 {
+                                    SettingsDivider()
+                                }
+                            }
+
+                            SettingsDivider()
+
+                            Button("Stop preview") {
+                                previewTone = nil
+                                store.stopChime()
+                            }
+                            .font(GlacialFont.subheadline(.semibold))
+                            .foregroundStyle(AppPalette.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 12)
+                        }
+                    }
+
+                    SettingsDisclosureCard(
+                        title: "POS Display",
+                        subtitle: "\(selectedPOSDisplayStyle.label) · \(selectedPOSAccentColor.label)",
+                        icon: "rectangle.grid.2x2",
+                        isExpanded: $displayOpen,
+                        accentColor: selectedPOSAccentColor.color
+                    ) {
+                        VStack(spacing: 0) {
+                            ForEach(Array(POSProductDisplayStyle.allCases.enumerated()), id: \.element.id) { index, style in
+                                Button {
+                                    posProductDisplayStyleRaw = style.rawValue
+                                    Haptics.impact(.light)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: style.icon)
+                                            .font(.headline.weight(.semibold))
+                                            .foregroundStyle(style == selectedPOSDisplayStyle ? selectedPOSAccentColor.color : AppPalette.muted)
+                                            .frame(width: 28, height: 28)
+
+                                        Text(style.label)
+                                            .font(GlacialFont.body(.semibold))
+                                            .foregroundStyle(AppPalette.ink)
+
+                                        Spacer()
+
+                                        if style == selectedPOSDisplayStyle {
+                                            Image(systemName: "checkmark")
+                                                .font(.headline.weight(.bold))
+                                                .foregroundStyle(selectedPOSAccentColor.color)
+                                        }
+                                    }
+                                    .padding(.vertical, 12)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+
+                                if index < POSProductDisplayStyle.allCases.count - 1 {
+                                    SettingsDivider()
+                                }
+                            }
+
+                            SettingsDivider()
+                                .padding(.vertical, 4)
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("BUTTON COLOR")
+                                    .font(GlacialFont.caption(.bold))
+                                    .tracking(1.8)
+                                    .foregroundStyle(AppPalette.muted)
+
+                                HStack(spacing: 10) {
+                                    ForEach(POSAccentColor.allCases) { accent in
+                                        Button {
+                                            posAccentColorRaw = accent.rawValue
+                                            Haptics.selectionChanged()
+                                        } label: {
+                                            VStack(spacing: 6) {
+                                                ZStack {
+                                                    Circle()
+                                                        .fill(accent.color)
+                                                        .frame(width: 34, height: 34)
+                                                        .overlay(
+                                                            Circle()
+                                                                .stroke(.white, lineWidth: 2)
+                                                        )
+                                                        .shadow(color: accent.color.opacity(0.24), radius: 8, y: 4)
+
+                                                    if accent == selectedPOSAccentColor {
+                                                        Image(systemName: "checkmark")
+                                                            .font(.caption.weight(.bold))
+                                                            .foregroundStyle(.white)
+                                                    }
+                                                }
+
+                                                Text(accent.label.uppercased())
+                                                    .font(GlacialFont.caption2(.bold))
+                                                    .tracking(0.7)
+                                                    .foregroundStyle(accent == selectedPOSAccentColor ? AppPalette.ink : AppPalette.muted)
+                                                    .lineLimit(1)
+                                            }
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 8)
+                                            .background(
+                                                accent == selectedPOSAccentColor ? accent.color.opacity(0.10) : Color.clear,
+                                                in: RoundedRectangle(cornerRadius: 8)
+                                            )
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                            .padding(.top, 4)
+                        }
+                    }
+
+                    SettingsDisclosureCard(
+                        title: "POS Catalog",
+                        subtitle: "Pictures unlocked, inventory locked",
+                        icon: "shippingbox",
+                        isExpanded: $catalogOpen,
+                        accentColor: selectedPOSAccentColor.color
+                    ) {
+                        VStack(spacing: 14) {
+                            POSProductPictureSettingsList(posStore: posStore, accentColor: selectedPOSAccentColor.color)
+                            SettingsDivider()
+                            LockedCatalogSettingsCard(accentColor: selectedPOSAccentColor.color)
+                        }
+                    }
+
+                    Button {
                         store.saveSettings(baseURL: baseURL, token: token)
                         dismiss()
+                    } label: {
+                        Text("SAVE")
+                            .font(GlacialFont.subheadline(.medium))
+                            .tracking(2.4)
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 15)
+                            .background(selectedPOSAccentColor.color, in: RoundedRectangle(cornerRadius: 8))
                     }
-                    .font(GlacialFont.headline())
+                    .buttonStyle(.plain)
+                    .padding(.top, 4)
+                }
+                .padding(18)
+            }
+            .background(Color.white.ignoresSafeArea())
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text("SETTINGS")
+                        .font(GlacialFont.subheadline(.medium))
+                        .tracking(2.4)
+                        .foregroundStyle(AppPalette.ink)
                 }
             }
-            .navigationTitle("Kitchen Settings")
             .onAppear {
                 baseURL = store.baseURL
                 token = store.kitchenToken
@@ -3423,10 +5468,312 @@ private struct SettingsView: View {
     }
 }
 
+private struct SettingsDisclosureCard<Content: View>: View {
+    let title: String
+    let subtitle: String
+    let icon: String
+    @Binding var isExpanded: Bool
+    let accentColor: Color
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.spring(response: 0.32, dampingFraction: 0.84)) {
+                    isExpanded.toggle()
+                }
+                Haptics.selectionChanged()
+            } label: {
+                HStack(spacing: 13) {
+                    Image(systemName: icon)
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(accentColor)
+                        .frame(width: 38, height: 38)
+                        .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(title)
+                            .font(GlacialFont.headline(.semibold))
+                            .foregroundStyle(AppPalette.ink)
+
+                        Text(subtitle)
+                            .font(GlacialFont.caption())
+                            .foregroundStyle(AppPalette.muted)
+                            .lineLimit(1)
+                    }
+
+                    Spacer()
+
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(AppPalette.muted)
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+                .padding(14)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .zIndex(1)
+
+            if isExpanded {
+                SettingsDivider()
+                    .padding(.horizontal, 14)
+
+                content()
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 14)
+                    .transition(.opacity)
+            }
+        }
+        .clipped()
+        .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+        )
+    }
+}
+
+private struct SettingsTextFieldRow: View {
+    let title: String
+    @Binding var text: String
+    let isSecure: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(GlacialFont.subheadline(.semibold))
+                .foregroundStyle(AppPalette.ink)
+                .frame(width: 118, alignment: .leading)
+
+            if isSecure {
+                SecureField(title, text: $text)
+                    .font(GlacialFont.subheadline())
+                    .foregroundStyle(AppPalette.ink)
+                    .textInputAutocapitalization(.never)
+            } else {
+                TextField(title, text: $text)
+                    .font(GlacialFont.subheadline())
+                    .foregroundStyle(AppPalette.ink)
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.URL)
+            }
+        }
+        .padding(.vertical, 12)
+    }
+}
+
+private struct SettingsDivider: View {
+    var body: some View {
+        Rectangle()
+            .fill(AppPalette.line.opacity(0.66))
+            .frame(height: 1)
+    }
+}
+
+private struct LockedCatalogSettingsCard: View {
+    let accentColor: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "lock.shield")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(accentColor)
+                    .frame(width: 34, height: 34)
+                    .background(accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Catalog editor locked")
+                        .font(GlacialFont.headline(.semibold))
+                        .foregroundStyle(AppPalette.ink)
+                    Text("Products and categories are linked to EmberOS inventory. Creation, deletion, price, category, and inventory edits stay locked until the native POS catalog API is ready.")
+                        .font(GlacialFont.caption())
+                        .foregroundStyle(AppPalette.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            VStack(spacing: 8) {
+                LockedCatalogAction(title: "add / edit products", icon: "square.and.pencil", accentColor: accentColor)
+                LockedCatalogAction(title: "categories", icon: "rectangle.3.group", accentColor: accentColor)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private struct POSProductPictureSettingsList: View {
+    @ObservedObject var posStore: POSStore
+    let accentColor: Color
+
+    private var products: [POSProduct] {
+        posStore.bootstrap?.catalog.products.sorted {
+            if $0.category == $1.category {
+                return $0.sortOrder == $1.sortOrder ? $0.name < $1.name : $0.sortOrder < $1.sortOrder
+            }
+
+            return $0.category < $1.category
+        } ?? []
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "photo.on.rectangle.angled")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(accentColor)
+                    .frame(width: 34, height: 34)
+                    .background(accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Product pictures")
+                        .font(GlacialFont.headline(.semibold))
+                        .foregroundStyle(AppPalette.ink)
+                    Text("Local POS image overrides only. EmberOS inventory, website store, prices, categories, and product logic are unchanged.")
+                        .font(GlacialFont.caption())
+                        .foregroundStyle(AppPalette.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if products.isEmpty {
+                Text("Load the POS once, then product pictures will appear here.")
+                    .font(GlacialFont.caption())
+                    .foregroundStyle(AppPalette.muted)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(products) { product in
+                        POSProductPictureSettingsRow(
+                            product: product,
+                            imageURL: posStore.imageURL(for: product),
+                            hasOverride: posStore.productImageOverrideURLs[product.id] != nil,
+                            accentColor: accentColor
+                        ) { data in
+                            await posStore.setProductImageOverride(productID: product.id, data: data)
+                        } onReset: {
+                            posStore.clearProductImageOverride(productID: product.id)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private struct POSProductPictureSettingsRow: View {
+    let product: POSProduct
+    let imageURL: URL?
+    let hasOverride: Bool
+    let accentColor: Color
+    let onPicked: (Data) async -> Void
+    let onReset: () -> Void
+    @State private var selectedPhoto: PhotosPickerItem?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            POSProductImage(url: imageURL)
+                .frame(width: 56, height: 56)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line.opacity(0.8), lineWidth: 1)
+                )
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(product.name)
+                    .font(GlacialFont.subheadline(.semibold))
+                    .foregroundStyle(AppPalette.ink)
+                    .lineLimit(1)
+
+                Text(hasOverride ? "custom POS picture" : product.category)
+                    .font(GlacialFont.caption())
+                    .foregroundStyle(hasOverride ? accentColor : AppPalette.muted)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            if hasOverride {
+                Button("Reset") {
+                    onReset()
+                }
+                .font(GlacialFont.caption(.bold))
+                .foregroundStyle(AppPalette.red)
+                .buttonStyle(.plain)
+            }
+
+            PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                Text(hasOverride ? "Change" : "Choose")
+                    .font(GlacialFont.caption(.bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(11)
+        .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppPalette.line.opacity(0.75), lineWidth: 1)
+        )
+        .onChange(of: selectedPhoto) { _, item in
+            guard let item else { return }
+            Task {
+                if let data = try? await item.loadTransferable(type: Data.self) {
+                    await onPicked(data)
+                }
+                selectedPhoto = nil
+            }
+        }
+    }
+}
+
+private struct LockedCatalogAction: View {
+    let title: String
+    let icon: String
+    let accentColor: Color
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(AppPalette.muted)
+                .frame(width: 24)
+
+            Text(title)
+                .font(GlacialFont.subheadline(.semibold))
+                .foregroundStyle(AppPalette.muted)
+
+            Spacer()
+
+            Text("locked")
+                .font(GlacialFont.caption2(.bold))
+                .foregroundStyle(accentColor)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+        }
+        .padding(11)
+        .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppPalette.line.opacity(0.75), lineWidth: 1)
+        )
+    }
+}
+
 private struct ChimeToneRow: View {
     let tone: KitchenChimeTone
     let isSaved: Bool
     let isPreviewing: Bool
+    let accentColor: Color
     let onTap: () -> Void
 
     var body: some View {
@@ -3452,7 +5799,7 @@ private struct ChimeToneRow: View {
                 if isSaved {
                     Image(systemName: "checkmark")
                         .font(.headline.weight(.bold))
-                        .foregroundStyle(AppPalette.red)
+                        .foregroundStyle(accentColor)
                 }
             }
             .contentShape(Rectangle())
@@ -3470,7 +5817,7 @@ private struct ChimeToneRow: View {
 
     private var iconColor: Color {
         if isSaved || isPreviewing {
-            return AppPalette.red
+            return accentColor
         }
 
         return .secondary
@@ -3532,10 +5879,90 @@ struct KitchenStatusRequest: Encodable {
     let status: String
 }
 
-struct POSBootstrapResponse: Decodable {
+struct POSBootstrapResponse: Decodable, Equatable {
     let `operator`: POSOperator
     let catalog: POSCatalog
     let shift: POSShiftEnvelope
+}
+
+struct POSRecapResponse: Decodable, Equatable {
+    let recap: POSRecap
+}
+
+struct POSRecap: Decodable, Equatable {
+    let period: POSRecapPeriod
+    let summary: POSRecapSummary
+    let paymentSplit: [POSRecapSplit]
+    let sourceSplit: [POSRecapSplit]
+    let bestSellers: [POSBestSeller]
+
+    enum CodingKeys: String, CodingKey {
+        case period
+        case summary
+        case paymentSplit = "payment_split"
+        case sourceSplit = "source_split"
+        case bestSellers = "best_sellers"
+    }
+}
+
+struct POSRecapPeriod: Decodable, Equatable {
+    let label: String
+    let date: String
+    let timezone: String
+    let startsAt: String
+    let endsAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case label
+        case date
+        case timezone
+        case startsAt = "starts_at"
+        case endsAt = "ends_at"
+    }
+}
+
+struct POSRecapSummary: Decodable, Equatable {
+    let salesTotal: Double
+    let ordersCount: Int
+    let averageTicket: Double
+
+    enum CodingKeys: String, CodingKey {
+        case salesTotal = "sales_total"
+        case ordersCount = "orders_count"
+        case averageTicket = "average_ticket"
+    }
+}
+
+struct POSRecapSplit: Identifiable, Decodable, Equatable {
+    let key: String
+    let label: String
+    let ordersCount: Int
+    let salesTotal: Double
+
+    var id: String { key }
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case label
+        case ordersCount = "orders_count"
+        case salesTotal = "sales_total"
+    }
+}
+
+struct POSBestSeller: Identifiable, Decodable, Equatable {
+    let productName: String
+    let category: String?
+    let quantity: Int
+    let salesTotal: Double
+
+    var id: String { "\(productName)|\(category ?? "")" }
+
+    enum CodingKeys: String, CodingKey {
+        case productName = "product_name"
+        case category
+        case quantity
+        case salesTotal = "sales_total"
+    }
 }
 
 struct POSOperator: Decodable, Equatable {
@@ -4279,6 +6706,12 @@ private extension JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return decoder
+    }
+}
+
+private extension Double {
+    var currencyText: String {
+        "\(Int(self).formatted()) VND"
     }
 }
 
