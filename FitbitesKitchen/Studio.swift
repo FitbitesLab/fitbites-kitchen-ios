@@ -215,6 +215,22 @@ struct StudioAPIClient {
         try await request(path: "/api/studio/inventory/items/\(id)", method: "DELETE")
     }
 
+    func createRecipeComponent(recipeID: Int, payload: StudioRecipeComponentRequest) async throws -> StudioInventoryPayload {
+        try await request(path: "/api/studio/inventory/recipes/\(recipeID)/components", method: "POST", body: payload)
+    }
+
+    func updateRecipeComponent(id: Int, payload: StudioRecipeComponentQuantityRequest) async throws -> StudioInventoryPayload {
+        try await request(path: "/api/studio/inventory/recipe-components/\(id)", method: "PATCH", body: payload)
+    }
+
+    func deleteRecipeComponent(id: Int) async throws -> StudioInventoryPayload {
+        try await request(path: "/api/studio/inventory/recipe-components/\(id)", method: "DELETE")
+    }
+
+    func produceRecipe(recipeID: Int, payload: StudioRecipeProductionRequest) async throws -> StudioInventoryPayload {
+        try await request(path: "/api/studio/inventory/recipes/\(recipeID)/produce", method: "POST", body: payload)
+    }
+
     private func request<Response: Decodable>(path: String, method: String = "GET") async throws -> Response {
         try await request(path: path, method: method, bodyData: nil)
     }
@@ -388,6 +404,10 @@ struct StudioInventoryRecipe: Decodable, Identifiable {
     let type: String
     let componentCount: Int
     let recipeCost: Double?
+    let sellingPrice: Double?
+    let grossProfit: Double?
+    let grossMarginPercent: Double?
+    let foodCostPercent: Double?
     let canProduce: Bool?
     let maxProduce: Double?
     let components: [StudioInventoryRecipeComponent]
@@ -396,6 +416,10 @@ struct StudioInventoryRecipe: Decodable, Identifiable {
         case id, name, type, components
         case componentCount = "component_count"
         case recipeCost = "recipe_cost"
+        case sellingPrice = "selling_price"
+        case grossProfit = "gross_profit"
+        case grossMarginPercent = "gross_margin_percent"
+        case foodCostPercent = "food_cost_percent"
         case canProduce = "can_produce"
         case maxProduce = "max_produce"
     }
@@ -472,6 +496,28 @@ struct StudioInventoryItemRequest: Encodable {
 
 struct StudioInventoryStockRequest: Encodable {
     let direction: String
+    let amount: Double
+}
+
+struct StudioRecipeComponentRequest: Encodable {
+    let childItemID: Int
+    let quantityUsed: Double
+
+    enum CodingKeys: String, CodingKey {
+        case childItemID = "child_item_id"
+        case quantityUsed = "quantity_used"
+    }
+}
+
+struct StudioRecipeComponentQuantityRequest: Encodable {
+    let quantityUsed: Double
+
+    enum CodingKeys: String, CodingKey {
+        case quantityUsed = "quantity_used"
+    }
+}
+
+struct StudioRecipeProductionRequest: Encodable {
     let amount: Double
 }
 
@@ -784,6 +830,26 @@ struct StudioRootView: View {
                             onDeleteItem: { id in
                                 await store.updateInventory(baseURL: baseURL, token: studioToken) { client in
                                     try await client.deleteInventoryItem(id: id)
+                                }
+                            },
+                            onCreateRecipeComponent: { recipeID, request in
+                                await store.updateInventory(baseURL: baseURL, token: studioToken) { client in
+                                    try await client.createRecipeComponent(recipeID: recipeID, payload: request)
+                                }
+                            },
+                            onUpdateRecipeComponent: { componentID, request in
+                                await store.updateInventory(baseURL: baseURL, token: studioToken) { client in
+                                    try await client.updateRecipeComponent(id: componentID, payload: request)
+                                }
+                            },
+                            onDeleteRecipeComponent: { componentID in
+                                await store.updateInventory(baseURL: baseURL, token: studioToken) { client in
+                                    try await client.deleteRecipeComponent(id: componentID)
+                                }
+                            },
+                            onProduceRecipe: { recipeID, request in
+                                await store.updateInventory(baseURL: baseURL, token: studioToken) { client in
+                                    try await client.produceRecipe(recipeID: recipeID, payload: request)
                                 }
                             }
                         )
@@ -1134,6 +1200,10 @@ private struct StudioInventoryContent: View {
     let onUpdateItem: (Int, StudioInventoryItemRequest) async -> Void
     let onAdjustStock: (Int, StudioInventoryStockRequest) async -> Void
     let onDeleteItem: (Int) async -> Void
+    let onCreateRecipeComponent: (Int, StudioRecipeComponentRequest) async -> Void
+    let onUpdateRecipeComponent: (Int, StudioRecipeComponentQuantityRequest) async -> Void
+    let onDeleteRecipeComponent: (Int) async -> Void
+    let onProduceRecipe: (Int, StudioRecipeProductionRequest) async -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1145,7 +1215,17 @@ private struct StudioInventoryContent: View {
             case .ingredients:
                 StudioInventoryItemsPanel(title: "Ingredients", mode: .ingredients, kicker: "\(payload.ingredients.count) items", items: payload.ingredients, valueMode: .cost, accentColor: accentColor, onCreateCategory: onCreateCategory, onCreateItem: onCreateItem, onUpdateItem: onUpdateItem, onAdjustStock: onAdjustStock, onDeleteItem: onDeleteItem)
             case .recipeLab:
-                StudioRecipeLabPanel(recipes: payload.recipes, accentColor: accentColor)
+                StudioRecipeLabPanel(
+                    recipes: payload.recipes,
+                    products: payload.products,
+                    ingredients: payload.ingredients,
+                    accentColor: accentColor,
+                    onCreateRecipe: onCreateItem,
+                    onCreateComponent: onCreateRecipeComponent,
+                    onUpdateComponent: onUpdateRecipeComponent,
+                    onDeleteComponent: onDeleteRecipeComponent,
+                    onProduceRecipe: onProduceRecipe
+                )
             case .planning:
                 StudioInventoryPlanningPanel(rows: payload.planning, movements: payload.movements, accentColor: accentColor)
             }
@@ -2110,30 +2190,597 @@ private struct StudioInventoryItemInspector: View {
 
 private struct StudioRecipeLabPanel: View {
     let recipes: [StudioInventoryRecipe]
+    let products: [StudioInventoryItem]
+    let ingredients: [StudioInventoryItem]
     let accentColor: Color
+    let onCreateRecipe: (StudioInventoryItemRequest) async -> Void
+    let onCreateComponent: (Int, StudioRecipeComponentRequest) async -> Void
+    let onUpdateComponent: (Int, StudioRecipeComponentQuantityRequest) async -> Void
+    let onDeleteComponent: (Int) async -> Void
+    let onProduceRecipe: (Int, StudioRecipeProductionRequest) async -> Void
+    @State private var selectedRecipeID: Int?
+    @State private var activeSheet: StudioRecipeLabSheet?
+
+    private var selectedRecipe: StudioInventoryRecipe? {
+        if let selectedRecipeID,
+           let recipe = recipes.first(where: { $0.id == selectedRecipeID }) {
+            return recipe
+        }
+
+        return recipes.first
+    }
 
     var body: some View {
         StudioPanel(title: "Recipe Lab", kicker: "\(recipes.count) recipes") {
-            VStack(spacing: 0) {
-                ForEach(recipes) { recipe in
-                    StudioDisclosureRow(title: recipe.name, meta: "\(recipe.componentCount) ingredients", value: recipe.type.uppercased(), rowStyle: .reportDay) {
-                        ForEach(recipe.components) { component in
-                            StudioFlatRow(
-                                title: component.name,
-                                meta: "Available \(formatQuantity(component.available, unit: component.unit))",
-                                value: formatQuantity(component.quantity, unit: component.unit),
-                                titleStyle: .standard
-                            )
-                        }
-                    }
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 14) {
+                    recipeList
+
+                    StudioRecipeMarginCard(recipe: selectedRecipe, accentColor: accentColor)
+                        .frame(width: 296)
                 }
 
-                if recipes.isEmpty {
-                    StudioMiniEmpty(message: "No recipe links synced yet.")
-                        .frame(height: 118)
+                VStack(alignment: .leading, spacing: 14) {
+                    StudioRecipeMarginCard(recipe: selectedRecipe, accentColor: accentColor)
+                    recipeList
                 }
             }
         }
+        .onAppear {
+            selectedRecipeID = selectedRecipeID ?? recipes.first?.id
+        }
+        .onChange(of: recipes.map(\.id)) { _, ids in
+            if let selectedRecipeID, ids.contains(selectedRecipeID) {
+                return
+            }
+
+            selectedRecipeID = ids.first
+        }
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .recipe:
+                StudioRecipeItemForm(products: products, accentColor: accentColor) { request in
+                    await onCreateRecipe(request)
+                    activeSheet = nil
+                }
+                .presentationDetents([.height(330)])
+                .presentationCornerRadius(10)
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Color.white)
+            case .component(let recipe, let component):
+                StudioRecipeComponentForm(
+                    recipe: recipe,
+                    component: component,
+                    ingredients: availableIngredients(for: recipe),
+                    accentColor: accentColor
+                ) { request in
+                    if let componentID = component?.componentID {
+                        await onUpdateComponent(componentID, StudioRecipeComponentQuantityRequest(quantityUsed: request.quantityUsed))
+                    } else {
+                        await onCreateComponent(recipe.id, request)
+                    }
+                    activeSheet = nil
+                }
+                .presentationDetents([.height(274)])
+                .presentationCornerRadius(10)
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Color.white)
+            case .deleteComponent(let component):
+                StudioRecipeComponentDeleteForm(component: component, accentColor: accentColor) {
+                    if let componentID = component.componentID {
+                        await onDeleteComponent(componentID)
+                    }
+                    activeSheet = nil
+                }
+                .presentationDetents([.height(226)])
+                .presentationCornerRadius(10)
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Color.white)
+            case .produce(let recipe):
+                StudioRecipeProductionForm(recipe: recipe, accentColor: accentColor) { request in
+                    await onProduceRecipe(recipe.id, request)
+                    activeSheet = nil
+                }
+                .presentationDetents([.height(238)])
+                .presentationCornerRadius(10)
+                .presentationDragIndicator(.visible)
+                .presentationBackground(Color.white)
+            }
+        }
+    }
+
+    private func availableIngredients(for recipe: StudioInventoryRecipe) -> [StudioInventoryItem] {
+        let usedIDs = Set(recipe.components.compactMap(\.childItemID))
+        return ingredients
+            .filter { !usedIDs.contains($0.id) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private var recipeList: some View {
+        VStack(spacing: 12) {
+            StudioRecipeActionStrip(
+                selectedRecipe: selectedRecipe,
+                accentColor: accentColor,
+                onAddRecipe: { activeSheet = .recipe },
+                onAddComponent: { recipe in activeSheet = .component(recipe, nil) },
+                onProduce: { recipe in activeSheet = .produce(recipe) }
+            )
+
+            VStack(spacing: 0) {
+                ForEach(recipes) { recipe in
+                    StudioRecipeRow(
+                        recipe: recipe,
+                        isSelected: selectedRecipe?.id == recipe.id,
+                        accentColor: accentColor,
+                        onSelect: { selectedRecipeID = recipe.id },
+                        onAddComponent: { activeSheet = .component(recipe, nil) },
+                        onEditComponent: { component in activeSheet = .component(recipe, component) },
+                        onDeleteComponent: { component in activeSheet = .deleteComponent(component) }
+                    )
+                }
+
+                if recipes.isEmpty {
+                    StudioMiniEmpty(message: "No recipe created yet.")
+                        .frame(height: 160)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+}
+
+private enum StudioRecipeLabSheet: Identifiable {
+    case recipe
+    case component(StudioInventoryRecipe, StudioInventoryRecipeComponent?)
+    case deleteComponent(StudioInventoryRecipeComponent)
+    case produce(StudioInventoryRecipe)
+
+    var id: String {
+        switch self {
+        case .recipe:
+            return "recipe"
+        case .component(let recipe, let component):
+            return "component-\(recipe.id)-\(component?.componentID ?? 0)"
+        case .deleteComponent(let component):
+            return "delete-component-\(component.componentID ?? 0)"
+        case .produce(let recipe):
+            return "produce-\(recipe.id)"
+        }
+    }
+}
+
+private struct StudioRecipeActionStrip: View {
+    let selectedRecipe: StudioInventoryRecipe?
+    let accentColor: Color
+    let onAddRecipe: () -> Void
+    let onAddComponent: (StudioInventoryRecipe) -> Void
+    let onProduce: (StudioInventoryRecipe) -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: onAddRecipe) {
+                Label("ADD RECIPE", systemImage: "plus")
+            }
+            .buttonStyle(StudioInventoryActionButtonStyle(accentColor: accentColor, isPrimary: true))
+
+            if let selectedRecipe {
+                Button {
+                    onAddComponent(selectedRecipe)
+                } label: {
+                    Label("INGREDIENT", systemImage: "leaf")
+                }
+                .buttonStyle(StudioInventoryActionButtonStyle(accentColor: accentColor, isPrimary: false))
+
+                Button {
+                    onProduce(selectedRecipe)
+                } label: {
+                    Label("PRODUCE", systemImage: "checkmark.circle")
+                }
+                .buttonStyle(StudioInventoryActionButtonStyle(accentColor: accentColor, isPrimary: false))
+                .disabled(selectedRecipe.componentCount == 0)
+            }
+
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+private struct StudioRecipeRow: View {
+    let recipe: StudioInventoryRecipe
+    let isSelected: Bool
+    let accentColor: Color
+    let onSelect: () -> Void
+    let onAddComponent: () -> Void
+    let onEditComponent: (StudioInventoryRecipeComponent) -> Void
+    let onDeleteComponent: (StudioInventoryRecipeComponent) -> Void
+    @State private var isOpen = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button {
+                onSelect()
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                    isOpen.toggle()
+                }
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(AppPalette.muted)
+                        .rotationEffect(.degrees(isOpen ? 90 : 0))
+                    StudioFlatRow(
+                        title: recipe.name,
+                        meta: "\(recipe.componentCount) ingredients",
+                        value: money(recipe.recipeCost ?? 0),
+                        titleStyle: isSelected ? .reportWeek : .reportDay
+                    )
+                }
+            }
+            .buttonStyle(.plain)
+
+            if isOpen {
+                VStack(spacing: 0) {
+                    ForEach(recipe.components) { component in
+                        HStack(spacing: 8) {
+                            StudioFlatRow(
+                                title: component.name,
+                                meta: "AVAILABLE \(formatQuantity(component.available, unit: component.unit).uppercased())",
+                                value: formatQuantity(component.quantity, unit: component.unit).uppercased(),
+                                titleStyle: .standard
+                            )
+
+                            Button {
+                                onEditComponent(component)
+                            } label: {
+                                Image(systemName: "pencil")
+                            }
+                            .buttonStyle(StudioInventoryIconButtonStyle(accentColor: accentColor))
+
+                            Button {
+                                onDeleteComponent(component)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(StudioInventoryIconButtonStyle(accentColor: AppPalette.red))
+                        }
+                    }
+
+                    if recipe.components.isEmpty {
+                        StudioMiniEmpty(message: "No ingredients in this recipe yet.")
+                            .frame(height: 88)
+                    }
+
+                    HStack {
+                        Spacer()
+                        Button(action: onAddComponent) {
+                            Label("ADD INGREDIENT", systemImage: "plus")
+                        }
+                        .buttonStyle(StudioInventoryActionButtonStyle(accentColor: accentColor, isPrimary: false))
+                        .padding(.vertical, 10)
+                    }
+                }
+                .padding(.leading, 28)
+            }
+        }
+        .background(isSelected ? accentColor.opacity(0.045) : .clear)
+    }
+}
+
+private struct StudioRecipeMarginCard: View {
+    let recipe: StudioInventoryRecipe?
+    let accentColor: Color
+
+    private var sellingPrice: Double {
+        recipe?.sellingPrice ?? 0
+    }
+
+    private var recipeCost: Double {
+        recipe?.recipeCost ?? 0
+    }
+
+    private var grossProfit: Double {
+        recipe?.grossProfit ?? max(sellingPrice - recipeCost, 0)
+    }
+
+    private var marginPercent: Double {
+        recipe?.grossMarginPercent ?? (sellingPrice > 0 ? grossProfit / sellingPrice * 100 : 0)
+    }
+
+    private var foodCostPercent: Double {
+        recipe?.foodCostPercent ?? (sellingPrice > 0 ? recipeCost / sellingPrice * 100 : 0)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("GROSS MARGIN")
+                    .font(GlacialFont.custom(9.5, .medium))
+                    .tracking(2.4)
+                    .foregroundStyle(AppPalette.orange.opacity(0.82))
+                Text(recipe?.name.uppercased() ?? "SELECT RECIPE")
+                    .font(GlacialFont.custom(16, .regular))
+                    .tracking(1.6)
+                    .foregroundStyle(AppPalette.ink)
+                    .lineLimit(2)
+            }
+
+            StudioMarginPieChart(costFraction: sellingPrice > 0 ? min(max(recipeCost / sellingPrice, 0), 1) : 0, accentColor: accentColor)
+                .frame(height: 150)
+
+            VStack(spacing: 0) {
+                StudioInventoryCompactMetricLine(label: "Price", value: money(sellingPrice).uppercased())
+                StudioInventoryCompactMetricLine(label: "Recipe Cost", value: money(recipeCost).uppercased())
+                StudioInventoryCompactMetricLine(label: "Gross Profit", value: money(grossProfit).uppercased())
+                StudioInventoryCompactMetricLine(label: "Margin", value: String(format: "%.1f%%", marginPercent).uppercased())
+                StudioInventoryCompactMetricLine(label: "Food Cost", value: String(format: "%.1f%%", foodCostPercent).uppercased())
+            }
+        }
+        .padding(18)
+        .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppPalette.line, lineWidth: 1))
+    }
+}
+
+private struct StudioMarginPieChart: View {
+    let costFraction: Double
+    let accentColor: Color
+
+    private var safeCostFraction: Double {
+        min(max(costFraction, 0), 1)
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [Color.white, AppPalette.background.opacity(0.96)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .shadow(color: Color.black.opacity(0.08), radius: 9, x: 0, y: 7)
+
+            Circle()
+                .trim(from: 0, to: safeCostFraction)
+                .stroke(AppPalette.red.opacity(0.82), style: StrokeStyle(lineWidth: 34, lineCap: .butt))
+                .rotationEffect(.degrees(-90))
+
+            Circle()
+                .trim(from: safeCostFraction, to: 1)
+                .stroke(accentColor.opacity(0.92), style: StrokeStyle(lineWidth: 34, lineCap: .butt))
+                .rotationEffect(.degrees(-90))
+
+            Circle()
+                .fill(Color.white)
+                .frame(width: 74, height: 74)
+                .shadow(color: Color.black.opacity(0.05), radius: 8, x: 0, y: 4)
+
+            VStack(spacing: 3) {
+                Text("MARGIN")
+                    .font(GlacialFont.custom(8.5, .medium))
+                    .tracking(2.1)
+                    .foregroundStyle(AppPalette.muted)
+                Text(String(format: "%.0f%%", (1 - safeCostFraction) * 100))
+                    .font(GlacialFont.custom(18, .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(AppPalette.ink)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct StudioRecipeItemForm: View {
+    let products: [StudioInventoryItem]
+    let accentColor: Color
+    let onSave: (StudioInventoryItemRequest) async -> Void
+    @State private var name = ""
+    @State private var category = ""
+    @State private var price = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("NEW RECIPE")
+                .font(GlacialFont.custom(15.5, .regular))
+                .tracking(2.0)
+                .foregroundStyle(AppPalette.ink)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 14)
+
+            StudioFormField(title: "Name", text: $name)
+            StudioFormField(title: "Category", text: $category)
+            StudioFormField(title: "Selling Price", text: $price, keyboard: .decimalPad)
+
+            Spacer(minLength: 0)
+
+            StudioFormPrimaryButton(title: "CREATE", accentColor: accentColor) {
+                await onSave(request)
+            }
+            .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .padding(.horizontal, 22)
+        .padding(.top, 10)
+        .padding(.bottom, 22)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.white.ignoresSafeArea())
+    }
+
+    private var request: StudioInventoryItemRequest {
+        StudioInventoryItemRequest(
+            mode: "products",
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            sku: nil,
+            unit: "unit",
+            currentStock: 0,
+            minimumStock: 0,
+            type: "product",
+            costPerUnit: 0,
+            sellingPrice: parseDouble(price),
+            linkToPOS: false,
+            inventoryCategory: category.trimmingCharacters(in: .whitespacesAndNewlines),
+            description: nil
+        )
+    }
+}
+
+private struct StudioRecipeComponentForm: View {
+    let recipe: StudioInventoryRecipe
+    let component: StudioInventoryRecipeComponent?
+    let ingredients: [StudioInventoryItem]
+    let accentColor: Color
+    let onSave: (StudioRecipeComponentRequest) async -> Void
+    @State private var selectedIngredientID: Int
+    @State private var quantity: String
+
+    init(
+        recipe: StudioInventoryRecipe,
+        component: StudioInventoryRecipeComponent?,
+        ingredients: [StudioInventoryItem],
+        accentColor: Color,
+        onSave: @escaping (StudioRecipeComponentRequest) async -> Void
+    ) {
+        self.recipe = recipe
+        self.component = component
+        self.ingredients = ingredients
+        self.accentColor = accentColor
+        self.onSave = onSave
+        _selectedIngredientID = State(initialValue: component?.childItemID ?? ingredients.first?.id ?? 0)
+        _quantity = State(initialValue: component.map { cleanNumber($0.quantity) } ?? "")
+    }
+
+    private var selectedIngredient: StudioInventoryItem? {
+        ingredients.first(where: { $0.id == selectedIngredientID })
+    }
+
+    private var canSave: Bool {
+        (component?.childItemID ?? selectedIngredientID) > 0 && parseDouble(quantity) > 0
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(component == nil ? "ADD INGREDIENT" : "EDIT INGREDIENT")
+                .font(GlacialFont.custom(15.5, .regular))
+                .tracking(2.0)
+                .foregroundStyle(AppPalette.ink)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 14)
+
+            if component == nil {
+                Menu {
+                    ForEach(ingredients) { ingredient in
+                        Button(ingredient.name.uppercased()) {
+                            selectedIngredientID = ingredient.id
+                        }
+                    }
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("INGREDIENT")
+                                .font(GlacialFont.custom(9, .medium))
+                                .tracking(2.2)
+                                .foregroundStyle(AppPalette.muted)
+                            Text((selectedIngredient?.name ?? "SELECT INGREDIENT").uppercased())
+                                .font(GlacialFont.custom(13, .regular))
+                                .tracking(1.8)
+                                .foregroundStyle(AppPalette.ink)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(AppPalette.muted)
+                    }
+                    .frame(height: 44)
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(AppPalette.line)
+                            .frame(height: 1)
+                    }
+                }
+                .buttonStyle(.plain)
+            } else {
+                StudioInventoryCompactMetricLine(label: "Ingredient", value: component?.name.uppercased() ?? "")
+            }
+
+            StudioFormField(title: "Quantity Used", text: $quantity, keyboard: .decimalPad)
+
+            Spacer(minLength: 0)
+
+            StudioFormPrimaryButton(title: "SAVE", accentColor: accentColor) {
+                await onSave(request)
+            }
+            .disabled(!canSave)
+        }
+        .padding(.horizontal, 22)
+        .padding(.top, 10)
+        .padding(.bottom, 22)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.white.ignoresSafeArea())
+    }
+
+    private var request: StudioRecipeComponentRequest {
+        StudioRecipeComponentRequest(
+            childItemID: component?.childItemID ?? selectedIngredientID,
+            quantityUsed: parseDouble(quantity)
+        )
+    }
+}
+
+private struct StudioRecipeComponentDeleteForm: View {
+    let component: StudioInventoryRecipeComponent
+    let accentColor: Color
+    let onDelete: () async -> Void
+
+    var body: some View {
+        StudioFormShell(title: "Delete Ingredient", kicker: "Recipe Lab") {
+            Text(component.name.uppercased())
+                .font(GlacialFont.custom(18, .regular))
+                .tracking(1.6)
+                .foregroundStyle(AppPalette.ink)
+
+            Text("REMOVE THIS INGREDIENT FROM THE RECIPE.")
+                .font(GlacialFont.custom(10.5, .regular))
+                .tracking(1.8)
+                .foregroundStyle(AppPalette.muted)
+
+            StudioFormPrimaryButton(title: "DELETE", accentColor: AppPalette.red) {
+                await onDelete()
+            }
+        }
+    }
+}
+
+private struct StudioRecipeProductionForm: View {
+    let recipe: StudioInventoryRecipe
+    let accentColor: Color
+    let onSave: (StudioRecipeProductionRequest) async -> Void
+    @State private var amount = "1"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("PRODUCE RECIPE")
+                .font(GlacialFont.custom(15.5, .regular))
+                .tracking(2.0)
+                .foregroundStyle(AppPalette.ink)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 14)
+
+            StudioInventoryCompactMetricLine(label: "Recipe", value: recipe.name.uppercased())
+            StudioInventoryCompactMetricLine(label: "Can Produce", value: recipe.maxProduce.map { cleanNumber($0) } ?? "0")
+            StudioFormField(title: "Amount", text: $amount, keyboard: .decimalPad)
+
+            Spacer(minLength: 0)
+
+            StudioFormPrimaryButton(title: "PRODUCE", accentColor: accentColor) {
+                await onSave(StudioRecipeProductionRequest(amount: parseDouble(amount)))
+            }
+            .disabled(parseDouble(amount) <= 0)
+        }
+        .padding(.horizontal, 22)
+        .padding(.top, 10)
+        .padding(.bottom, 22)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.white.ignoresSafeArea())
     }
 }
 
