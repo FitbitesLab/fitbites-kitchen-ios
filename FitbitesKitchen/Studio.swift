@@ -54,7 +54,7 @@ enum StudioInventoryTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 
     static var essentialsCases: [StudioInventoryTab] {
-        [.products, .ingredients]
+        [.products, .ingredients, .recipeLab]
     }
 
     var icon: String {
@@ -387,20 +387,41 @@ struct StudioInventoryRecipe: Decodable, Identifiable {
     let name: String
     let type: String
     let componentCount: Int
+    let recipeCost: Double?
+    let canProduce: Bool?
+    let maxProduce: Double?
     let components: [StudioInventoryRecipeComponent]
 
     enum CodingKeys: String, CodingKey {
         case id, name, type, components
         case componentCount = "component_count"
+        case recipeCost = "recipe_cost"
+        case canProduce = "can_produce"
+        case maxProduce = "max_produce"
     }
 }
 
 struct StudioInventoryRecipeComponent: Decodable, Identifiable {
-    var id: String { name + unit }
+    var id: String { "\(componentID ?? childItemID ?? 0)-\(name)-\(unit)" }
+    let componentID: Int?
+    let childItemID: Int?
     let name: String
     let quantity: Double
     let unit: String
     let available: Double
+    let neededPerBatch: Double?
+    let shortage: Double?
+    let cost: Double?
+    let canProduce: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case name, quantity, unit, available, cost
+        case componentID = "id"
+        case childItemID = "child_item_id"
+        case neededPerBatch = "needed_per_batch"
+        case shortage
+        case canProduce = "can_produce"
+    }
 }
 
 struct StudioInventoryMovement: Decodable, Identifiable {
@@ -1256,15 +1277,21 @@ private struct StudioInventoryItemsPanel: View {
     let onAdjustStock: (Int, StudioInventoryStockRequest) async -> Void
     let onDeleteItem: (Int) async -> Void
     @State private var selectedItemID: Int?
-    @State private var selectedCategory = "All"
+    @State private var selectedCategory = ""
     @State private var activeSheet: StudioInventorySheet?
 
-    private var visibleItems: [StudioInventoryItem] {
-        let scopedItems = selectedCategory == "All"
-            ? items
-            : items.filter { $0.category == selectedCategory }
+    private var categoryNames: [String] {
+        Dictionary(grouping: items, by: \.category)
+            .map { $0.key }
+            .sorted()
+    }
 
-        return scopedItems
+    private var visibleItems: [StudioInventoryItem] {
+        guard let activeCategory = selectedCategory.isEmpty ? categoryNames.first : selectedCategory else {
+            return items
+        }
+
+        return items.filter { $0.category == activeCategory }
     }
 
     private var selectedItem: StudioInventoryItem? {
@@ -1301,8 +1328,17 @@ private struct StudioInventoryItemsPanel: View {
             }
         }
         .onAppear {
+            if selectedCategory.isEmpty {
+                selectedCategory = categoryNames.first ?? ""
+            }
+
             if selectedItemID == nil {
                 selectedItemID = visibleItems.first?.id
+            }
+        }
+        .onChange(of: items.map(\.id)) { _, _ in
+            if !categoryNames.contains(selectedCategory) {
+                selectedCategory = categoryNames.first ?? ""
             }
         }
         .onChange(of: selectedCategory) { _, _ in
@@ -1328,7 +1364,7 @@ private struct StudioInventoryItemsPanel: View {
                     }
                     activeSheet = nil
                 }
-                .presentationDetents([.height(mode == .ingredients ? 392 : 352), .large])
+                .presentationDetents([.height(336), .large])
                 .presentationCornerRadius(10)
                 .presentationDragIndicator(.visible)
                 .presentationBackground(Color.white)
@@ -1583,6 +1619,8 @@ private struct StudioInventoryItemForm: View {
                 .font(GlacialFont.custom(15.5, .regular))
                 .tracking(2.0)
                 .foregroundStyle(AppPalette.ink)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, 14)
 
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
                 StudioFormField(title: "Name", text: $name)
@@ -1594,19 +1632,13 @@ private struct StudioInventoryItemForm: View {
                 StudioFormField(title: "Cost", text: $cost, keyboard: .decimalPad)
                 if mode == .products {
                     StudioFormField(title: "Price", text: $price, keyboard: .decimalPad)
+                } else {
+                    StudioFormField(title: "Type", text: $itemType)
                 }
-            }
-
-            if mode == .ingredients {
-                Picker("", selection: $itemType) {
-                    Text("RAW").tag("raw")
-                    Text("MIXED").tag("mixed")
-                }
-                .pickerStyle(.segmented)
             }
 
             Toggle(isOn: $linkToPOS) {
-                Text(mode == .ingredients ? "LINK AS POS TOPPING" : "LINK TO POS")
+                Text("LINK TO POS")
                     .font(GlacialFont.custom(10.5, .medium))
                     .tracking(2.4)
                     .foregroundStyle(AppPalette.ink)
@@ -1615,14 +1647,16 @@ private struct StudioInventoryItemForm: View {
 
             StudioFormField(title: "Description", text: $description)
 
+            Spacer(minLength: 0)
+
             StudioFormPrimaryButton(title: "SAVE", accentColor: accentColor) {
                 await onSave(request)
             }
             .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding(.horizontal, 22)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
+        .padding(.top, 10)
+        .padding(.bottom, 22)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color.white.ignoresSafeArea())
     }
@@ -1635,7 +1669,7 @@ private struct StudioInventoryItemForm: View {
             unit: unit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "unit" : unit,
             currentStock: parseDouble(currentStock),
             minimumStock: parseDouble(minimumStock),
-            type: mode == .ingredients ? itemType : "product",
+            type: mode == .ingredients ? itemType.lowercased() : "product",
             costPerUnit: parseDouble(cost),
             sellingPrice: mode == .products ? parseDouble(price) : 0,
             linkToPOS: linkToPOS,
@@ -1798,8 +1832,9 @@ private struct StudioInventoryItemRow: View {
                 .frame(width: 34, height: 34)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(item.name)
+                Text(item.name.uppercased())
                     .font(GlacialFont.custom(12.5, isSelected ? .semibold : .medium))
+                    .tracking(1.6)
                     .foregroundStyle(isSelected ? AppPalette.ink : AppPalette.ink.opacity(0.86))
                     .lineLimit(1)
                 Text("\(item.category.uppercased())  ·  \(formatQuantity(item.currentStock, unit: item.unit))")
@@ -1811,8 +1846,9 @@ private struct StudioInventoryItemRow: View {
 
             Spacer()
 
-            Text(value)
+            Text(value.uppercased())
                 .font(GlacialFont.caption(.medium))
+                .tracking(1.2)
                 .monospacedDigit()
                 .foregroundStyle(isSelected ? accentColor : AppPalette.ink)
                 .lineLimit(1)
@@ -1878,10 +1914,6 @@ private struct StudioInventoryCategoryTabs: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                StudioInventoryCategoryPill(title: "All", isSelected: selectedCategory == "All", accentColor: accentColor) {
-                    selectedCategory = "All"
-                }
-
                 ForEach(categories, id: \.self) { category in
                     StudioInventoryCategoryPill(title: category, isSelected: selectedCategory == category, accentColor: accentColor) {
                         selectedCategory = category
@@ -1895,6 +1927,11 @@ private struct StudioInventoryCategoryTabs: View {
             Rectangle()
                 .fill(AppPalette.line)
                 .frame(height: 1)
+        }
+        .onAppear {
+            if selectedCategory.isEmpty {
+                selectedCategory = categories.first ?? ""
+            }
         }
     }
 }
