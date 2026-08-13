@@ -2147,8 +2147,12 @@ private struct StudioRecipeLabPanel: View {
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .top, spacing: 14) {
                     builderPanel
-                    pricingPanel.frame(width: 300)
-                    insightsPanel.frame(width: 280)
+                    pricingPanel
+                        .frame(width: 300)
+                        .frame(minHeight: 458, alignment: .top)
+                    insightsPanel
+                        .frame(width: 280)
+                        .frame(minHeight: 458, alignment: .top)
                 }
 
                 VStack(alignment: .leading, spacing: 14) {
@@ -2219,7 +2223,8 @@ private struct StudioRecipeLabPanel: View {
                 StudioFormField(title: "Selling Price", text: $sellingPrice, keyboard: .decimalPad)
 
                 StudioMarginPieChart(costFraction: metrics.foodCostFraction, marginPercent: metrics.grossMargin, accentColor: accentColor)
-                    .frame(height: 174)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 166)
 
                 VStack(spacing: 0) {
                     StudioInventoryCompactMetricLine(label: "Recipe Cost", value: money(metrics.recipeCost).uppercased())
@@ -2234,11 +2239,12 @@ private struct StudioRecipeLabPanel: View {
 
     private var insightsPanel: some View {
         StudioPanel(title: "AI Insights", kicker: "3. Signals") {
-            VStack(spacing: 10) {
+            VStack(spacing: 9) {
                 ForEach(StudioLabInsight.make(from: metrics, ingredients: sortedIngredients)) { insight in
                     StudioRecipeInsightCard(insight: insight, accentColor: accentColor)
                 }
             }
+            .frame(maxWidth: .infinity, minHeight: 382, alignment: .topLeading)
         }
     }
 
@@ -2538,37 +2544,96 @@ private struct StudioMarginPieChart: View {
 
     var body: some View {
         ZStack {
-            Circle()
-                .fill(Color.white)
-                .shadow(color: Color.black.opacity(0.07), radius: 10, x: 0, y: 7)
+            Ellipse()
+                .fill(Color.black.opacity(0.08))
+                .frame(width: 128, height: 18)
+                .blur(radius: 7)
+                .offset(y: 58)
 
-            Circle()
-                .trim(from: 0, to: safeCostFraction)
-                .stroke(AppPalette.red.opacity(0.86), style: StrokeStyle(lineWidth: 34, lineCap: .butt))
-                .rotationEffect(.degrees(-90))
+            ZStack {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.white, AppPalette.background.opacity(0.96)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: 142, height: 142)
+                    .overlay(Circle().stroke(AppPalette.line.opacity(0.7), lineWidth: 1))
 
-            Circle()
-                .trim(from: safeCostFraction, to: 1)
-                .stroke(marginColor, style: StrokeStyle(lineWidth: 34, lineCap: .butt))
-                .rotationEffect(.degrees(-90))
+                Circle()
+                    .stroke(
+                        LinearGradient(
+                            colors: [Color.black.opacity(0.10), Color.black.opacity(0.02)],
+                            startPoint: .bottom,
+                            endPoint: .top
+                        ),
+                        lineWidth: 30
+                    )
+                    .frame(width: 122, height: 122)
+                    .offset(y: 5)
 
-            Circle()
-                .fill(Color.white)
-                .frame(width: 82, height: 82)
-                .overlay(Circle().stroke(AppPalette.line, lineWidth: 1))
+                Circle()
+                    .trim(from: 0, to: safeCostFraction)
+                    .stroke(
+                        LinearGradient(
+                            colors: [Color(red: 0.84, green: 0.32, blue: 0.22), AppPalette.red.opacity(0.82)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        style: StrokeStyle(lineWidth: 30, lineCap: .round)
+                    )
+                    .frame(width: 122, height: 122)
+                    .rotationEffect(.degrees(-90))
 
-            VStack(spacing: 3) {
-                Text("GROSS MARGIN")
-                    .font(GlacialFont.custom(8.5, .medium))
-                    .tracking(2.0)
-                    .foregroundStyle(AppPalette.muted)
-                Text(String(format: "%.1f%%", marginPercent))
-                    .font(GlacialFont.custom(20, .medium))
-                    .monospacedDigit()
-                    .foregroundStyle(marginColor)
+                Circle()
+                    .trim(from: safeCostFraction, to: 1)
+                    .stroke(
+                        LinearGradient(
+                            colors: [marginColor.opacity(0.95), marginColor.opacity(0.76)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        style: StrokeStyle(lineWidth: 30, lineCap: .round)
+                    )
+                    .frame(width: 122, height: 122)
+                    .rotationEffect(.degrees(-90))
+
+                Circle()
+                    .trim(from: 0.62, to: 0.91)
+                    .stroke(Color.white.opacity(0.46), style: StrokeStyle(lineWidth: 7, lineCap: .round))
+                    .frame(width: 122, height: 122)
+                    .rotationEffect(.degrees(-90))
+                    .blur(radius: 0.4)
+
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.white, Color(red: 0.982, green: 0.976, blue: 0.964)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: 80, height: 80)
+                    .shadow(color: Color.black.opacity(0.07), radius: 7, x: 0, y: 4)
+                    .overlay(Circle().stroke(AppPalette.line.opacity(0.92), lineWidth: 1))
+
+                VStack(spacing: 3) {
+                    Text("GROSS MARGIN")
+                        .font(GlacialFont.custom(8.5, .medium))
+                        .tracking(2.0)
+                        .foregroundStyle(AppPalette.muted)
+                    Text(String(format: "%.1f%%", marginPercent))
+                        .font(GlacialFont.custom(20, .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(marginColor)
+                }
             }
+            .shadow(color: Color.black.opacity(0.08), radius: 10, x: 0, y: 7)
         }
-        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.vertical, 2)
     }
 }
 
@@ -2588,28 +2653,47 @@ private struct StudioRecipeInsightCard: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 11) {
-            Image(systemName: insight.icon)
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(color)
-                .frame(width: 34, height: 34)
-                .background(color.opacity(0.09), in: RoundedRectangle(cornerRadius: 8))
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(color.opacity(0.09))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(color.opacity(0.12), lineWidth: 1))
+                Image(systemName: insight.icon)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(color)
+            }
+            .frame(width: 34, height: 34)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(insight.title)
-                    .font(GlacialFont.custom(11.5, .medium))
-                    .tracking(1.3)
-                    .foregroundStyle(AppPalette.ink)
-                    .lineLimit(2)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(insight.title)
+                        .font(GlacialFont.custom(10.8, .medium))
+                        .tracking(1.8)
+                        .foregroundStyle(AppPalette.ink)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+
                 Text(insight.body)
-                    .font(GlacialFont.custom(10.5, .regular))
-                    .tracking(1.1)
+                    .font(GlacialFont.custom(10.2, .regular))
+                    .tracking(1.35)
                     .foregroundStyle(AppPalette.muted)
                     .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(12)
-        .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, minHeight: 78, alignment: .topLeading)
+        .background(
+            LinearGradient(
+                colors: [Color.white, color.opacity(0.025)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppPalette.line, lineWidth: 1))
     }
 }

@@ -17,18 +17,70 @@ import Network
 private enum AppSection {
     case kitchen
     case pos
+    case studio
+
+    var label: String {
+        switch self {
+        case .pos: "POS"
+        case .kitchen: "Kitchen"
+        case .studio: "Studio"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .pos: "cart"
+        case .kitchen: "house"
+        case .studio: "square.grid.2x2"
+        }
+    }
+}
+
+private struct POSCategorySwipeCommand: Equatable {
+    let id = UUID()
+    let offset: Int
+}
+
+private extension View {
+    func emberSheetChrome() -> some View {
+        self
+            .presentationCornerRadius(4)
+            .presentationBackground(.white)
+    }
+}
+
+private struct NoHighlightButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func lightGlassBackground<S: Shape>(_ material: Material, in shape: S) -> some View {
+        if UIAccessibility.isReduceTransparencyEnabled {
+            background(Color.white, in: shape)
+        } else {
+            background(material, in: shape)
+        }
+    }
 }
 
 struct ContentView: View {
     @StateObject private var store = KitchenStore()
     @StateObject private var posStore = POSStore()
     @StateObject private var printStore = PrintBridgeStore()
+    @StateObject private var studioStore = StudioStore()
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     private let startsPolling: Bool
-    @State private var selectedSection: AppSection = .kitchen
+    private let showsSplash: Bool
+    @State private var selectedSection: AppSection = .pos
     @State private var selectedStatus: KitchenStatus? = nil
     @State private var selectedSource: KitchenSource? = nil
     @State private var selectedOrder: KitchenOrder?
+    @State private var selectedOnlineOrder: KitchenOnlineOrder?
+    @State private var selectedCompletedTicket: CompletedKitchenTicket?
     @State private var pendingOnlineOrderAction: OnlineOrderAction?
     @State private var pendingKitchenCancelOrder: KitchenOrder?
     @State private var settingsOpen = false
@@ -38,13 +90,31 @@ struct ContentView: View {
     @State private var isPOSEndShiftOpen = false
     @State private var isPOSCheckoutOpen = false
     @State private var isPOSRecapOpen = false
+    @State private var isSplashVisible: Bool
+    @State private var isPOSArrangeMode = false
+    @State private var saleCompletion: POSSaleCompletion?
+    @State private var posPinEntry = ""
+    @State private var posOpeningCashText = ""
+    @State private var posPendingPINForCash: String?
+    @State private var posPinWelcome: POSPinWelcome?
+    @State private var posCategorySwipeCommand = POSCategorySwipeCommand(offset: 0)
+    @State private var selectedCompactTab: CompactShellTab = .pos
+    @State private var didApplyInitialLaunchSection = false
+    @State private var posStaffSessionSkipped = false
+    @State private var posStaffSessionToken = ""
     @AppStorage("POSProductDisplayStyle") private var posProductDisplayStyleRaw = POSProductDisplayStyle.productCard.rawValue
     @AppStorage("POSAccentColor") private var posAccentColorRaw = POSAccentColor.ember.rawValue
+    @AppStorage("POSToppingCategoryOrder") private var posToppingCategoryOrderRaw = ""
+    @AppStorage("POSBrandLogoHidden") private var posBrandLogoHidden = false
+    @AppStorage("POSBrandLogoScale") private var posBrandLogoScale = 1.0
+    @AppStorage("StudioToken") private var studioToken = ""
     @Namespace private var filterSelectionNamespace
 
-    init(startsPolling: Bool = true) {
+    init(startsPolling: Bool = true, showsSplash: Bool = true) {
         GlacialFont.register()
         self.startsPolling = startsPolling
+        self.showsSplash = showsSplash
+        _isSplashVisible = State(initialValue: showsSplash)
     }
 
     private var filteredOrders: [KitchenOrder] {
@@ -61,7 +131,7 @@ struct ContentView: View {
     }
 
     private var visibleOnlineOrders: [KitchenOnlineOrder] {
-        return store.onlineOrders
+        store.onlineOrders.filter { $0.status == .submitted || $0.status == .accepted }
     }
 
     private var showsOnlineOrders: Bool {
@@ -72,33 +142,433 @@ struct ContentView: View {
         POSAccentColor(rawValue: posAccentColorRaw) ?? .ember
     }
 
+    private var canAccessAdminFeatures: Bool {
+        hasPOSStaffSession && (posStore.bootstrap?.operator.canAccessAdminFeatures ?? false)
+    }
+
+    private var hasPOSStaffSession: Bool {
+        !posStaffSessionToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var canAccessPOS: Bool {
+        hasPOSStaffSession
+    }
+
+    private var canAccessRecap: Bool {
+        hasPOSStaffSession
+    }
+
+    private var shouldShowPOSPinGate: Bool {
+        !isSplashVisible && !hasPOSStaffSession && !posStaffSessionSkipped && posPendingPINForCash == nil
+    }
+
+    private var shouldShowPOSCashDeclaration: Bool {
+        !isSplashVisible && !hasPOSStaffSession && !posStaffSessionSkipped && posPendingPINForCash != nil
+    }
+
+    private var isPOSAuthOverlayVisible: Bool {
+        shouldShowPOSPinGate || shouldShowPOSCashDeclaration
+    }
+
+    private var isCompactShell: Bool {
+        horizontalSizeClass == .compact
+    }
+
+    private var activeCompactTab: CompactShellTab {
+        selectedCompactTab
+    }
+
+    private var onlineOrderActionAlertBinding: Binding<Bool> {
+        Binding(
+            get: { pendingOnlineOrderAction != nil },
+            set: { isPresented in
+                if !isPresented {
+                    pendingOnlineOrderAction = nil
+                }
+            }
+        )
+    }
+
+    private var kitchenCancelAlertBinding: Binding<Bool> {
+        Binding(
+            get: { pendingKitchenCancelOrder != nil },
+            set: { isPresented in
+                if !isPresented {
+                    pendingKitchenCancelOrder = nil
+                }
+            }
+        )
+    }
+
+    private var settingsSheetBinding: Binding<Bool> {
+        Binding(
+            get: { settingsOpen && !isCompactShell && canAccessAdminFeatures },
+            set: { isPresented in
+                if !isPresented {
+                    settingsOpen = false
+                }
+            }
+        )
+    }
+
+    private var recapSheetBinding: Binding<Bool> {
+        Binding(
+            get: { isPOSRecapOpen && !isCompactShell && canAccessRecap },
+            set: { isPresented in
+                if !isPresented {
+                    isPOSRecapOpen = false
+                }
+            }
+        )
+    }
+
+    private var shiftSheetBinding: Binding<Bool> {
+        Binding(
+            get: { isPOSShiftMenuOpen && !isCompactShell && canAccessPOS },
+            set: { isPresented in
+                if !isPresented {
+                    isPOSShiftMenuOpen = false
+                }
+            }
+        )
+    }
+
+    private func confirmOnlineOrderAction(_ action: OnlineOrderAction) {
+        pendingOnlineOrderAction = nil
+
+        Task {
+            switch action {
+            case .accept(let order):
+                await store.acceptOnlineOrder(order)
+            case .markPaid(let order):
+                await store.markOnlineOrderPaid(order)
+            case .sendToKitchen(let order):
+                await store.sendOnlineOrderToKitchen(order)
+            case .decline(let order):
+                await store.rejectOnlineOrder(order)
+            }
+        }
+    }
+
+    private func confirmKitchenCancelOrder(_ order: KitchenOrder) {
+        pendingKitchenCancelOrder = nil
+        Task { await store.update(order: order, status: .cancelled) }
+    }
+
+    private var posCategorySwipeGesture: some Gesture {
+        DragGesture(minimumDistance: 34, coordinateSpace: .local)
+            .onEnded { value in
+                guard selectedSection == .pos, !isPOSArrangeMode, !isCompactShell else { return }
+
+                let horizontal = value.translation.width
+                let vertical = value.translation.height
+                let predicted = value.predictedEndTranslation.width
+
+                guard abs(horizontal) > abs(vertical) * 2.45 else { return }
+                guard abs(horizontal) > 82 || abs(predicted) > 150 else { return }
+
+                posCategorySwipeCommand = POSCategorySwipeCommand(offset: horizontal < 0 ? 1 : -1)
+            }
+    }
+
+    private func showSaleCompletion(saleID: Int, total: Double, printResult: PrintReceiptResult) {
+        let completion = POSSaleCompletion(saleID: saleID, total: total, printResult: printResult)
+        withAnimation(.spring(response: 0.36, dampingFraction: 0.82)) {
+            saleCompletion = completion
+        }
+
+        guard printResult.canAutoDismiss else { return }
+
+        Task {
+            try? await Task.sleep(nanoseconds: 2_400_000_000)
+            await MainActor.run {
+                guard saleCompletion?.id == completion.id else { return }
+                withAnimation(.easeOut(duration: 0.22)) {
+                    saleCompletion = nil
+                }
+            }
+        }
+    }
+
+    private func selectSection(_ section: AppSection) {
+        guard section != .studio || canAccessAdminFeatures else {
+            Haptics.impact(.light)
+            return
+        }
+
+        guard section == .kitchen || section == .studio || canAccessPOS else {
+            posStaffSessionSkipped = false
+            posPinEntry = ""
+            selectedSection = .pos
+            selectedCompactTab = .pos
+            Haptics.impact(.light)
+            return
+        }
+
+        closeCompactPanels()
+        selectedSection = section
+        selectedCompactTab = section == .pos ? .pos : .kitchen
+
+        switch section {
+        case .pos:
+            Task { await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken) }
+        case .kitchen:
+            selectedSource = nil
+            selectedStatus = nil
+            Task { await store.refresh(forceChime: false) }
+        case .studio:
+            selectedSource = nil
+            selectedStatus = nil
+            Task { await studioStore.refresh(baseURL: store.baseURL, token: studioToken) }
+        }
+    }
+
+    private func openPOSRecap() {
+        guard canAccessRecap else {
+            closeCompactPanelToCurrentSection()
+            return
+        }
+
+        selectedCompactTab = .recap
+        isPOSShiftMenuOpen = false
+        settingsOpen = false
+        isPOSRecapOpen = true
+        Task { await posStore.refreshRecap(baseURL: store.baseURL, token: store.kitchenToken) }
+    }
+
+    private func openCompactShiftPanel() {
+        guard canAccessPOS else {
+            closeCompactPanelToCurrentSection()
+            return
+        }
+
+        selectedCompactTab = .shift
+        isPOSRecapOpen = false
+        settingsOpen = false
+        isPOSShiftMenuOpen = true
+
+        if posStore.bootstrap == nil {
+            Task { await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken) }
+        }
+    }
+
+    private func openCompactSettingsPanel() {
+        guard canAccessAdminFeatures else {
+            closeCompactPanelToCurrentSection()
+            return
+        }
+
+        selectedCompactTab = .settings
+        isPOSShiftMenuOpen = false
+        isPOSRecapOpen = false
+        settingsOpen = true
+    }
+
+    private func closeCompactPanels() {
+        isPOSShiftMenuOpen = false
+        isPOSRecapOpen = false
+        settingsOpen = false
+    }
+
+    private func closeCompactPanel(returningTo tab: CompactShellTab = .pos) {
+        closeCompactPanels()
+        selectedCompactTab = tab
+    }
+
+    private func closeCompactPanelToCurrentSection() {
+        closeCompactPanels()
+        selectedCompactTab = selectedSection == .pos ? .pos : .kitchen
+    }
+
+    private func signInLater() {
+        withAnimation(.easeInOut(duration: 0.28)) {
+            posStaffSessionSkipped = true
+            posPinEntry = ""
+            posOpeningCashText = ""
+            posPendingPINForCash = nil
+            selectedSection = .kitchen
+            selectedCompactTab = .kitchen
+            closeCompactPanels()
+        }
+
+        Haptics.impact(.light)
+    }
+
+    private func submitPOSPin(_ pin: String) {
+        guard pin.count >= 4, pin.count <= 6 else { return }
+
+        withAnimation(.easeInOut(duration: 0.38)) {
+            posPendingPINForCash = pin
+            posOpeningCashText = ""
+            posStore.pinErrorMessage = nil
+        }
+    }
+
+    private func confirmPOSOpeningCash(_ openingCash: Double) {
+        guard let pin = posPendingPINForCash else { return }
+
+        Task {
+            guard let response = await posStore.authenticateStaffPIN(
+                baseURL: store.baseURL,
+                token: store.kitchenToken,
+                pin: pin,
+                openingCash: openingCash
+            ) else {
+                await MainActor.run {
+                    posPinEntry = ""
+                }
+                return
+            }
+
+            await MainActor.run {
+                posStaffSessionToken = response.sessionToken
+                posStaffSessionSkipped = false
+                posPinEntry = ""
+                posOpeningCashText = ""
+                posPendingPINForCash = nil
+                selectedSection = .pos
+                selectedCompactTab = .pos
+                posPinWelcome = POSPinWelcome(operatorName: response.operator.name, openingCash: response.openingCash)
+                posStore.setStaffSessionToken(response.sessionToken)
+            }
+
+            await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken)
+
+            try? await Task.sleep(nanoseconds: 3_400_000_000)
+            await MainActor.run {
+                withAnimation(.easeInOut(duration: 0.72)) {
+                    posPinWelcome = nil
+                }
+            }
+        }
+    }
+
+    private func returnToPOSPinEntry() {
+        withAnimation(.easeInOut(duration: 0.28)) {
+            posPendingPINForCash = nil
+            posOpeningCashText = ""
+        }
+    }
+
+    private func resetPOSStaffSessionToPIN() {
+        UserDefaults.standard.removeObject(forKey: "POSStaffSessionToken")
+
+        withAnimation(.easeInOut(duration: 0.42)) {
+            posStaffSessionToken = ""
+            posStaffSessionSkipped = false
+            posPinEntry = ""
+            posOpeningCashText = ""
+            posPendingPINForCash = nil
+            posPinWelcome = nil
+            selectedSection = .pos
+            selectedCompactTab = .pos
+            isPOSShiftMenuOpen = false
+            isPOSStartShiftOpen = false
+            isPOSEndShiftOpen = false
+            isPOSCheckoutOpen = false
+            isPOSArrangeMode = false
+            posCashMovementType = nil
+            saleCompletion = nil
+            settingsOpen = false
+            isPOSRecapOpen = false
+        }
+
+        posStore.setStaffSessionToken("")
+        posStore.clearStaffSession()
+        Haptics.notification(.success)
+    }
+
+    private func applyInitialLaunchSectionIfNeeded() {
+        guard !didApplyInitialLaunchSection else { return }
+        didApplyInitialLaunchSection = true
+
+        if !canAccessPOS && posStaffSessionSkipped {
+            selectedSection = .kitchen
+            selectedCompactTab = .kitchen
+        } else {
+            selectedSection = .pos
+            selectedCompactTab = .pos
+        }
+
+        closeCompactPanels()
+        selectedSource = nil
+        selectedStatus = nil
+        selectedOrder = nil
+        selectedOnlineOrder = nil
+        selectedCompletedTicket = nil
+    }
+
+    private func enforceOperatorAccess() {
+        if !canAccessPOS {
+            selectedSection = posStaffSessionSkipped ? .kitchen : .pos
+            selectedCompactTab = posStaffSessionSkipped ? .kitchen : .pos
+            closeCompactPanels()
+            return
+        }
+
+        guard !canAccessAdminFeatures else { return }
+
+        if selectedSection == .studio {
+            selectedSection = canAccessPOS ? .pos : .kitchen
+        }
+
+        isPOSShiftMenuOpen = false
+        if !canAccessRecap {
+            isPOSRecapOpen = false
+        }
+        settingsOpen = false
+
+        if selectedCompactTab == .shift || selectedCompactTab == .settings || (selectedCompactTab == .recap && !canAccessRecap) {
+            selectedCompactTab = selectedSection == .kitchen ? .kitchen : .pos
+        }
+    }
+
     var body: some View {
         NavigationStack {
             ZStack(alignment: .top) {
                 AppPalette.background.ignoresSafeArea()
 
                 if selectedSection == .pos {
-                    POSProductAreaWallpaper()
+                    POSProductAreaWallpaper(assetName: selectedPOSAccentColor.wallpaperAssetName)
                         .ignoresSafeArea()
                         .transition(.opacity)
+                        .animation(.easeInOut(duration: 0.28), value: selectedPOSAccentColor.wallpaperAssetName)
+                        .opacity(isSplashVisible ? 0 : 1)
+                        .blur(radius: isPOSAuthOverlayVisible ? 3.2 : 0)
+                        .animation(.easeInOut(duration: 0.24), value: isPOSAuthOverlayVisible)
                 }
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
+                    LazyVStack(alignment: .leading, spacing: 18) {
                         HeaderView(
-                            activeCount: selectedSection == .kitchen ? store.orders.count : posStore.productCount,
-                            readyCount: selectedSection == .kitchen ? store.summary.ready : posStore.categoryCount,
+                            activeCount: selectedSection == .kitchen ? store.orders.count : (selectedSection == .studio ? (studioStore.payload?.summary.orders ?? 0) : posStore.productCount),
+                            readyCount: selectedSection == .kitchen ? store.summary.ready : (selectedSection == .studio ? Int((studioStore.payload?.summary.revenue ?? 0).rounded()) : posStore.categoryCount),
                             oldestMinutes: selectedSection == .kitchen ? store.oldestElapsedMinutes : nil,
-                            isConnected: selectedSection == .kitchen ? store.isConnected : posStore.isConnected,
+                            isConnected: selectedSection == .kitchen ? store.isConnected : (selectedSection == .studio ? studioStore.isConnected : posStore.isConnected),
                             section: selectedSection,
+                            brandLogoURL: posStore.brandLogoOverrideURL,
+                            isBrandLogoHidden: posBrandLogoHidden,
+                            brandLogoScale: posBrandLogoScale,
                             cartItemCount: posStore.cartItemCount,
+                            openTicketCount: posStore.openTicketCount,
                             cartTotal: posStore.cartTotal,
                             posAccentColor: selectedPOSAccentColor.color,
-                            onCart: { isPOSCheckoutOpen = true }
+                            isPOSArrangeMode: isPOSArrangeMode,
+                            isCompact: isCompactShell,
+                            studioPeriod: studioStore.selectedPeriod,
+                            onHome: { selectSection(.pos) },
+                            onFinishPOSArrange: { finishPOSArrangeMode() },
+                            onCart: { isPOSCheckoutOpen = true },
+                            onStudioPeriodSelect: { period in
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    studioStore.selectedPeriod = period
+                                }
+                                Task { await studioStore.refresh(baseURL: store.baseURL, token: studioToken) }
+                            }
                         )
 
                         if selectedSection == .kitchen {
-                            MetricsStrip(summary: store.summary, accentColor: selectedPOSAccentColor.color)
+                            MetricsStrip(summary: store.summary, accentColor: selectedPOSAccentColor.color, isCompact: isCompactShell)
 
                             FilterBar(
                                 selectedSource: $selectedSource,
@@ -118,47 +588,88 @@ struct ContentView: View {
                                 OnlineOrderReviewSection(
                                     orders: visibleOnlineOrders,
                                     accentColor: selectedPOSAccentColor.color,
+                                    onSelect: { order in
+                                        selectedOnlineOrder = order
+                                    },
                                     onAccept: { order in
                                         pendingOnlineOrderAction = .accept(order)
                                     },
+                                    onMarkPaid: { order in
+                                        pendingOnlineOrderAction = .markPaid(order)
+                                    },
+                                    onSendToKitchen: { order in
+                                        pendingOnlineOrderAction = .sendToKitchen(order)
+                                    },
                                     onDecline: { order in
                                         pendingOnlineOrderAction = .decline(order)
-                                    }
+                                    },
+                                    isCompact: isCompactShell
                                 )
                             }
 
                             QueueSection(
                                 orders: filteredOrders,
+                                onlineDetailsBySaleID: store.onlineOrderDetailsBySaleID,
                                 isInitialLoading: store.isInitialLoading,
                                 isRefreshing: store.isRefreshing,
                                 accentColor: selectedPOSAccentColor.color,
-                                onSelect: { selectedOrder = $0 },
+                                onSelect: { order in
+                                    selectedOrder = order
+                                },
                                 onStatus: { order, status in
                                     handleStatus(order: order, status: status)
-                                }
+                                },
+                                isCompact: isCompactShell
                             )
-                        } else {
+
+                            CompletedKitchenSection(
+                                tickets: store.completedTickets,
+                                accentColor: selectedPOSAccentColor.color,
+                                onSelect: { ticket in
+                                    selectedCompletedTicket = ticket
+                                },
+                                isCompact: isCompactShell
+                            )
+                        } else if selectedSection == .pos {
                             POSDashboardView(
                                 store: posStore,
                                 baseURL: store.baseURL,
                                 token: store.kitchenToken,
                                 displayStyle: POSProductDisplayStyle(rawValue: posProductDisplayStyleRaw) ?? .productCard,
+                                toppingCategoryOrder: posToppingCategoryOrderRaw.csvValues,
                                 accentColor: selectedPOSAccentColor.color,
-                                isCheckoutOpen: $isPOSCheckoutOpen
+                                isArrangeMode: $isPOSArrangeMode,
+                                isCheckoutOpen: $isPOSCheckoutOpen,
+                                categorySwipeCommand: posCategorySwipeCommand,
+                                isCompact: isCompactShell
+                            )
+                        } else {
+                            StudioRootView(
+                                store: studioStore,
+                                baseURL: store.baseURL,
+                                studioToken: studioToken,
+                                accentColor: selectedPOSAccentColor.color
                             )
                         }
                     }
-                    .padding(.horizontal, 18)
-                    .padding(.top, 44)
-                    .padding(.bottom, 20)
+                    .padding(.horizontal, isCompactShell ? 14 : 18)
+                    .padding(.top, isCompactShell ? 8 : 44)
+                    .padding(.bottom, isCompactShell ? 92 : 20)
                 }
                 .refreshable {
                     if selectedSection == .kitchen {
                         await store.refresh(forceChime: false)
-                    } else {
+                    } else if selectedSection == .pos {
                         await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken)
+                    } else {
+                        await studioStore.refresh(baseURL: store.baseURL, token: studioToken)
                     }
                 }
+                .opacity(isSplashVisible ? 0 : 1)
+                .animation(.easeInOut(duration: 0.42), value: isSplashVisible)
+                .blur(radius: isPOSAuthOverlayVisible ? 3.2 : 0)
+                .animation(.easeInOut(duration: 0.24), value: isPOSAuthOverlayVisible)
+                .allowsHitTesting(!isPOSAuthOverlayVisible)
 
                 if let message = store.notificationMessage {
                     InAppOrderNotification(message: message, accentColor: selectedPOSAccentColor.color) {
@@ -170,86 +681,311 @@ struct ContentView: View {
                     .padding(.top, 18)
                     .frame(maxWidth: .infinity, alignment: .top)
                     .transition(.move(edge: .top).combined(with: .opacity))
+                    .opacity(isSplashVisible ? 0 : 1)
                     .zIndex(3)
                 }
 
-                HStack(spacing: 14) {
-                    if selectedSection == .pos, let bootstrap = posStore.bootstrap {
-                        POSOperatorButton(
-                            operator: bootstrap.operator,
-                            shift: bootstrap.shift,
-                            isSubmitting: posStore.isShiftSubmitting
-                        ) {
-                            isPOSShiftMenuOpen = true
+                if let saleCompletion {
+                    POSSaleCompletionOverlay(
+                        completion: saleCompletion,
+                        accentColor: selectedPOSAccentColor.color,
+                        onRetry: {
+                            Task {
+                                let result = await printStore.printSaleReceiptNow(saleID: saleCompletion.saleID)
+                                showSaleCompletion(saleID: saleCompletion.saleID, total: saleCompletion.total, printResult: result)
+                            }
+                        },
+                        onDismiss: {
+                            withAnimation(.easeOut(duration: 0.22)) {
+                                self.saleCompletion = nil
+                            }
                         }
-                    }
+                    )
+                        .padding(.top, 92)
+                        .frame(maxWidth: .infinity, alignment: .top)
+                        .transition(.scale(scale: 0.94).combined(with: .opacity))
+                        .opacity(isSplashVisible ? 0 : 1)
+                        .zIndex(4)
+                }
 
-                    Menu {
-                        Button {
-                            selectedSection = .kitchen
-                            selectedSource = nil
-                            selectedStatus = nil
-                            Task { await store.refresh(forceChime: false) }
+                if !isCompactShell {
+                    HStack(spacing: 14) {
+                        if selectedSection == .pos, canAccessPOS, let bootstrap = posStore.bootstrap {
+                            POSOperatorButton(
+                                operator: bootstrap.operator,
+                                shift: bootstrap.shift,
+                                isSubmitting: posStore.isShiftSubmitting
+                            ) {
+                                isPOSShiftMenuOpen = true
+                            }
+                        }
+
+                        Menu {
+                            Button {
+                                selectSection(.pos)
+                            } label: {
+                                Label("POS", systemImage: "cart")
+                            }
+
+                            Button {
+                                selectSection(.kitchen)
+                            } label: {
+                                MenuBadgeLabel(
+                                    title: "Kitchen",
+                                    systemImage: "house",
+                                    count: store.waitingOnlineOrderCount,
+                                    accentColor: selectedPOSAccentColor.color
+                                )
+                            }
+
+                            if canAccessAdminFeatures {
+                                Button {
+                                    selectSection(.studio)
+                                } label: {
+                                    Label("Studio", systemImage: "square.grid.2x2")
+                                }
+                            }
+
+                            if canAccessRecap {
+                                Button {
+                                    openPOSRecap()
+                                } label: {
+                                    Label("Recap", systemImage: "chart.bar.xaxis")
+                                }
+                            }
+
+                            if canAccessAdminFeatures {
+                                Button {
+                                    openCompactSettingsPanel()
+                                } label: {
+                                    Label("Settings", systemImage: "gearshape")
+                                }
+                            }
                         } label: {
-                            MenuBadgeLabel(
-                                title: "Kitchen",
-                                systemImage: "house",
-                                count: store.waitingOnlineOrderCount,
-                                accentColor: selectedPOSAccentColor.color
+                            TopMenuIcon(badgeCount: store.waitingOnlineOrderCount, accentColor: selectedPOSAccentColor.color)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.top, 18)
+                    .padding(.trailing, 22)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .opacity(isSplashVisible ? 0 : 1)
+                    .animation(.easeInOut(duration: 0.42), value: isSplashVisible)
+                    .blur(radius: isPOSAuthOverlayVisible ? 3.2 : 0)
+                    .animation(.easeInOut(duration: 0.24), value: isPOSAuthOverlayVisible)
+                    .allowsHitTesting(!isPOSAuthOverlayVisible)
+                }
+
+                if isCompactShell, canAccessPOS, isPOSShiftMenuOpen {
+                    if let bootstrap = posStore.bootstrap {
+                        CompactFullScreenPanel(
+                            accentColor: selectedPOSAccentColor.color,
+                            onDismiss: {
+                                withAnimation(.easeInOut(duration: 0.24)) {
+                                    closeCompactPanelToCurrentSection()
+                                }
+                            }
+                        ) {
+                            POSShiftControlSheet(
+                                operator: bootstrap.operator,
+                                shift: bootstrap.shift,
+                                isSubmitting: posStore.isShiftSubmitting,
+                                accentColor: selectedPOSAccentColor.color,
+                                onOpenShift: {
+                                    closeCompactPanelToCurrentSection()
+                                    isPOSStartShiftOpen = true
+                                },
+                                onCashIn: {
+                                    closeCompactPanelToCurrentSection()
+                                    posCashMovementType = .deposit
+                                },
+                                onCashOut: {
+                                    closeCompactPanelToCurrentSection()
+                                    posCashMovementType = .withdrawal
+                                },
+                                onCloseShift: {
+                                    closeCompactPanelToCurrentSection()
+                                    isPOSEndShiftOpen = true
+                                },
+                                onSignOff: {
+                                    resetPOSStaffSessionToPIN()
+                                },
+                                onClose: {
+                                    withAnimation(.easeInOut(duration: 0.24)) {
+                                        closeCompactPanelToCurrentSection()
+                                    }
+                                }
                             )
                         }
-
-                        Button {
-                            selectedSection = .pos
-                            Task { await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken) }
-                        } label: {
-                            Label("POS", systemImage: "cart")
-                        }
-
-                        Button {
-                            selectedSection = .pos
-                            isPOSRecapOpen = true
-                            Task { await posStore.refreshRecap(baseURL: store.baseURL, token: store.kitchenToken) }
-                        } label: {
-                            Label("Recap", systemImage: "chart.bar.xaxis")
-                        }
-
-                        Button {
-                            settingsOpen = true
-                        } label: {
-                            Label("Settings", systemImage: "gearshape")
-                        }
-                    } label: {
-                        TopMenuIcon(badgeCount: store.waitingOnlineOrderCount, accentColor: selectedPOSAccentColor.color)
+                        .transition(.opacity)
+                        .zIndex(5)
                     }
-                    .buttonStyle(.plain)
                 }
-                .padding(.top, 18)
-                .padding(.trailing, 22)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+
+                if isCompactShell, canAccessRecap, isPOSRecapOpen {
+                    CompactFullScreenPanel(
+                        accentColor: selectedPOSAccentColor.color,
+                        onDismiss: {
+                            withAnimation(.easeInOut(duration: 0.24)) {
+                                closeCompactPanelToCurrentSection()
+                            }
+                        }
+                    ) {
+                        POSRecapSheet(
+                            recap: posStore.recap,
+                            isLoading: posStore.isRecapLoading,
+                            errorMessage: posStore.recapErrorMessage,
+                            accentColor: selectedPOSAccentColor.color,
+                            onClose: {
+                                withAnimation(.easeInOut(duration: 0.24)) {
+                                    closeCompactPanelToCurrentSection()
+                                }
+                            }
+                        ) {
+                            Task { await posStore.refreshRecap(baseURL: store.baseURL, token: store.kitchenToken) }
+                        }
+                    }
+                    .transition(.opacity)
+                    .zIndex(5)
+                }
+
+                if isCompactShell, canAccessAdminFeatures, settingsOpen {
+                    CompactFullScreenPanel(
+                        accentColor: selectedPOSAccentColor.color,
+                        onDismiss: {
+                            withAnimation(.easeInOut(duration: 0.24)) {
+                                closeCompactPanelToCurrentSection()
+                            }
+                        }
+                    ) {
+                        SettingsView(
+                            store: store,
+                            posStore: posStore,
+                            printStore: printStore,
+                            onClose: {
+                                withAnimation(.easeInOut(duration: 0.24)) {
+                                    closeCompactPanelToCurrentSection()
+                                }
+                            }
+                        )
+                    }
+                    .transition(.opacity)
+                    .zIndex(5)
+                }
+
+                if isSplashVisible {
+                    LaunchSplashView(
+                        wallpaperAssetName: selectedPOSAccentColor.wallpaperAssetName,
+                        accentColor: selectedPOSAccentColor.color
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.34)) {
+                            isSplashVisible = false
+                        }
+                    }
+                    .transition(.opacity)
+                    .zIndex(20)
+                }
+
+                if shouldShowPOSPinGate {
+                    POSStaffPinGateView(
+                        pin: $posPinEntry,
+                        isSubmitting: posStore.isPinAuthenticating,
+                        errorMessage: posStore.pinErrorMessage,
+                        accentColor: selectedPOSAccentColor.color,
+                        onSubmit: submitPOSPin,
+                        onSignInLater: signInLater
+                    )
+                    .zIndex(24)
+                }
+
+                if shouldShowPOSCashDeclaration {
+                    POSOpeningCashDeclarationOverlay(
+                        openingCashText: $posOpeningCashText,
+                        isSubmitting: posStore.isPinAuthenticating,
+                        errorMessage: posStore.pinErrorMessage,
+                        accentColor: selectedPOSAccentColor.color,
+                        onConfirm: confirmPOSOpeningCash,
+                        onBack: returnToPOSPinEntry,
+                        onSignInLater: signInLater
+                    )
+                    .transition(.opacity)
+                    .zIndex(24)
+                }
+
+                if let posPinWelcome {
+                    POSPinWelcomeOverlay(welcome: posPinWelcome, accentColor: selectedPOSAccentColor.color)
+                        .transition(.opacity)
+                        .zIndex(25)
+                }
             }
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(.hidden, for: .navigationBar)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if isCompactShell && !isSplashVisible && !isPOSAuthOverlayVisible {
+                    CompactShellTabBar(
+                        selectedTab: activeCompactTab,
+                        waitingOrderCount: store.waitingOnlineOrderCount,
+                        cartItemCount: posStore.cartItemCount,
+                        accentColor: selectedPOSAccentColor.color,
+                        canAccessAdminFeatures: canAccessAdminFeatures,
+                        canAccessShiftAuth: canAccessPOS,
+                        canAccessRecap: canAccessRecap,
+                        canAccessPOS: canAccessPOS,
+                        onSelect: { selectSection($0) },
+                        onShift: {
+                            openCompactShiftPanel()
+                        },
+                        onRecap: { openPOSRecap() },
+                        onSettings: { openCompactSettingsPanel() }
+                    )
+                    .zIndex(20)
+                }
+            }
             .onAppear {
+                UserDefaults.standard.removeObject(forKey: "POSStaffSessionToken")
+                UserDefaults.standard.removeObject(forKey: "POSStaffSessionSkipped")
+                posStore.setStaffSessionToken(posStaffSessionToken)
+                applyInitialLaunchSectionIfNeeded()
+                printStore.receiptLogoURL = posStore.brandLogoOverrideURL
                 if startsPolling {
                     store.start()
                     printStore.start()
                 }
+                if hasPOSStaffSession {
+                    Task { await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken) }
+                }
+            }
+            .onChange(of: posStore.brandLogoOverrideURL) { _, logoURL in
+                printStore.receiptLogoURL = logoURL
+            }
+            .onChange(of: posStore.bootstrap?.operator.role) { _, _ in
+                enforceOperatorAccess()
+            }
+            .onChange(of: posStaffSessionToken) { _, token in
+                posStore.setStaffSessionToken(token)
+                enforceOperatorAccess()
             }
             .onChange(of: scenePhase) { _, phase in
                 guard startsPolling else { return }
 
-                if phase == .active {
-                    store.start()
-                    printStore.start()
+            if phase == .active {
+                store.start()
+                printStore.start()
+                    if selectedSection == .studio, canAccessAdminFeatures {
+                        Task { await studioStore.refresh(baseURL: store.baseURL, token: studioToken) }
+                    } else if selectedSection == .pos, hasPOSStaffSession {
+                        Task { await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken) }
+                    } else if hasPOSStaffSession {
+                        posStore.preloadForSmoothness(baseURL: store.baseURL, token: store.kitchenToken)
+                    }
                 } else if phase == .background {
                     store.stopPolling()
                     printStore.stop()
                 }
             }
             .sheet(item: $selectedOrder) { order in
-                OrderDetailView(order: order) { status in
+                OrderDetailView(order: order, onlineDetails: store.onlineOrderDetailsBySaleID[order.id]) { status in
                     if status == .cancelled {
                         pendingKitchenCancelOrder = order
                         selectedOrder = nil
@@ -258,31 +994,45 @@ struct ContentView: View {
                         Task { await store.update(order: order, status: status) }
                     }
                 }
-                .presentationDetents([.medium, .large])
+                .presentationDetents([.large])
+                .emberSheetChrome()
+            }
+            .sheet(item: $selectedOnlineOrder) { order in
+                OnlineOrderDetailView(
+                    order: order,
+                    accentColor: selectedPOSAccentColor.color,
+                    onAccept: {
+                        selectedOnlineOrder = nil
+                        pendingOnlineOrderAction = .accept(order)
+                    },
+                    onMarkPaid: {
+                        selectedOnlineOrder = nil
+                        pendingOnlineOrderAction = .markPaid(order)
+                    },
+                    onSendToKitchen: {
+                        selectedOnlineOrder = nil
+                        pendingOnlineOrderAction = .sendToKitchen(order)
+                    },
+                    onDecline: {
+                        selectedOnlineOrder = nil
+                        pendingOnlineOrderAction = .decline(order)
+                    }
+                )
+                .presentationDetents([.large])
+                .emberSheetChrome()
+            }
+            .sheet(item: $selectedCompletedTicket) { ticket in
+                CompletedKitchenTicketDetailView(ticket: ticket, accentColor: selectedPOSAccentColor.color)
+                    .presentationDetents([.medium, .large])
+                    .emberSheetChrome()
             }
             .alert(
                 pendingOnlineOrderAction?.title ?? "",
-                isPresented: Binding(
-                    get: { pendingOnlineOrderAction != nil },
-                    set: { isPresented in
-                        if !isPresented {
-                            pendingOnlineOrderAction = nil
-                        }
-                    }
-                ),
+                isPresented: onlineOrderActionAlertBinding,
                 presenting: pendingOnlineOrderAction
             ) { action in
                 Button(action.confirmLabel, role: action.role) {
-                    let confirmedAction = action
-                    pendingOnlineOrderAction = nil
-                    Task {
-                        switch confirmedAction {
-                        case .accept(let order):
-                            await store.acceptOnlineOrder(order)
-                        case .decline(let order):
-                            await store.rejectOnlineOrder(order)
-                        }
-                    }
+                    confirmOnlineOrderAction(action)
                 }
                 Button("Cancel", role: .cancel) {
                     pendingOnlineOrderAction = nil
@@ -292,19 +1042,11 @@ struct ContentView: View {
             }
             .alert(
                 "Cancel kitchen order?",
-                isPresented: Binding(
-                    get: { pendingKitchenCancelOrder != nil },
-                    set: { isPresented in
-                        if !isPresented {
-                            pendingKitchenCancelOrder = nil
-                        }
-                    }
-                ),
+                isPresented: kitchenCancelAlertBinding,
                 presenting: pendingKitchenCancelOrder
             ) { order in
                 Button("Cancel order", role: .destructive) {
-                    pendingKitchenCancelOrder = nil
-                    Task { await store.update(order: order, status: .cancelled) }
+                    confirmKitchenCancelOrder(order)
                 }
                 Button("Keep order", role: .cancel) {
                     pendingKitchenCancelOrder = nil
@@ -312,25 +1054,54 @@ struct ContentView: View {
             } message: { order in
                 Text("Are you sure you want to cancel \(order.orderNumber)? This removes it from the active kitchen rail.")
             }
-            .sheet(isPresented: $settingsOpen) {
+            .sheet(isPresented: settingsSheetBinding) {
                 SettingsView(store: store, posStore: posStore, printStore: printStore)
                     .presentationDetents([.large])
+                    .emberSheetChrome()
             }
             .sheet(isPresented: $isPOSCheckoutOpen) {
                 POSCheckoutSheet(
                     lines: posStore.cartLines,
+                    tickets: posStore.tickets,
+                    activeTicketID: posStore.activeTicketID,
                     total: posStore.cartTotal,
                     baseURL: store.baseURL,
                     token: store.kitchenToken,
+                    posSessionToken: posStaffSessionToken,
                     isSubmitting: posStore.isSubmitting,
                     accentColor: selectedPOSAccentColor.color,
+                    toppingCategoryOrder: posToppingCategoryOrderRaw.csvValues,
                     productImageURL: { product in
                         posStore.imageURL(for: product)
+                    },
+                    onIncrement: { line in
+                        posStore.increment(line: line)
+                    },
+                    onDecrement: { line in
+                        posStore.decrement(line: line)
+                    },
+                    onRemove: { line in
+                        posStore.remove(line: line)
+                    },
+                    onClearCart: {
+                        posStore.clearCart()
+                    },
+                    onNewTicket: {
+                        posStore.createNewTicket()
+                    },
+                    onSwitchTicket: { ticket in
+                        posStore.switchTicket(ticket)
                     },
                     defaultPrintReceipt: { source in
                         printStore.enabledSources.allows(source.receiptSourceKey)
                     },
-                    submit: { paymentMethod, source, reference, customer, discountPercent, notes, shouldPrintReceipt in
+                    onMarketplacePriceChange: { line, price in
+                        posStore.setMarketplaceUnitPrice(line: line, price: price)
+                    },
+                    onToppingsChange: { line, toppings in
+                        posStore.updateToppings(line: line, toppings: toppings)
+                    },
+                    submit: { paymentMethod, source, reference, customer, discountPercent, notes, completionTotal, shouldPrintReceipt in
                         guard let response = await posStore.submitSale(
                             baseURL: store.baseURL,
                             token: store.kitchenToken,
@@ -345,15 +1116,18 @@ struct ContentView: View {
                         }
 
                         printStore.setPrintIntent(saleID: response.saleID, shouldPrint: shouldPrintReceipt)
+                        var printResult = PrintReceiptResult.skipped
                         if shouldPrintReceipt {
-                            await printStore.printSaleReceiptNow(saleID: response.saleID)
+                            printResult = await printStore.printSaleReceiptNow(saleID: response.saleID)
                         }
 
+                        showSaleCompletion(saleID: response.saleID, total: completionTotal, printResult: printResult)
                         return true
                     }
                 )
+                .emberSheetChrome()
             }
-            .sheet(isPresented: $isPOSRecapOpen) {
+            .sheet(isPresented: recapSheetBinding) {
                 POSRecapSheet(
                     recap: posStore.recap,
                     isLoading: posStore.isRecapLoading,
@@ -363,8 +1137,9 @@ struct ContentView: View {
                     Task { await posStore.refreshRecap(baseURL: store.baseURL, token: store.kitchenToken) }
                 }
                 .presentationDetents([.large])
+                .emberSheetChrome()
             }
-            .sheet(isPresented: $isPOSShiftMenuOpen) {
+            .sheet(isPresented: shiftSheetBinding) {
                 if let bootstrap = posStore.bootstrap {
                     POSShiftControlSheet(
                         operator: bootstrap.operator,
@@ -386,19 +1161,30 @@ struct ContentView: View {
                         onCloseShift: {
                             isPOSShiftMenuOpen = false
                             isPOSEndShiftOpen = true
+                        },
+                        onSignOff: {
+                            resetPOSStaffSessionToPIN()
                         }
                     )
+                    .presentationDetents([.large])
+                    .emberSheetChrome()
+                } else {
+                    POSShiftLoadingSheet(accentColor: selectedPOSAccentColor.color)
+                        .presentationDetents([.large])
+                        .emberSheetChrome()
                 }
             }
             .sheet(isPresented: $isPOSStartShiftOpen) {
                 POSStartShiftSheet(isSubmitting: posStore.isShiftSubmitting, accentColor: selectedPOSAccentColor.color) { openingCash, notes in
                     await posStore.startShift(baseURL: store.baseURL, token: store.kitchenToken, openingCash: openingCash, notes: notes)
                 }
+                .emberSheetChrome()
             }
             .sheet(item: $posCashMovementType) { type in
                 POSCashMovementSheet(type: type, isSubmitting: posStore.isShiftSubmitting, accentColor: selectedPOSAccentColor.color) { amount, reason in
                     await posStore.recordCashMovement(baseURL: store.baseURL, token: store.kitchenToken, type: type, amount: amount, reason: reason)
                 }
+                .emberSheetChrome()
             }
             .sheet(isPresented: $isPOSEndShiftOpen) {
                 POSEndShiftSheet(
@@ -406,12 +1192,21 @@ struct ContentView: View {
                     isSubmitting: posStore.isShiftSubmitting,
                     accentColor: selectedPOSAccentColor.color
                 ) { closingCash, notes in
-                    await posStore.endShift(baseURL: store.baseURL, token: store.kitchenToken, closingCash: closingCash, notes: notes)
+                    let didClose = await posStore.endShift(baseURL: store.baseURL, token: store.kitchenToken, closingCash: closingCash, notes: notes)
+                    if didClose {
+                        resetPOSStaffSessionToPIN()
+                    }
+                    return didClose
                 }
+                .emberSheetChrome()
             }
         }
+        .preferredColorScheme(.light)
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
+            if !showsSplash {
+                isSplashVisible = false
+            }
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
@@ -426,16 +1221,30 @@ struct ContentView: View {
 
         Task { await store.update(order: order, status: status) }
     }
+
+    private func finishPOSArrangeMode() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            isPOSArrangeMode = false
+        }
+    }
 }
 
 private enum OnlineOrderAction: Identifiable {
     case accept(KitchenOnlineOrder)
+    case markPaid(KitchenOnlineOrder)
+    case sendToKitchen(KitchenOnlineOrder)
     case decline(KitchenOnlineOrder)
 
     var id: String {
         switch self {
         case .accept(let order):
             return "accept-\(order.id)"
+        case .markPaid(let order):
+            return "paid-\(order.id)"
+        case .sendToKitchen(let order):
+            return "send-\(order.id)"
         case .decline(let order):
             return "decline-\(order.id)"
         }
@@ -445,17 +1254,25 @@ private enum OnlineOrderAction: Identifiable {
         switch self {
         case .accept:
             return "Accept online order?"
+        case .markPaid:
+            return "Confirm QR payment?"
+        case .sendToKitchen:
+            return "Send to Kitchen?"
         case .decline:
-            return "Decline online order?"
+            return "Declining Online Order"
         }
     }
 
     var message: String {
         switch self {
         case .accept(let order):
-            return "Are you sure you want to accept \(order.orderNumber)? It will move into the kitchen queue now."
+            return "Accept \(order.orderNumber)? The customer will be notified and asked to complete payment if needed."
+        case .markPaid(let order):
+            return "Mark QR payment received for \(order.orderNumber)?"
+        case .sendToKitchen(let order):
+            return "Send \(order.orderNumber) into the kitchen queue now?"
         case .decline(let order):
-            return "Are you sure you want to decline \(order.orderNumber)? The customer order request will be rejected."
+            return "Are you sure you want to decline the order \(order.orderNumber)?"
         }
     }
 
@@ -463,6 +1280,10 @@ private enum OnlineOrderAction: Identifiable {
         switch self {
         case .accept:
             return "Accept"
+        case .markPaid:
+            return "Mark Paid"
+        case .sendToKitchen:
+            return "Send"
         case .decline:
             return "Decline"
         }
@@ -470,7 +1291,7 @@ private enum OnlineOrderAction: Identifiable {
 
     var role: ButtonRole? {
         switch self {
-        case .accept:
+        case .accept, .markPaid, .sendToKitchen:
             return nil
         case .decline:
             return .destructive
@@ -494,6 +1315,7 @@ final class PrintBridgeStore: ObservableObject {
     @Published var isConnected = false
     @Published var isPrinting = false
     @Published var statusMessage = "Printer not checked yet."
+    var receiptLogoURL: URL?
 
     private var pollTimer: Timer?
     private var isPollInFlight = false
@@ -569,7 +1391,7 @@ final class PrintBridgeStore: ObservableObject {
 
         do {
             let receipt = PrintReceiptFormatter.testReceipt()
-            let data = PrintReceiptFormatter.format(receipt, paperWidth: paperWidth)
+            let data = PrintReceiptFormatter.format(receipt, paperWidth: paperWidth, logoURL: receiptLogoURL)
             try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
             isConnected = true
             statusMessage = "Test receipt sent."
@@ -596,11 +1418,12 @@ final class PrintBridgeStore: ObservableObject {
         UserDefaults.standard.set(Array(allowedSaleIDs), forKey: "PrintBridgeAllowedSaleIDs")
     }
 
-    func printSaleReceiptNow(saleID: Int) async {
-        guard validateSettings() else { return }
+    fileprivate func printSaleReceiptNow(saleID: Int) async -> PrintReceiptResult {
+        guard validateSettings() else { return .failed(statusMessage) }
 
         isPrinting = true
         statusMessage = "Printing sale #\(saleID)..."
+        defer { isPrinting = false }
 
         do {
             let client = PrintJobAPIClient(baseURL: serverURL, token: printToken)
@@ -609,12 +1432,11 @@ final class PrintBridgeStore: ObservableObject {
             guard let job = lookup.job else {
                 isConnected = true
                 statusMessage = "Sale saved. No receipt job found yet."
-                isPrinting = false
-                return
+                return .failed("No receipt job found yet.")
             }
 
             let claimed = try await client.claim(jobID: job.id, bridgeName: "emberos-ipad-manual")
-            let data = PrintReceiptFormatter.format(claimed.job.payload, paperWidth: paperWidth)
+            let data = PrintReceiptFormatter.format(claimed.job.payload, paperWidth: paperWidth, logoURL: receiptLogoURL)
             try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
             _ = try await client.markPrinted(jobID: job.id)
             allowedSaleIDs.remove(saleID)
@@ -624,13 +1446,13 @@ final class PrintBridgeStore: ObservableObject {
             isConnected = true
             statusMessage = "Printed sale #\(saleID)."
             Haptics.notification(.success)
+            return .printed
         } catch {
             isConnected = false
             statusMessage = error.localizedDescription
             Haptics.notification(.error)
+            return .failed(error.localizedDescription)
         }
-
-        isPrinting = false
     }
 
     func pollOnce() async {
@@ -677,7 +1499,7 @@ final class PrintBridgeStore: ObservableObject {
             }
 
             let claimed = try await client.claim(jobID: job.id, bridgeName: "emberos-ipad")
-            let data = PrintReceiptFormatter.format(claimed.job.payload, paperWidth: paperWidth)
+            let data = PrintReceiptFormatter.format(claimed.job.payload, paperWidth: paperWidth, logoURL: receiptLogoURL)
             try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
             _ = try await client.markPrinted(jobID: job.id)
             if let saleID = job.saleID {
@@ -770,6 +1592,10 @@ struct PrintJobAPIClient {
         }
 
         guard (200..<300).contains(httpResponse.statusCode) else {
+            if let body = String(data: data, encoding: .utf8) {
+                print("Kitchen API \(httpResponse.statusCode) at \(path): \(body)")
+            }
+
             if httpResponse.statusCode == 403 {
                 throw KitchenAPIError.unauthorized
             }
@@ -835,15 +1661,21 @@ enum PrintReceiptFormatter {
     private static let gs = UInt8(0x1d)
     private static let lf = UInt8(0x0a)
 
-    static func format(_ payload: PrintReceiptPayload, paperWidth: Int) -> Data {
+    static func format(_ payload: PrintReceiptPayload, paperWidth: Int, logoURL: URL? = nil) -> Data {
         let columns = paperWidth == 58 ? 32 : 48
         var data = Data()
 
         append(&data, [esc, 0x40])
         alignCenter(&data)
-        bold(&data, true)
-        appendLine(&data, "FITBITES")
-        bold(&data, false)
+
+        if appendLogoIfAvailable(&data, logoURL: logoURL, paperWidth: paperWidth) {
+            blank(&data)
+        } else {
+            bold(&data, true)
+            appendLine(&data, payload.store.name.uppercased())
+            bold(&data, false)
+        }
+
         appendLine(&data, "Health has never tasted this wrong.")
         appendLine(&data, payload.store.address)
         blank(&data)
@@ -894,6 +1726,17 @@ enum PrintReceiptFormatter {
             }
         }
 
+        if let loyalty = payload.loyalty {
+            divider(&data, columns: columns)
+            appendLine(&data, "Fitbites loyalty")
+            appendLine(&data, pair("Stamps", "\(loyalty.safeStamps) / \(loyalty.safeTarget)", columns: columns))
+            appendLine(&data, loyalty.receiptStarsLine)
+            appendLine(&data, pair("Level", "\(loyalty.level) - \(loyalty.xp) XP", columns: columns))
+            if loyalty.rewardCount > 0 {
+                appendLine(&data, "\(loyalty.rewardCount) reward\(loyalty.rewardCount == 1 ? "" : "s") available")
+            }
+        }
+
         if let notes = payload.notes, !notes.isEmpty {
             divider(&data, columns: columns)
             wrap("Notes: \(notes)", columns: columns).forEach { appendLine(&data, $0) }
@@ -927,7 +1770,7 @@ enum PrintReceiptFormatter {
             customer: nil,
             items: [
                 PrintReceiptItem(
-                    name: "Hello World. This is Ember and Goblin talking to you now.",
+                    name: "Hello World. This is emberOS talking to you now.",
                     sku: nil,
                     category: nil,
                     quantity: 1,
@@ -958,12 +1801,90 @@ enum PrintReceiptFormatter {
                 ),
             ],
             totals: PrintReceiptTotals(subtotal: 0, discount: 0, discountPercent: 0, deliveryFee: 0, total: 0),
-            notes: nil
+            notes: nil,
+            loyalty: PrintReceiptLoyalty(level: 1, xp: 0, stamps: 3, target: 9, rewardCount: 0)
         )
     }
 
     private static func append(_ data: inout Data, _ bytes: [UInt8]) {
         data.append(contentsOf: bytes)
+    }
+
+    private static func appendLogoIfAvailable(_ data: inout Data, logoURL: URL?, paperWidth: Int) -> Bool {
+        let image: UIImage?
+        if let logoURL, logoURL.isFileURL {
+            image = UIImage(contentsOfFile: logoURL.path)
+        } else {
+            image = UIImage(named: "EmberOSLogo")
+        }
+
+        guard let image else {
+            return false
+        }
+
+        let maxPixelWidth = paperWidth == 58 ? 144 : 220
+        guard let raster = escposRasterImageData(for: image, maxPixelWidth: maxPixelWidth) else {
+            return false
+        }
+
+        append(&data, raster)
+        return true
+    }
+
+    private static func escposRasterImageData(for image: UIImage, maxPixelWidth: Int) -> [UInt8]? {
+        guard let prepared = prepareReceiptLogo(image, maxPixelWidth: maxPixelWidth),
+              let cgImage = prepared.cgImage,
+              let provider = cgImage.dataProvider,
+              let pixelData = provider.data,
+              let bytes = CFDataGetBytePtr(pixelData) else {
+            return nil
+        }
+
+        let width = cgImage.width
+        let height = cgImage.height
+        guard width > 0, height > 0 else { return nil }
+
+        let bytesPerRow = cgImage.bytesPerRow
+        let bitmapBytesPerRow = (width + 7) / 8
+        var imageBytes = [UInt8](repeating: 0, count: bitmapBytesPerRow * height)
+
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * bytesPerRow + x * 4
+                let red = Double(bytes[offset])
+                let green = Double(bytes[offset + 1])
+                let blue = Double(bytes[offset + 2])
+                let alpha = Double(bytes[offset + 3]) / 255.0
+                let luminance = (0.299 * red + 0.587 * green + 0.114 * blue) * alpha + 255.0 * (1.0 - alpha)
+
+                if luminance < 178 {
+                    let byteIndex = y * bitmapBytesPerRow + x / 8
+                    imageBytes[byteIndex] |= UInt8(0x80 >> (x % 8))
+                }
+            }
+        }
+
+        let xL = UInt8(bitmapBytesPerRow & 0xff)
+        let xH = UInt8((bitmapBytesPerRow >> 8) & 0xff)
+        let yL = UInt8(height & 0xff)
+        let yH = UInt8((height >> 8) & 0xff)
+        return [gs, 0x76, 0x30, 0x00, xL, xH, yL, yH] + imageBytes + [lf]
+    }
+
+    private static func prepareReceiptLogo(_ image: UIImage, maxPixelWidth: Int) -> UIImage? {
+        let sourceSize = image.size
+        guard sourceSize.width > 0, sourceSize.height > 0 else { return nil }
+
+        let maxPixelHeight: CGFloat = maxPixelWidth <= 144 ? 52 : 72
+        let scale = min(CGFloat(maxPixelWidth) / sourceSize.width, maxPixelHeight / sourceSize.height)
+        let canvasSize = CGSize(width: ceil(sourceSize.width * scale), height: ceil(sourceSize.height * scale))
+
+        let renderer = UIGraphicsImageRenderer(size: canvasSize)
+        return renderer.image { context in
+            UIColor.white.setFill()
+            context.fill(CGRect(origin: .zero, size: canvasSize))
+            image.draw(in: CGRect(origin: .zero, size: canvasSize))
+        }
     }
 
     private static func appendLine(_ data: inout Data, _ text: String) {
@@ -1104,6 +2025,8 @@ struct PrintSourceSelection: Equatable {
 final class KitchenStore: ObservableObject {
     @Published var onlineOrders: [KitchenOnlineOrder] = []
     @Published var orders: [KitchenOrder] = []
+    @Published var completedTickets: [CompletedKitchenTicket] = CompletedKitchenTicketStore.load()
+    @Published var onlineOrderDetailsBySaleID: [Int: KitchenOnlineOrder] = [:]
     @Published var summary = KitchenSummary.empty
     @Published var isInitialLoading = false
     @Published var isRefreshing = false
@@ -1140,6 +2063,7 @@ final class KitchenStore: ObservableObject {
 
     func start() {
         pollTimer?.invalidate()
+        pruneCompletedTickets()
 
         Task { await refresh(forceChime: false) }
 
@@ -1202,8 +2126,11 @@ final class KitchenStore: ObservableObject {
         }
 
         isRefreshInFlight = true
+        defer {
+            isRefreshInFlight = false
+        }
+
         await performRefresh(forceChime: forceChime)
-        isRefreshInFlight = false
     }
 
     private func performRefresh(forceChime: Bool) async {
@@ -1222,6 +2149,11 @@ final class KitchenStore: ObservableObject {
             isRefreshing = true
         }
 
+        defer {
+            isInitialLoading = false
+            isRefreshing = false
+        }
+
         do {
             let client = KitchenAPIClient(baseURL: baseURL, token: kitchenToken)
             let onlinePayload = try await client.fetchOnlineOrders()
@@ -1233,15 +2165,23 @@ final class KitchenStore: ObservableObject {
                     .filter { $0.status == .submitted }
                     .map(\.id)
             )
+            let alertableKitchenOrderIDs = Set(
+                kitchenPayload.orders
+                    .filter { $0.source != .store && $0.status != .completed && $0.status != .cancelled }
+                    .map(\.id)
+            )
             let previousActiveCount = orders.count + onlineOrders.count
             let newOnlineIDs = incomingOnlineIDs.subtracting(knownOnlineOrderIDs)
+            let newKitchenOrderIDs = alertableKitchenOrderIDs.subtracting(knownOrderIDs)
             let unalertedSubmittedIDs = submittedOnlineIDs.subtracting(alertedOnlineOrderIDs)
             let alertingIDs = Set(kitchenPayload.orders.filter(\.isPastAlertThreshold).map(\.id))
             let newAlertingIDs = alertingIDs.subtracting(alertingOrderIDs)
+            let chimeOrderCount = unalertedSubmittedIDs.count
 
             onlineOrders = onlinePayload.onlineOrders
-            orders = kitchenPayload.orders
+            orders = kitchenPayload.orders.filter { $0.status != .completed && $0.status != .cancelled }
             summary = kitchenPayload.summary
+            pruneCompletedTickets()
             knownOrderIDs = incomingIDs
             knownOnlineOrderIDs = incomingOnlineIDs
             alertedOnlineOrderIDs.formIntersection(submittedOnlineIDs)
@@ -1250,18 +2190,19 @@ final class KitchenStore: ObservableObject {
             isConnected = true
             hasLoadedOnce = true
 
-            if !unalertedSubmittedIDs.isEmpty {
+            if chimeOrderCount > 0 {
                 alertedOnlineOrderIDs.formUnion(unalertedSubmittedIDs)
                 showNotification(
-                    unalertedSubmittedIDs.count == 1
+                    chimeOrderCount == 1
                         ? "You received a new order!"
-                        : "You received \(unalertedSubmittedIDs.count) new orders!"
+                        : "You received \(chimeOrderCount) new orders!"
                 )
                 chime.play(tone: chimeTone)
             }
 
             if !firstLoad && (
                 !newOnlineIDs.isEmpty ||
+                !newKitchenOrderIDs.isEmpty ||
                 !unalertedSubmittedIDs.isEmpty ||
                 previousActiveCount > 0 && onlinePayload.onlineOrders.isEmpty && kitchenPayload.orders.isEmpty ||
                 !newAlertingIDs.isEmpty
@@ -1280,9 +2221,6 @@ final class KitchenStore: ObservableObject {
             errorMessage = error.localizedDescription
             isConnected = false
         }
-
-        isInitialLoading = false
-        isRefreshing = false
     }
 
     private func showNotification(_ message: String) {
@@ -1310,6 +2248,9 @@ final class KitchenStore: ObservableObject {
             if let index = orders.firstIndex(where: { $0.id == updated.id }) {
                 if updated.status == .completed || updated.status == .cancelled {
                     orders.remove(at: index)
+                    if updated.status == .completed {
+                        archiveCompleted(updated)
+                    }
                 } else {
                     orders[index] = updated
                 }
@@ -1325,12 +2266,48 @@ final class KitchenStore: ObservableObject {
         chime.stop()
 
         do {
-            _ = try await KitchenAPIClient(baseURL: baseURL, token: kitchenToken).acceptOnlineOrder(orderID: order.id)
+            let response = try await KitchenAPIClient(baseURL: baseURL, token: kitchenToken).acceptOnlineOrder(order)
+            upsertOnlineOrder(response.onlineOrder)
+            await refresh(forceChime: false)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func markOnlineOrderPaid(_ order: KitchenOnlineOrder) async {
+        chime.stop()
+
+        do {
+            let response = try await KitchenAPIClient(baseURL: baseURL, token: kitchenToken).markOnlineOrderPaid(order)
+            upsertOnlineOrder(response.onlineOrder)
+            await refresh(forceChime: false)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func sendOnlineOrderToKitchen(_ order: KitchenOnlineOrder) async {
+        chime.stop()
+
+        do {
+            let response = try await KitchenAPIClient(baseURL: baseURL, token: kitchenToken).sendOnlineOrderToKitchen(order)
+            onlineOrders.removeAll { $0.id == order.id }
+            onlineOrderDetailsBySaleID[response.sale.id] = response.onlineOrder
+            knownOrderIDs.insert(response.sale.id)
+            upsertKitchenOrder(response.sale)
             knownOnlineOrderIDs.remove(order.id)
             alertedOnlineOrderIDs.remove(order.id)
             await refresh(forceChime: false)
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func upsertOnlineOrder(_ order: KitchenOnlineOrder) {
+        if let index = onlineOrders.firstIndex(where: { $0.id == order.id }) {
+            onlineOrders[index] = order
+        } else {
+            onlineOrders.insert(order, at: 0)
         }
     }
 
@@ -1346,12 +2323,62 @@ final class KitchenStore: ObservableObject {
             errorMessage = error.localizedDescription
         }
     }
+
+    private func upsertKitchenOrder(_ order: KitchenOrder) {
+        if order.status == .completed || order.status == .cancelled {
+            orders.removeAll { $0.id == order.id }
+            if order.status == .completed {
+                archiveCompleted(order)
+            }
+            return
+        }
+
+        if let index = orders.firstIndex(where: { $0.id == order.id }) {
+            orders[index] = order
+        } else {
+            orders.insert(order, at: 0)
+        }
+
+        summary = KitchenSummary(
+            pending: orders.filter { $0.status == .pending }.count,
+            preparing: orders.filter { $0.status == .preparing }.count,
+            ready: orders.filter { $0.status == .ready }.count,
+            held: orders.filter { $0.status == .held }.count
+        )
+    }
+
+    private func archiveCompleted(_ order: KitchenOrder) {
+        let ticket = CompletedKitchenTicket(
+            order: order,
+            onlineDetails: onlineOrderDetailsBySaleID[order.id],
+            archivedAt: Date()
+        )
+        completedTickets.removeAll { $0.id == ticket.id }
+        completedTickets.insert(ticket, at: 0)
+        onlineOrderDetailsBySaleID.removeValue(forKey: order.id)
+        pruneCompletedTickets()
+        CompletedKitchenTicketStore.save(completedTickets)
+    }
+
+    private func pruneCompletedTickets() {
+        let cutoff = CompletedKitchenTicketStore.vietnamStartOfToday()
+        let pruned = completedTickets
+            .filter { $0.archivedAt >= cutoff }
+            .sorted { $0.archivedAt > $1.archivedAt }
+
+        if pruned != completedTickets {
+            completedTickets = pruned
+            CompletedKitchenTicketStore.save(pruned)
+        }
+    }
 }
 
 @MainActor
 final class POSStore: ObservableObject {
     @Published var bootstrap: POSBootstrapResponse?
     @Published var cartLines: [POSCartLine] = []
+    @Published private(set) var tickets: [POSDraftTicket]
+    @Published private(set) var activeTicketID: UUID
     @Published var isInitialLoading = false
     @Published var isRefreshing = false
     @Published var isSubmitting = false
@@ -1359,16 +2386,28 @@ final class POSStore: ObservableObject {
     @Published var isRecapLoading = false
     @Published var isConnected = false
     @Published var errorMessage: String?
+    @Published var pinErrorMessage: String?
     @Published var recapErrorMessage: String?
     @Published var saleMessage: String?
     @Published var recap: POSRecap?
     @Published var productImageOverrideURLs: [Int: URL] = [:]
+    @Published var brandLogoOverrideURL: URL?
+    @Published var isPinAuthenticating = false
 
     private var refreshTask: Task<Void, Never>?
+    private var preloadTask: Task<Void, Never>?
+    private var saleMessageClearTask: Task<Void, Never>?
+    private var staffSessionToken = ""
     private let imageOverridesDirectoryName = "POSProductImageOverrides"
+    private let brandLogoFileName = "pos-brand-logo.png"
+    private var nextTicketNumber = 1
 
     init() {
+        let firstTicket = POSDraftTicket(number: 1)
+        tickets = [firstTicket]
+        activeTicketID = firstTicket.id
         loadProductImageOverrides()
+        loadBrandLogoOverride()
     }
 
     var productCount: Int {
@@ -1383,8 +2422,73 @@ final class POSStore: ObservableObject {
         cartLines.reduce(0) { $0 + $1.quantity }
     }
 
+    var openTicketCount: Int {
+        tickets.filter { !$0.lines.isEmpty || $0.id == activeTicketID }.count
+    }
+
     var cartTotal: Double {
         cartLines.reduce(0) { $0 + $1.lineTotal }
+    }
+
+    func setStaffSessionToken(_ token: String) {
+        staffSessionToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func clearStaffSession() {
+        staffSessionToken = ""
+        bootstrap = nil
+        recap = nil
+        recapErrorMessage = nil
+        saleMessage = nil
+        errorMessage = nil
+        isShiftSubmitting = false
+        isSubmitting = false
+    }
+
+    func authenticateStaffPIN(baseURL: String, token: String, pin: String, openingCash: Double) async -> POSPinSessionResponse? {
+        guard !isPinAuthenticating else { return nil }
+
+        let trimmedPIN = pin.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (4...6).contains(trimmedPIN.count) else {
+            pinErrorMessage = "Enter a 4-6 digit PIN."
+            Haptics.notification(.error)
+            return nil
+        }
+
+        guard !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            pinErrorMessage = "Add the emberOS Key in Settings first."
+            Haptics.notification(.error)
+            return nil
+        }
+
+        isPinAuthenticating = true
+        pinErrorMessage = nil
+        errorMessage = nil
+
+        do {
+            let response = try await KitchenAPIClient(baseURL: baseURL, token: token).openPOSPinSession(
+                POSPinSessionRequest(
+                    pin: trimmedPIN,
+                    openingCash: openingCash,
+                    deviceName: UIDevice.current.name
+                )
+            )
+            staffSessionToken = response.sessionToken
+            pinErrorMessage = nil
+            bootstrap = bootstrap.map {
+                POSBootstrapResponse(operator: response.operator, catalog: $0.catalog, shift: response.shift)
+            }
+            isConnected = true
+            isPinAuthenticating = false
+            Haptics.notification(.success)
+            return response
+        } catch {
+            pinErrorMessage = error.localizedDescription
+            isConnected = false
+            isPinAuthenticating = false
+            Haptics.notification(.error)
+            return nil
+        }
     }
 
     func quantityInCart(for product: POSProduct) -> Int {
@@ -1426,6 +2530,35 @@ final class POSStore: ObservableObject {
         Haptics.impact(.light)
     }
 
+    func setBrandLogoOverride(data: Data) async {
+        guard let image = UIImage(data: data),
+              let logoData = image.normalizedForPOSLogo().pngData(),
+              let directory = productImageOverridesDirectory(createIfNeeded: true) else {
+            errorMessage = "This logo could not be saved."
+            Haptics.notification(.error)
+            return
+        }
+
+        let fileURL = directory.appendingPathComponent(brandLogoFileName)
+
+        do {
+            try logoData.write(to: fileURL, options: [.atomic])
+            brandLogoOverrideURL = fileURL
+            errorMessage = nil
+            Haptics.notification(.success)
+        } catch {
+            errorMessage = "This logo could not be saved."
+            Haptics.notification(.error)
+        }
+    }
+
+    func clearBrandLogoOverride() {
+        guard let fileURL = brandLogoOverrideURL else { return }
+        try? FileManager.default.removeItem(at: fileURL)
+        brandLogoOverrideURL = nil
+        Haptics.impact(.light)
+    }
+
     func add(product: POSProduct, toppings: [POSTopping]) {
         let lineID = POSCartLine.makeID(product: product, toppings: toppings)
 
@@ -1435,12 +2568,14 @@ final class POSStore: ObservableObject {
             cartLines.append(POSCartLine(product: product, toppings: toppings, quantity: 1))
         }
 
+        syncActiveTicket()
         Haptics.impact(.light)
     }
 
     func increment(line: POSCartLine) {
         guard let index = cartLines.firstIndex(where: { $0.id == line.id }) else { return }
         cartLines[index].quantity += 1
+        syncActiveTicket()
         Haptics.impact(.light)
     }
 
@@ -1453,12 +2588,81 @@ final class POSStore: ObservableObject {
             cartLines[index].quantity -= 1
         }
 
+        syncActiveTicket()
+        Haptics.impact(.light)
+    }
+
+    func remove(line: POSCartLine) {
+        cartLines.removeAll { $0.id == line.id }
+        syncActiveTicket()
+        Haptics.impact(.medium)
+    }
+
+    func setMarketplaceUnitPrice(line: POSCartLine, price: Double?) {
+        guard let index = cartLines.firstIndex(where: { $0.id == line.id }) else { return }
+        var updatedLines = cartLines
+        updatedLines[index].adjustedUnitPrice = price.map { max(0, $0) }
+        cartLines = updatedLines
+        syncActiveTicket()
+    }
+
+    func updateToppings(line: POSCartLine, toppings: [POSTopping]) {
+        guard let currentIndex = cartLines.firstIndex(where: { $0.id == line.id }) else { return }
+
+        let updatedLine = POSCartLine(
+            product: cartLines[currentIndex].product,
+            toppings: toppings,
+            quantity: cartLines[currentIndex].quantity,
+            adjustedUnitPrice: cartLines[currentIndex].adjustedUnitPrice
+        )
+
+        var updatedLines = cartLines
+
+        if let existingIndex = updatedLines.firstIndex(where: { $0.id == updatedLine.id }),
+           existingIndex != currentIndex {
+            updatedLines[existingIndex].quantity += updatedLine.quantity
+            if updatedLines[existingIndex].adjustedUnitPrice == nil {
+                updatedLines[existingIndex].adjustedUnitPrice = updatedLine.adjustedUnitPrice
+            }
+            updatedLines.remove(at: currentIndex)
+        } else {
+            updatedLines[currentIndex] = updatedLine
+        }
+
+        cartLines = updatedLines
+        syncActiveTicket()
         Haptics.impact(.light)
     }
 
     func clearCart() {
         cartLines.removeAll()
+        syncActiveTicket()
         Haptics.notification(.success)
+    }
+
+    func createNewTicket() {
+        syncActiveTicket()
+
+        if cartLines.isEmpty, tickets.contains(where: { $0.id == activeTicketID && $0.lines.isEmpty }) {
+            Haptics.impact(.light)
+            return
+        }
+
+        nextTicketNumber += 1
+        let ticket = POSDraftTicket(number: nextTicketNumber)
+        tickets.append(ticket)
+        activeTicketID = ticket.id
+        cartLines = []
+        Haptics.notification(.success)
+    }
+
+    func switchTicket(_ ticket: POSDraftTicket) {
+        guard ticket.id != activeTicketID else { return }
+
+        syncActiveTicket()
+        activeTicketID = ticket.id
+        cartLines = ticket.lines
+        Haptics.selectionChanged()
     }
 
     func submitSale(
@@ -1478,10 +2682,10 @@ final class POSStore: ObservableObject {
 
         isSubmitting = true
         errorMessage = nil
-        saleMessage = nil
+        clearSaleMessage()
 
         do {
-            let response = try await KitchenAPIClient(baseURL: baseURL, token: token).submitPOSSale(
+            let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).submitPOSSale(
                 POSCreateSaleRequest(
                     cart: cartLines.map(POSSaleCartItem.init(line:)),
                     paymentMethod: paymentMethod.rawValue,
@@ -1498,8 +2702,8 @@ final class POSStore: ObservableObject {
                 )
             )
 
-            saleMessage = response.message
-            cartLines.removeAll()
+            showSaleMessage(response.message)
+            removeActiveTicketAfterSale()
             await refresh(baseURL: baseURL, token: token)
             if recap != nil {
                 await refreshRecap(baseURL: baseURL, token: token)
@@ -1516,9 +2720,36 @@ final class POSStore: ObservableObject {
         }
     }
 
+    private func syncActiveTicket() {
+        guard let index = tickets.firstIndex(where: { $0.id == activeTicketID }) else {
+            let ticket = POSDraftTicket(number: nextTicketNumber, lines: cartLines)
+            tickets.append(ticket)
+            activeTicketID = ticket.id
+            return
+        }
+
+        tickets[index].lines = cartLines
+    }
+
+    private func removeActiveTicketAfterSale() {
+        tickets.removeAll { $0.id == activeTicketID }
+
+        if let nextTicket = tickets.first(where: { !$0.lines.isEmpty }) ?? tickets.first {
+            activeTicketID = nextTicket.id
+            cartLines = nextTicket.lines
+            return
+        }
+
+        nextTicketNumber += 1
+        let ticket = POSDraftTicket(number: nextTicketNumber)
+        tickets = [ticket]
+        activeTicketID = ticket.id
+        cartLines = []
+    }
+
     func startShift(baseURL: String, token: String, openingCash: Double, notes: String) async -> Bool {
         await mutateShift(baseURL: baseURL, token: token) {
-            try await KitchenAPIClient(baseURL: baseURL, token: token).startPOSShift(
+            try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).startPOSShift(
                 POSStartShiftRequest(
                     openingCash: openingCash,
                     notes: notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : notes.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1529,7 +2760,7 @@ final class POSStore: ObservableObject {
 
     func recordCashMovement(baseURL: String, token: String, type: POSCashMovementType, amount: Double, reason: String) async -> Bool {
         await mutateShift(baseURL: baseURL, token: token) {
-            try await KitchenAPIClient(baseURL: baseURL, token: token).recordPOSCashMovement(
+            try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).recordPOSCashMovement(
                 POSCashMovementRequest(
                     type: type.rawValue,
                     amount: amount,
@@ -1541,7 +2772,7 @@ final class POSStore: ObservableObject {
 
     func endShift(baseURL: String, token: String, closingCash: Double?, notes: String) async -> Bool {
         await mutateShift(baseURL: baseURL, token: token) {
-            try await KitchenAPIClient(baseURL: baseURL, token: token).endPOSShift(
+            try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).endPOSShift(
                 POSEndShiftRequest(
                     closingCash: closingCash,
                     notes: notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : notes.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1555,7 +2786,7 @@ final class POSStore: ObservableObject {
 
         isShiftSubmitting = true
         errorMessage = nil
-        saleMessage = nil
+        clearSaleMessage()
 
         do {
             let response = try await action()
@@ -1573,6 +2804,27 @@ final class POSStore: ObservableObject {
             isShiftSubmitting = false
             return false
         }
+    }
+
+    private func showSaleMessage(_ message: String) {
+        saleMessageClearTask?.cancel()
+        saleMessage = message
+        let expectedMessage = message
+
+        saleMessageClearTask = Task {
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            await MainActor.run {
+                guard saleMessage == expectedMessage else { return }
+                saleMessage = nil
+                saleMessageClearTask = nil
+            }
+        }
+    }
+
+    private func clearSaleMessage() {
+        saleMessageClearTask?.cancel()
+        saleMessageClearTask = nil
+        saleMessage = nil
     }
 
     func refresh(baseURL: String, token: String) async {
@@ -1604,9 +2856,10 @@ final class POSStore: ObservableObject {
         }
 
         do {
-            bootstrap = try await KitchenAPIClient(baseURL: baseURL, token: token).fetchPOSBootstrap()
+            bootstrap = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).fetchPOSBootstrap()
             errorMessage = nil
             isConnected = true
+            preloadForSmoothness(baseURL: baseURL, token: token)
         } catch {
             errorMessage = error.localizedDescription
             isConnected = false
@@ -1614,6 +2867,26 @@ final class POSStore: ObservableObject {
 
         isInitialLoading = false
         isRefreshing = false
+    }
+
+    func preloadForSmoothness(baseURL: String, token: String) {
+        guard preloadTask == nil else { return }
+
+        let products = bootstrap?.catalog.products ?? []
+        let imageURLs = products.compactMap { imageURL(for: $0) }
+
+        preloadTask = Task { [weak self] in
+            await POSProductImageCache.shared.prewarm(urls: imageURLs)
+
+            await MainActor.run {
+                guard let self else { return }
+                self.preloadTask = nil
+            }
+        }
+
+        if recap == nil, !isRecapLoading {
+            Task { await refreshRecap(baseURL: baseURL, token: token) }
+        }
     }
 
     func refreshRecap(baseURL: String, token: String) async {
@@ -1628,7 +2901,7 @@ final class POSStore: ObservableObject {
         recapErrorMessage = nil
 
         do {
-            recap = try await KitchenAPIClient(baseURL: baseURL, token: token).fetchPOSRecap().recap
+            recap = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).fetchPOSRecap().recap
             isConnected = true
         } catch {
             recapErrorMessage = error.localizedDescription
@@ -1637,6 +2910,7 @@ final class POSStore: ObservableObject {
 
         isRecapLoading = false
     }
+
 
     private func loadProductImageOverrides() {
         guard let directory = productImageOverridesDirectory(createIfNeeded: false),
@@ -1659,6 +2933,17 @@ final class POSStore: ObservableObject {
         productImageOverrideURLs = overrides
     }
 
+    private func loadBrandLogoOverride() {
+        guard let directory = productImageOverridesDirectory(createIfNeeded: false) else {
+            return
+        }
+
+        let fileURL = directory.appendingPathComponent(brandLogoFileName)
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            brandLogoOverrideURL = fileURL
+        }
+    }
+
     private func productImageOverridesDirectory(createIfNeeded: Bool) -> URL? {
         guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
             return nil
@@ -1676,9 +2961,14 @@ final class POSStore: ObservableObject {
 struct KitchenAPIClient {
     let baseURL: String
     let token: String
+    var posSessionToken: String = ""
 
     func fetchPOSBootstrap() async throws -> POSBootstrapResponse {
         try await request(path: "/api/pos/bootstrap", method: "GET", body: Optional<KitchenStatusRequest>.none)
+    }
+
+    func openPOSPinSession(_ session: POSPinSessionRequest) async throws -> POSPinSessionResponse {
+        try await request(path: "/api/pos/sessions/pin", method: "POST", body: session)
     }
 
     func fetchPOSRecap() async throws -> POSRecapResponse {
@@ -1728,9 +3018,25 @@ struct KitchenAPIClient {
         try await request(path: "/api/kitchen/orders", method: "GET", body: Optional<KitchenStatusRequest>.none)
     }
 
-    func acceptOnlineOrder(orderID: Int) async throws -> KitchenAcceptOnlineOrderResponse {
+    func acceptOnlineOrder(_ order: KitchenOnlineOrder) async throws -> KitchenOnlineOrderResponse {
         try await request(
-            path: "/api/kitchen/online-orders/\(orderID)/accept",
+            path: "/api/kitchen/online-orders/\(order.id)/accept",
+            method: "POST",
+            body: Optional<KitchenStatusRequest>.none
+        )
+    }
+
+    func markOnlineOrderPaid(_ order: KitchenOnlineOrder) async throws -> KitchenOnlineOrderResponse {
+        try await request(
+            path: "/api/kitchen/online-orders/\(order.id)/mark-paid",
+            method: "POST",
+            body: Optional<KitchenStatusRequest>.none
+        )
+    }
+
+    func sendOnlineOrderToKitchen(_ order: KitchenOnlineOrder) async throws -> KitchenSendOnlineOrderToKitchenResponse {
+        try await request(
+            path: "/api/kitchen/online-orders/\(order.id)/send-to-kitchen",
             method: "POST",
             body: Optional<KitchenStatusRequest>.none
         )
@@ -1764,6 +3070,10 @@ struct KitchenAPIClient {
         request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue(token, forHTTPHeaderField: "X-Kitchen-Token")
+        let trimmedPOSSession = posSessionToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedPOSSession.isEmpty {
+            request.setValue(trimmedPOSSession, forHTTPHeaderField: "X-POS-Staff-Session")
+        }
 
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1888,7 +3198,7 @@ private final class KitchenChime: NSObject, AVAudioPlayerDelegate {
     }
 }
 
-private enum GlacialFont {
+enum GlacialFont {
     static let familyName = "Glacial Indifference"
 
     static func register() {
@@ -1945,27 +3255,96 @@ private enum GlacialFont {
     }
 }
 
+private struct LaunchSplashView: View {
+    let wallpaperAssetName: String
+    let accentColor: Color
+    let onFinished: () -> Void
+
+    @State private var logoOpacity = 0.0
+    @State private var progress = 0.0
+
+    var body: some View {
+        ZStack {
+            AppPalette.background.ignoresSafeArea()
+
+            POSProductAreaWallpaper(assetName: wallpaperAssetName)
+                .opacity(0.46)
+                .ignoresSafeArea()
+
+            Rectangle()
+                .fill(.white.opacity(0.62))
+                .ignoresSafeArea()
+
+            VStack(spacing: 18) {
+                Image("EmberOSLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 310, height: 96)
+                    .opacity(logoOpacity)
+
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(AppPalette.line.opacity(0.72))
+                        .frame(width: 172, height: 3)
+
+                    Capsule()
+                        .fill(accentColor)
+                        .frame(width: 172 * progress, height: 3)
+                }
+                .opacity(logoOpacity)
+            }
+            .padding(.horizontal, 32)
+        }
+        .allowsHitTesting(true)
+        .onAppear {
+            runAnimation()
+        }
+    }
+
+    private func runAnimation() {
+        withAnimation(.easeInOut(duration: 2.0)) {
+            logoOpacity = 1
+        }
+
+        withAnimation(.easeInOut(duration: 1.55).delay(0.28)) {
+            progress = 1
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_250_000_000)
+            onFinished()
+        }
+    }
+}
+
 private struct HeaderView: View {
     let activeCount: Int
     let readyCount: Int
     let oldestMinutes: Int?
     let isConnected: Bool
     let section: AppSection
+    let brandLogoURL: URL?
+    let isBrandLogoHidden: Bool
+    let brandLogoScale: Double
     let cartItemCount: Int
+    let openTicketCount: Int
     let cartTotal: Double
     let posAccentColor: Color
+    let isPOSArrangeMode: Bool
+    let isCompact: Bool
+    let studioPeriod: String
+    let onHome: () -> Void
+    let onFinishPOSArrange: () -> Void
     let onCart: () -> Void
+    let onStudioPeriodSelect: (String) -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 18) {
-            Image("EmberOSLogo")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 265, height: 82)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(.white, in: RoundedRectangle(cornerRadius: 8))
-                .accessibilityLabel("EmberOS")
+        HStack(alignment: isCompact ? .top : .center, spacing: isCompact ? 10 : 18) {
+            Button(action: onHome) {
+                BrandLogoHeader(url: brandLogoURL, isHidden: isBrandLogoHidden, scale: brandLogoScale, isCompact: isCompact)
+            }
+            .buttonStyle(NoHighlightButtonStyle())
+            .accessibilityLabel("Go to POS home")
 
             Spacer()
 
@@ -1979,14 +3358,53 @@ private struct HeaderView: View {
                     accentColor: posAccentColor
                 )
             case .pos:
-                POSHeaderCartSummary(
-                    itemCount: cartItemCount,
-                    total: cartTotal,
-                    isConnected: isConnected,
-                    accentColor: posAccentColor,
-                    onCart: onCart
-                )
-                .offset(y: 8)
+                VStack(alignment: .leading, spacing: 7) {
+                    if isPOSArrangeMode {
+                        Button(action: onFinishPOSArrange) {
+                            Text("DONE")
+                                .font(GlacialFont.caption(.bold))
+                                .tracking(2.0)
+                                .foregroundStyle(posAccentColor)
+                                .frame(width: 84, height: 30)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(posAccentColor.opacity(0.46), lineWidth: 1)
+                                )
+                        }
+                        .buttonStyle(NoHighlightButtonStyle())
+                    }
+
+                    POSHeaderCartSummary(
+                        itemCount: cartItemCount,
+                        ticketCount: openTicketCount,
+                        total: cartTotal,
+                        isConnected: isConnected,
+                        accentColor: posAccentColor,
+                        isCompact: isCompact,
+                        onCart: onCart
+                    )
+                }
+            case .studio:
+                VStack(alignment: .trailing, spacing: 7) {
+                    Text("EMBEROS STUDIO")
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(2.4)
+                        .foregroundStyle(posAccentColor)
+
+                    HStack(spacing: 8) {
+                        StudioPeriodMenuButton(
+                            selectedPeriod: studioPeriod,
+                            accentColor: posAccentColor,
+                            onSelect: onStudioPeriodSelect
+                        )
+
+                        Text("· \(activeCount) ORDERS")
+                            .font(GlacialFont.caption2(.bold))
+                            .tracking(1.5)
+                            .foregroundStyle(AppPalette.muted)
+                    }
+                }
+                .padding(.top, isCompact ? 8 : 14)
             }
         }
     }
@@ -2002,7 +3420,88 @@ private struct HeaderView: View {
             return readyCount > 0 ? "\(readyCount) ready" : oldestText
         case .pos:
             return "\(readyCount) categories"
+        case .studio:
+            return isConnected ? "Studio live" : "Studio offline"
         }
+    }
+}
+
+private struct StudioPeriodMenuButton: View {
+    let selectedPeriod: String
+    let accentColor: Color
+    let onSelect: (String) -> Void
+
+    private let periods = [
+        ("today", "TODAY"),
+        ("this_week", "WEEK"),
+        ("this_month", "MONTH"),
+        ("this_year", "YEAR")
+    ]
+
+    private var label: String {
+        periods.first(where: { $0.0 == selectedPeriod })?.1 ?? selectedPeriod.uppercased()
+    }
+
+    var body: some View {
+        Menu {
+            ForEach(periods, id: \.0) { value, title in
+                Button {
+                    onSelect(value)
+                } label: {
+                    Label(title, systemImage: selectedPeriod == value ? "checkmark" : "calendar")
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Text(label)
+                    .font(GlacialFont.caption2(.bold))
+                    .tracking(1.5)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 7)
+            .background(accentColor, in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct BrandLogoHeader: View {
+    let url: URL?
+    let isHidden: Bool
+    let scale: Double
+    let isCompact: Bool
+
+    private var clampedScale: CGFloat {
+        min(max(CGFloat(scale), 0.6), 1.3)
+    }
+
+    private var baseSize: CGSize {
+        isCompact ? CGSize(width: 148, height: 48) : CGSize(width: 265, height: 82)
+    }
+
+    var body: some View {
+        Group {
+            if isHidden {
+                Color.clear
+            } else if let url, url.isFileURL, let image = UIImage(contentsOfFile: url.path) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image("EmberOSLogo")
+                    .resizable()
+                    .scaledToFit()
+            }
+        }
+        .frame(width: baseSize.width * clampedScale, height: baseSize.height * clampedScale)
+        .padding(.horizontal, isCompact ? 8 : 12)
+        .padding(.vertical, isCompact ? 6 : 8)
+        .background(isHidden ? Color.clear : .white, in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityLabel(isHidden ? "Brand logo hidden" : "Brand logo")
     }
 }
 
@@ -2061,6 +3560,779 @@ private struct MenuBadgeLabel: View {
     }
 }
 
+private enum CompactShellTab: Hashable {
+    case pos
+    case kitchen
+    case shift
+    case recap
+    case settings
+}
+
+private struct CompactShellTabBar: View {
+    let selectedTab: CompactShellTab
+    let waitingOrderCount: Int
+    let cartItemCount: Int
+    let accentColor: Color
+    let canAccessAdminFeatures: Bool
+    let canAccessShiftAuth: Bool
+    let canAccessRecap: Bool
+    let canAccessPOS: Bool
+    let onSelect: (AppSection) -> Void
+    let onShift: () -> Void
+    let onRecap: () -> Void
+    let onSettings: () -> Void
+    @Namespace private var selectionNamespace
+
+    var body: some View {
+        HStack(spacing: 8) {
+            CompactShellTabButton(
+                title: AppSection.pos.label,
+                systemImage: selectedTab == .pos ? "house.fill" : "house",
+                badgeCount: cartItemCount,
+                tab: .pos,
+                selectedTab: selectedTab,
+                accentColor: accentColor,
+                isEnabled: canAccessPOS,
+                namespace: selectionNamespace
+            ) {
+                onSelect(.pos)
+            }
+
+            CompactShellTabButton(
+                title: AppSection.kitchen.label,
+                systemImage: "fork.knife",
+                badgeCount: waitingOrderCount,
+                tab: .kitchen,
+                selectedTab: selectedTab,
+                accentColor: accentColor,
+                isEnabled: true,
+                namespace: selectionNamespace
+            ) {
+                onSelect(.kitchen)
+            }
+
+            if canAccessRecap {
+                CompactShellTabButton(
+                    title: "Recap",
+                    systemImage: "chart.bar",
+                    badgeCount: 0,
+                    tab: .recap,
+                    selectedTab: selectedTab,
+                    accentColor: accentColor,
+                    isEnabled: true,
+                    namespace: selectionNamespace,
+                    action: onRecap
+                )
+            }
+
+            if canAccessShiftAuth {
+                CompactShellTabButton(
+                    title: "Auth",
+                    systemImage: "person",
+                    badgeCount: 0,
+                    tab: .shift,
+                    selectedTab: selectedTab,
+                    accentColor: accentColor,
+                    isEnabled: true,
+                    namespace: selectionNamespace,
+                    action: onShift
+                )
+            }
+
+            if canAccessAdminFeatures {
+                CompactShellTabButton(
+                    title: "Settings",
+                    systemImage: "gearshape.fill",
+                    badgeCount: 0,
+                    tab: .settings,
+                    selectedTab: selectedTab,
+                    accentColor: accentColor,
+                    isEnabled: true,
+                    namespace: selectionNamespace,
+                    action: onSettings
+                )
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: 354)
+        .background(.ultraThinMaterial, in: Capsule())
+        .background(.white.opacity(0.54), in: Capsule())
+        .overlay(
+            Capsule()
+                .stroke(.white.opacity(0.72), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.15), radius: 24, y: 10)
+        .padding(.horizontal, 18)
+        .padding(.bottom, 10)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private struct CompactShellTabButton: View {
+    let title: String
+    let systemImage: String
+    let badgeCount: Int
+    let tab: CompactShellTab
+    let selectedTab: CompactShellTab
+    let accentColor: Color
+    var isEnabled = true
+    let namespace: Namespace.ID
+    let action: () -> Void
+
+    private var isSelected: Bool {
+        selectedTab == tab
+    }
+
+    var body: some View {
+        Button {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.82, blendDuration: 0.08)) {
+                action()
+            }
+        } label: {
+            ZStack(alignment: .topTrailing) {
+                ZStack {
+                    if isSelected {
+                        Capsule()
+                            .fill(.white.opacity(0.34))
+                            .matchedGeometryEffect(id: "compact-tab-pill", in: namespace)
+                            .overlay(
+                                Capsule()
+                                    .stroke(.white.opacity(0.34), lineWidth: 1)
+                            )
+                    }
+
+                    Image(systemName: systemImage)
+                        .font(.system(size: 22, weight: isSelected ? .bold : .semibold))
+                        .symbolRenderingMode(.monochrome)
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: 52)
+
+                if badgeCount > 0 {
+                    Text("\(min(badgeCount, 9))")
+                        .font(GlacialFont.caption2(.bold))
+                        .foregroundStyle(.white)
+                        .frame(minWidth: 15, minHeight: 15)
+                        .background(accentColor, in: Circle())
+                        .offset(x: -8, y: 2)
+                }
+            }
+            .foregroundStyle(isEnabled ? (isSelected ? AppPalette.ink : AppPalette.ink.opacity(0.84)) : AppPalette.ink.opacity(0.28))
+            .frame(maxWidth: .infinity)
+            .frame(height: 52)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .animation(.spring(response: 0.34, dampingFraction: 0.82, blendDuration: 0.08), value: selectedTab)
+        .animation(.snappy(duration: 0.18), value: badgeCount)
+    }
+}
+
+private struct POSStaffPinGateView: View {
+    @Binding var pin: String
+    let isSubmitting: Bool
+    let errorMessage: String?
+    let accentColor: Color
+    let onSubmit: (String) -> Void
+    let onSignInLater: () -> Void
+    @State private var isPanelPresented = false
+    @State private var localErrorMessage: String?
+    private let panelCornerRadius: CGFloat = 8
+
+    private let keypadRows = [
+        ["1", "2", "3"],
+        ["4", "5", "6"],
+        ["7", "8", "9"],
+        ["delete.left", "0", "arrow.right"]
+    ]
+
+    private var displayErrorMessage: String? {
+        localErrorMessage ?? errorMessage
+    }
+
+    private var keyGlassFill: AnyShapeStyle {
+        UIAccessibility.isReduceTransparencyEnabled ? AnyShapeStyle(Color.white) : AnyShapeStyle(.thinMaterial)
+    }
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(.white.opacity(0.10))
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {}
+
+            Color.black.opacity(0.03)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {}
+
+            ZStack {
+                VStack(spacing: 18) {
+                    Image("EmberOSLogo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 166)
+                        .opacity(0.92)
+
+                    pinPanel
+                }
+                .padding(.horizontal, 18)
+                .offset(y: -56)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .opacity(isPanelPresented ? 1 : 0)
+            .scaleEffect(isPanelPresented ? 1 : 0.965)
+        }
+        .animation(.easeInOut(duration: 0.22), value: errorMessage)
+        .animation(.easeInOut(duration: 0.22), value: localErrorMessage)
+        .onAppear {
+            isPanelPresented = false
+            withAnimation(.easeOut(duration: 1.05).delay(0.50)) {
+                isPanelPresented = true
+            }
+        }
+    }
+
+    private var pinPanel: some View {
+        VStack(spacing: 22) {
+            VStack(spacing: 7) {
+                Text("STAFF PIN")
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(3.4)
+                    .foregroundStyle(AppPalette.muted)
+
+                Text("Enter your 4-6 digit code")
+                    .font(GlacialFont.subheadline())
+                    .foregroundStyle(AppPalette.ink.opacity(0.78))
+            }
+
+            HStack(spacing: 10) {
+                ForEach(0..<6, id: \.self) { index in
+                    Circle()
+                        .fill(index < pin.count ? accentColor : AppPalette.ink.opacity(0.12))
+                        .frame(width: index < pin.count ? 12 : 9, height: index < pin.count ? 12 : 9)
+                        .animation(.spring(response: 0.28, dampingFraction: 0.78), value: pin.count)
+                }
+            }
+            .frame(height: 16)
+
+            if let displayErrorMessage {
+                Text(displayErrorMessage)
+                    .font(GlacialFont.caption())
+                    .foregroundStyle(Color(red: 0.68, green: 0.20, blue: 0.18))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 260)
+                    .transition(.opacity)
+            }
+
+            VStack(spacing: 10) {
+                ForEach(keypadRows, id: \.self) { row in
+                    HStack(spacing: 10) {
+                        ForEach(row, id: \.self) { key in
+                            pinKey(key)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 4)
+            .disabled(isSubmitting)
+            .opacity(isSubmitting ? 0.62 : 1)
+
+            if isSubmitting {
+                ProgressView()
+                    .tint(accentColor)
+                    .transition(.opacity)
+            }
+
+            Button(action: onSignInLater) {
+                Text("SIGN IN LATER")
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(1.8)
+                    .foregroundStyle(AppPalette.ink.opacity(0.76))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 3)
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 2)
+        }
+        .padding(.horizontal, 28)
+        .padding(.vertical, 30)
+        .frame(width: min(UIScreen.main.bounds.width - 44, 390))
+        .lightGlassBackground(.thinMaterial, in: RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous))
+        .background(.white.opacity(0.78), in: RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous))
+        .background(
+            LinearGradient(
+                colors: [
+                    .white.opacity(0.92),
+                    .white.opacity(0.74),
+                    accentColor.opacity(0.08)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+        )
+        .overlay(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [.white.opacity(0.68), .white.opacity(0.18), .clear],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .allowsHitTesting(false)
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                .stroke(
+                    LinearGradient(
+                        colors: [.white.opacity(0.92), .white.opacity(0.34), .white.opacity(0.66)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
+        )
+        .shadow(color: accentColor.opacity(0.08), radius: 18, y: 10)
+        .shadow(color: .black.opacity(0.07), radius: 30, y: 16)
+    }
+
+    private func pinKey(_ key: String) -> some View {
+        Button {
+            handleKey(key)
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(keyGlassFill)
+                    .background(.white.opacity(key == "arrow.right" ? 0.84 : 0.78), in: Circle())
+                    .overlay(
+                        Circle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        .white.opacity(key == "arrow.right" ? 0.92 : 0.86),
+                                        .white.opacity(0.50),
+                                        accentColor.opacity(key == "arrow.right" ? 0.10 : 0.03)
+                                    ],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                    )
+                    .overlay(
+                        Circle()
+                            .stroke(
+                                LinearGradient(
+                                    colors: [.white.opacity(0.94), .white.opacity(0.30), .white.opacity(0.58)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                ),
+                                lineWidth: 0.9
+                            )
+                    )
+                    .overlay(alignment: .topLeading) {
+                        Capsule()
+                            .fill(.white.opacity(0.46))
+                            .frame(width: 18, height: 7)
+                            .blur(radius: 4)
+                            .rotationEffect(.degrees(-24))
+                            .offset(x: 17, y: 14)
+                    }
+                    .shadow(color: .white.opacity(0.28), radius: 5, x: -1, y: -1)
+                    .shadow(color: .black.opacity(0.08), radius: 9, x: 1, y: 6)
+
+                if key == "delete.left" || key == "arrow.right" {
+                    Image(systemName: key)
+                        .font(.system(size: 21, weight: .semibold))
+                        .foregroundStyle(key == "arrow.right" && pin.count >= 4 ? accentColor : AppPalette.ink.opacity(0.55))
+                } else {
+                    Text(key)
+                        .font(.system(size: 25, weight: .regular, design: .rounded))
+                        .foregroundStyle(AppPalette.ink)
+                }
+            }
+            .frame(width: 72, height: 72)
+        }
+        .buttonStyle(.plain)
+        .scaleEffect(key == "arrow.right" && pin.count >= 4 ? 1.03 : 1)
+        .animation(.spring(response: 0.28, dampingFraction: 0.74), value: pin.count)
+    }
+
+    private func handleKey(_ key: String) {
+        switch key {
+        case "delete.left":
+            guard !pin.isEmpty else { return }
+            pin.removeLast()
+            Haptics.selectionChanged()
+        case "arrow.right":
+            submitIfReady()
+        default:
+            guard pin.count < 6 else { return }
+            pin.append(key)
+            Haptics.selectionChanged()
+            if pin.count == 6 {
+                submitIfReady()
+            }
+        }
+    }
+
+    private func submitIfReady() {
+        guard pin.count >= 4 else {
+            localErrorMessage = "Enter your PIN first."
+            Haptics.impact(.light)
+            return
+        }
+
+        localErrorMessage = nil
+        onSubmit(pin)
+    }
+}
+
+private struct POSOpeningCashDeclarationOverlay: View {
+    @Binding var openingCashText: String
+    let isSubmitting: Bool
+    let errorMessage: String?
+    let accentColor: Color
+    let onConfirm: (Double) -> Void
+    let onBack: () -> Void
+    let onSignInLater: () -> Void
+    @State private var isPanelPresented = false
+    @State private var localErrorMessage: String?
+    private let panelCornerRadius: CGFloat = 8
+
+    private var declaredOpeningCash: Double? {
+        let digits = openingCashText.filter(\.isNumber)
+        guard !digits.isEmpty else { return nil }
+        return Double(digits)
+    }
+
+    private var displayErrorMessage: String? {
+        localErrorMessage ?? errorMessage
+    }
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(.white.opacity(0.10))
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {}
+
+            Color.black.opacity(0.03)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {}
+
+            VStack(spacing: 18) {
+                Spacer(minLength: 26)
+
+                VStack(spacing: 22) {
+                    Image(systemName: "banknote")
+                        .font(.system(size: 34, weight: .semibold))
+                        .foregroundStyle(accentColor)
+                        .frame(width: 54, height: 54)
+                        .background(accentColor.opacity(0.10), in: Circle())
+
+                    VStack(spacing: 7) {
+                        Text("OPENING CASH")
+                            .font(GlacialFont.caption(.bold))
+                            .tracking(3.2)
+                            .foregroundStyle(AppPalette.muted)
+
+                        Text("Declare the cash in the register before opening the shift.")
+                            .font(GlacialFont.subheadline())
+                            .foregroundStyle(AppPalette.ink.opacity(0.78))
+                            .multilineTextAlignment(.center)
+                    }
+
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("CASH IN REGISTER")
+                            .font(GlacialFont.caption2(.bold))
+                            .tracking(1.8)
+                            .foregroundStyle(AppPalette.muted)
+
+                        HStack(spacing: 10) {
+                            TextField("Amount", text: $openingCashText)
+                                .font(GlacialFont.headline(.semibold))
+                                .keyboardType(.numberPad)
+                                .foregroundStyle(AppPalette.ink)
+                                .foregroundColor(AppPalette.ink)
+                                .tint(accentColor)
+                                .onChange(of: openingCashText) { _, value in
+                                    let formatted = formattedCashInput(value)
+                                    if formatted != value {
+                                        openingCashText = formatted
+                                    }
+                                    localErrorMessage = nil
+                                }
+
+                            Text("VND")
+                                .font(GlacialFont.caption(.bold))
+                                .tracking(1.1)
+                                .foregroundStyle(AppPalette.muted)
+                        }
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 13)
+                        .lightGlassBackground(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(.white.opacity(0.54), lineWidth: 1)
+                        )
+                    }
+
+                    if let displayErrorMessage {
+                        Text(displayErrorMessage)
+                            .font(GlacialFont.caption())
+                            .foregroundStyle(Color(red: 0.68, green: 0.20, blue: 0.18))
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 260)
+                            .transition(.opacity)
+                    }
+
+                    Button {
+                        confirm()
+                    } label: {
+                        HStack(spacing: 9) {
+                            if isSubmitting {
+                                ProgressView()
+                                    .tint(.white)
+                            }
+
+                            Text(isSubmitting ? "OPENING SHIFT" : "OPEN SHIFT")
+                                .font(GlacialFont.caption(.bold))
+                                .tracking(1.8)
+                        }
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 15)
+                        .background(accentColor, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isSubmitting)
+                    .opacity(isSubmitting ? 0.76 : 1)
+
+                    Button("BACK TO PIN", action: onBack)
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.5)
+                        .foregroundStyle(AppPalette.muted)
+                        .buttonStyle(.plain)
+                        .disabled(isSubmitting)
+                }
+                .padding(.horizontal, 28)
+                .padding(.vertical, 30)
+                .frame(width: min(UIScreen.main.bounds.width - 44, 390))
+                .lightGlassBackground(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous))
+                .background(
+                    LinearGradient(
+                        colors: [
+                            .white.opacity(0.42),
+                            .white.opacity(0.24),
+                            accentColor.opacity(0.08)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    in: RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                )
+                .overlay(alignment: .topLeading) {
+                    RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [.white.opacity(0.54), .white.opacity(0.12), .clear],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .allowsHitTesting(false)
+                }
+                .overlay(
+                    RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                        .stroke(
+                            LinearGradient(
+                                colors: [.white.opacity(0.92), .white.opacity(0.34), .white.opacity(0.66)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                )
+                .shadow(color: accentColor.opacity(0.10), radius: 22, y: 12)
+                .shadow(color: .black.opacity(0.10), radius: 34, y: 18)
+
+                Button(action: onSignInLater) {
+                    Text("SIGN IN LATER")
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.8)
+                        .foregroundStyle(AppPalette.ink.opacity(0.76))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 15)
+                        .lightGlassBackground(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .background(.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(.white.opacity(0.58), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .frame(width: min(UIScreen.main.bounds.width - 44, 390))
+                .padding(.top, 8)
+                .disabled(isSubmitting)
+
+                Spacer(minLength: 40)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.horizontal, 18)
+            .opacity(isPanelPresented ? 1 : 0)
+            .scaleEffect(isPanelPresented ? 1 : 0.965)
+        }
+        .animation(.easeInOut(duration: 0.22), value: errorMessage)
+        .animation(.easeInOut(duration: 0.22), value: localErrorMessage)
+        .onAppear {
+            isPanelPresented = false
+            withAnimation(.easeOut(duration: 0.92).delay(0.18)) {
+                isPanelPresented = true
+            }
+        }
+    }
+
+    private func confirm() {
+        guard let declaredOpeningCash else {
+            localErrorMessage = "Declare the cash in the register."
+            Haptics.notification(.error)
+            return
+        }
+
+        localErrorMessage = nil
+        onConfirm(declaredOpeningCash)
+    }
+
+    private func formattedCashInput(_ value: String) -> String {
+        let digits = value.filter(\.isNumber)
+        guard !digits.isEmpty, let number = Int(digits) else { return "" }
+        return number.formatted()
+    }
+}
+
+private struct AnimatedSuccessCheckmark: View {
+    let accentColor: Color
+    let size: CGFloat
+    @State private var circleProgress: CGFloat = 0
+    @State private var checkProgress: CGFloat = 0
+    @State private var glowOpacity: Double = 0
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(accentColor.opacity(0.10))
+                .frame(width: size, height: size)
+                .scaleEffect(glowOpacity > 0 ? 1.18 : 0.92)
+                .opacity(glowOpacity)
+
+            Circle()
+                .stroke(accentColor.opacity(0.18), lineWidth: 6)
+                .frame(width: size, height: size)
+
+            Circle()
+                .trim(from: 0, to: circleProgress)
+                .stroke(accentColor, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .frame(width: size, height: size)
+
+            CheckmarkShape()
+                .trim(from: 0, to: checkProgress)
+                .stroke(accentColor, style: StrokeStyle(lineWidth: 4.2, lineCap: .round, lineJoin: .round))
+                .frame(width: size * 0.48, height: size * 0.36)
+                .offset(y: -1)
+        }
+        .onAppear {
+            circleProgress = 0
+            checkProgress = 0
+            glowOpacity = 0
+
+            withAnimation(.easeOut(duration: 0.72)) {
+                circleProgress = 1
+                glowOpacity = 1
+            }
+
+            withAnimation(.easeOut(duration: 0.58).delay(0.54)) {
+                checkProgress = 1
+            }
+
+            withAnimation(.easeInOut(duration: 1.25).delay(0.82)) {
+                glowOpacity = 0.22
+            }
+        }
+    }
+}
+
+private struct CheckmarkShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.midY))
+        path.addLine(to: CGPoint(x: rect.width * 0.38, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        return path
+    }
+}
+
+private struct POSPinWelcomeOverlay: View {
+    let welcome: POSPinWelcome
+    let accentColor: Color
+    @State private var isPresented = false
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.08)
+                .ignoresSafeArea()
+
+            VStack(spacing: 14) {
+                AnimatedSuccessCheckmark(accentColor: accentColor, size: 58)
+
+                VStack(spacing: 7) {
+                    Text("Welcome, \(welcome.operatorName).")
+                        .font(GlacialFont.title3(.bold))
+                        .foregroundStyle(AppPalette.ink)
+                        .multilineTextAlignment(.center)
+
+                    Text("Your shift starts now.")
+                        .font(GlacialFont.subheadline())
+                        .foregroundStyle(AppPalette.muted)
+
+                    Text("Opening Cash : \(welcome.openingCash.currencyText)")
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.1)
+                        .foregroundStyle(AppPalette.ink.opacity(0.76))
+                        .padding(.top, 4)
+                }
+            }
+            .padding(.horizontal, 30)
+            .padding(.vertical, 28)
+            .frame(width: min(UIScreen.main.bounds.width - 44, 380))
+            .lightGlassBackground(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .background(.white.opacity(0.64), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .stroke(.white.opacity(0.78), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.16), radius: 30, y: 16)
+            .opacity(isPresented ? 1 : 0)
+            .scaleEffect(isPresented ? 1 : 0.955)
+            .offset(y: isPresented ? 0 : 10)
+        }
+        .onAppear {
+            isPresented = false
+            withAnimation(.easeOut(duration: 0.95).delay(0.12)) {
+                isPresented = true
+            }
+        }
+    }
+}
+
 private struct InAppOrderNotification: View {
     let message: String
     let accentColor: Color
@@ -2099,6 +4371,160 @@ private struct InAppOrderNotification: View {
     }
 }
 
+private enum PrintReceiptResult: Equatable {
+    case printed
+    case skipped
+    case failed(String)
+
+    var title: String {
+        switch self {
+        case .printed: "RECEIPT PRINTED"
+        case .skipped: "NO RECEIPT"
+        case .failed: "PRINT FAILED"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .printed: "Receipt sent to printer."
+        case .skipped: "Sale saved without printing."
+        case .failed(let message): message
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .printed: "printer.fill"
+        case .skipped: "printer"
+        case .failed: "exclamationmark.triangle.fill"
+        }
+    }
+
+    var canAutoDismiss: Bool {
+        switch self {
+        case .printed, .skipped: true
+        case .failed: false
+        }
+    }
+
+    var isFailure: Bool {
+        if case .failed = self { return true }
+        return false
+    }
+}
+
+private struct POSSaleCompletion: Identifiable, Equatable {
+    let id = UUID()
+    let saleID: Int
+    let total: Double
+    let printResult: PrintReceiptResult
+}
+
+private struct POSSaleCompletionOverlay: View {
+    let completion: POSSaleCompletion
+    let accentColor: Color
+    let onRetry: () -> Void
+    let onDismiss: () -> Void
+    @State private var ringProgress: CGFloat = 0
+    @State private var checkProgress: CGFloat = 0
+    @State private var contentScale: CGFloat = 0.92
+
+    var body: some View {
+        VStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(accentColor.opacity(0.09))
+                    .frame(width: 74, height: 74)
+
+                Circle()
+                    .trim(from: 0, to: ringProgress)
+                    .stroke(accentColor, style: StrokeStyle(lineWidth: 3.2, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .frame(width: 46, height: 46)
+
+                POSCompletionCheckmark()
+                    .trim(from: 0, to: checkProgress)
+                    .stroke(accentColor, style: StrokeStyle(lineWidth: 4.2, lineCap: .round, lineJoin: .round))
+                    .frame(width: 28, height: 22)
+            }
+
+            VStack(spacing: 4) {
+                Text("SALE COMPLETED")
+                    .font(GlacialFont.subheadline(.semibold))
+                    .tracking(2.4)
+                    .foregroundStyle(AppPalette.ink)
+
+                Text("#\(completion.saleID)  \(Int(completion.total).formatted()) VND")
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(1.4)
+                    .foregroundStyle(AppPalette.muted)
+
+                HStack(spacing: 7) {
+                    Image(systemName: completion.printResult.icon)
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(completion.printResult.title)
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.4)
+                }
+                .foregroundStyle(completion.printResult.isFailure ? AppPalette.red : accentColor)
+                .padding(.top, 4)
+
+                Text(completion.printResult.detail)
+                    .font(GlacialFont.caption2())
+                    .foregroundStyle(AppPalette.muted)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .frame(maxWidth: 260)
+            }
+
+            if completion.printResult.isFailure {
+                HStack(spacing: 10) {
+                    Button(action: onDismiss) {
+                        POSRectActionLabel(title: "CLOSE", tint: AppPalette.ink)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: onRetry) {
+                        POSRectActionLabel(title: "RETRY PRINT", tint: accentColor, isPrimary: true)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(.horizontal, 26)
+        .padding(.vertical, 18)
+        .background(.white, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(accentColor.opacity(0.22), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.08), radius: 18, y: 10)
+        .scaleEffect(contentScale)
+        .onAppear {
+            withAnimation(.spring(response: 0.36, dampingFraction: 0.78)) {
+                contentScale = 1
+            }
+            withAnimation(.easeOut(duration: 0.44)) {
+                ringProgress = 1
+            }
+            withAnimation(.easeOut(duration: 0.34).delay(0.18)) {
+                checkProgress = 1
+            }
+        }
+    }
+}
+
+private struct POSCompletionCheckmark: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX + rect.width * 0.14, y: rect.minY + rect.height * 0.56))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.40, y: rect.minY + rect.height * 0.80))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.86, y: rect.minY + rect.height * 0.22))
+        return path
+    }
+}
+
 private struct KitchenHeaderStatus: View {
     let activeCount: Int
     let readyCount: Int
@@ -2132,12 +4558,42 @@ private struct KitchenHeaderStatus: View {
 
 private struct POSHeaderCartSummary: View {
     let itemCount: Int
+    let ticketCount: Int
     let total: Double
     let isConnected: Bool
     let accentColor: Color
+    let isCompact: Bool
     let onCart: () -> Void
 
     var body: some View {
+        if isCompact {
+            compactSummary
+        } else {
+            regularSummary
+        }
+    }
+
+    private var compactSummary: some View {
+        Button(action: onCart) {
+            VStack(spacing: 3) {
+                Image(systemName: "bag")
+                    .font(.system(size: 30, weight: .light))
+                    .foregroundStyle(accentColor)
+                    .frame(width: 56, height: 42)
+
+                ConnectionDot(isConnected: isConnected)
+                    .scaleEffect(0.82)
+            }
+            .frame(width: 76, height: 64)
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .disabled(itemCount == 0 && ticketCount <= 1)
+        .opacity(itemCount == 0 && ticketCount <= 1 ? 0.72 : 1)
+        .accessibilityLabel("POS cart")
+    }
+
+    private var regularSummary: some View {
         Button(action: onCart) {
             HStack(spacing: 12) {
                 ZStack(alignment: .topTrailing) {
@@ -2178,17 +4634,132 @@ private struct POSHeaderCartSummary: View {
             )
         }
         .buttonStyle(.plain)
-        .disabled(itemCount == 0)
-        .opacity(itemCount == 0 ? 0.72 : 1)
+        .disabled(itemCount == 0 && ticketCount <= 1)
+        .opacity(itemCount == 0 && ticketCount <= 1 ? 0.72 : 1)
         .accessibilityLabel("POS cart")
     }
 
     private var cartLabel: String {
+        if ticketCount > 1 {
+            return "\(ticketCount) TICKETS"
+        }
+
         if itemCount == 0 {
             return "CART"
         }
 
         return itemCount == 1 ? "1 ITEM" : "\(itemCount) ITEMS"
+    }
+}
+
+private struct POSCartBagIllustration: View {
+    let itemCount: Int
+    let accentColor: Color
+
+    var body: some View {
+        ZStack {
+            Ellipse()
+                .fill(accentColor.opacity(0.10))
+                .frame(width: 40, height: 7)
+                .offset(y: 22)
+
+            POSCartBagShape()
+                .fill(
+                    LinearGradient(
+                        colors: [.white, accentColor.opacity(0.10)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay {
+                    POSCartBagShape()
+                        .stroke(accentColor, style: StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
+                }
+                .shadow(color: accentColor.opacity(0.10), radius: 7, y: 4)
+
+            POSCartBagPanel()
+                .fill(accentColor.opacity(0.12))
+                .frame(width: 24, height: 21)
+                .offset(y: 8)
+
+            POSCartBagStripe()
+                .stroke(accentColor.opacity(0.42), style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
+                .frame(width: 25, height: 18)
+                .offset(y: 6)
+
+            POSCartBagHandle()
+                .stroke(accentColor, style: StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
+                .frame(width: 22, height: 16)
+                .offset(y: -15)
+        }
+    }
+}
+
+private struct POSCartBagShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let width = rect.width
+        let height = rect.height
+        let left = rect.minX + width * 0.16
+        let right = rect.maxX - width * 0.16
+        let top = rect.minY + height * 0.32
+        let bottom = rect.maxY - height * 0.12
+        let corner = width * 0.08
+
+        path.move(to: CGPoint(x: left + corner, y: top))
+        path.addLine(to: CGPoint(x: right - corner, y: top))
+        path.addQuadCurve(to: CGPoint(x: right, y: top + corner), control: CGPoint(x: right, y: top))
+        path.addLine(to: CGPoint(x: right, y: bottom - corner))
+        path.addQuadCurve(to: CGPoint(x: right - corner, y: bottom), control: CGPoint(x: right, y: bottom))
+        path.addLine(to: CGPoint(x: left + corner, y: bottom))
+        path.addQuadCurve(to: CGPoint(x: left, y: bottom - corner), control: CGPoint(x: left, y: bottom))
+        path.addLine(to: CGPoint(x: left, y: top + corner))
+        path.addQuadCurve(to: CGPoint(x: left + corner, y: top), control: CGPoint(x: left, y: top))
+        path.closeSubpath()
+        return path
+    }
+}
+
+private struct POSCartBagHandle: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + rect.height * 0.42))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.midX, y: rect.minY),
+            control: CGPoint(x: rect.minX, y: rect.minY)
+        )
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX, y: rect.minY + rect.height * 0.42),
+            control: CGPoint(x: rect.maxX, y: rect.minY)
+        )
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        return path
+    }
+}
+
+private struct POSCartBagPanel: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX + rect.width * 0.16, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX - rect.width * 0.16, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.closeSubpath()
+        return path
+    }
+}
+
+private struct POSCartBagStripe: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX + rect.width * 0.18, y: rect.minY + rect.height * 0.28))
+        path.addLine(to: CGPoint(x: rect.maxX - rect.width * 0.18, y: rect.minY + rect.height * 0.28))
+        path.move(to: CGPoint(x: rect.minX + rect.width * 0.08, y: rect.midY))
+        path.addLine(to: CGPoint(x: rect.maxX - rect.width * 0.08, y: rect.midY))
+        path.move(to: CGPoint(x: rect.minX, y: rect.maxY - rect.height * 0.22))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - rect.height * 0.22))
+        return path
     }
 }
 
@@ -2210,14 +4781,35 @@ private struct ConnectionDot: View {
 private struct MetricsStrip: View {
     let summary: KitchenSummary
     let accentColor: Color
+    let isCompact: Bool
+
+    private var compactColumns: [GridItem] {
+        [
+            GridItem(.flexible(minimum: 0), spacing: 10),
+            GridItem(.flexible(minimum: 0), spacing: 10)
+        ]
+    }
 
     var body: some View {
-        HStack(spacing: 12) {
-            MetricCard(title: "Pending", value: "\(summary.pending)", icon: "bell.badge", tint: accentColor)
-            MetricCard(title: "Preparing", value: "\(summary.preparing)", icon: "flame.fill", tint: AppPalette.red)
-            MetricCard(title: "Ready", value: "\(summary.ready)", icon: "checkmark.seal.fill", tint: AppPalette.green)
-            MetricCard(title: "Held", value: "\(summary.held)", icon: "pause.fill", tint: AppPalette.blue)
+        Group {
+            if isCompact {
+                LazyVGrid(columns: compactColumns, spacing: 10) {
+                    metrics
+                }
+            } else {
+                HStack(spacing: 12) {
+                    metrics
+                }
+            }
         }
+    }
+
+    @ViewBuilder
+    private var metrics: some View {
+        MetricCard(title: "Pending", value: "\(summary.pending)", icon: "bell.badge", tint: accentColor, isCompact: isCompact)
+        MetricCard(title: "Preparing", value: "\(summary.preparing)", icon: "flame.fill", tint: AppPalette.red, isCompact: isCompact)
+        MetricCard(title: "Ready", value: "\(summary.ready)", icon: "checkmark.seal.fill", tint: AppPalette.green, isCompact: isCompact)
+        MetricCard(title: "Held", value: "\(summary.held)", icon: "pause.fill", tint: AppPalette.blue, isCompact: isCompact)
     }
 }
 
@@ -2226,32 +4818,41 @@ private struct MetricCard: View {
     let value: String
     let icon: String
     let tint: Color
+    let isCompact: Bool
+
+    private var iconBoxSize: CGFloat {
+        isCompact ? 48 : 56
+    }
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: isCompact ? 10 : 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(tint.opacity(0.10))
-                    .frame(width: 48, height: 48)
+                    .frame(width: iconBoxSize, height: iconBoxSize)
                 Image(systemName: icon)
-                    .font(.system(size: 21, weight: .semibold))
+                    .font(.system(size: isCompact ? 25 : 30, weight: .semibold))
                     .foregroundStyle(tint)
             }
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(value)
-                    .font(GlacialFont.custom(32, .semibold))
+                    .font(GlacialFont.custom(isCompact ? 26 : 32, .semibold))
                     .foregroundStyle(AppPalette.ink)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
                 Text(title)
                     .font(GlacialFont.caption2(.bold))
                     .foregroundStyle(AppPalette.muted)
                     .textCase(.uppercase)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
             }
 
             Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, minHeight: 84)
-        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: isCompact ? 64 : 76, maxHeight: isCompact ? 64 : nil)
+        .padding(isCompact ? 8 : 10)
         .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
@@ -2268,7 +4869,7 @@ private struct FilterBar: View {
     let accentColor: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     FilterChip(title: "active", isSelected: selectedStatus == nil, namespace: namespace, accentColor: accentColor) {
@@ -2346,6 +4947,14 @@ private enum KitchenGrid {
         repeating: GridItem(.flexible(minimum: 210), spacing: 12, alignment: .top),
         count: 3
     )
+
+    static func columns(isCompact: Bool) -> [GridItem] {
+        if isCompact {
+            return [GridItem(.flexible(minimum: 0), spacing: 12, alignment: .top)]
+        }
+
+        return threeColumns
+    }
 }
 
 private struct SourceArtwork: View {
@@ -2459,39 +5068,42 @@ private struct SourcePattern: Shape {
 private struct OnlineOrderReviewSection: View {
     let orders: [KitchenOnlineOrder]
     let accentColor: Color
+    let onSelect: (KitchenOnlineOrder) -> Void
     let onAccept: (KitchenOnlineOrder) -> Void
+    let onMarkPaid: (KitchenOnlineOrder) -> Void
+    let onSendToKitchen: (KitchenOnlineOrder) -> Void
     let onDecline: (KitchenOnlineOrder) -> Void
+    let isCompact: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("Orders")
                     .font(GlacialFont.heading())
                     .foregroundStyle(AppPalette.ink)
                 Spacer()
-                Text("\(orders.count) waiting")
-                    .font(GlacialFont.footnote(.semibold))
-                    .foregroundStyle(orders.isEmpty ? AppPalette.muted : accentColor)
+                if !orders.isEmpty {
+                    Text("\(orders.count) waiting")
+                        .font(GlacialFont.footnote(.semibold))
+                        .foregroundStyle(accentColor)
+                }
             }
 
             if orders.isEmpty {
-                HStack(spacing: 10) {
-                    Image(systemName: "checkmark.circle")
-                        .foregroundStyle(AppPalette.green)
-                    Text("No online orders waiting for review.")
-                        .font(GlacialFont.subheadline(.medium))
-                        .foregroundStyle(AppPalette.muted)
-                    Spacer()
-                }
-                .padding(14)
-                .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                Text("New orders will appear here when they need your attention.")
+                    .font(GlacialFont.footnote(.medium))
+                    .foregroundStyle(AppPalette.muted)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                LazyVGrid(columns: KitchenGrid.threeColumns, spacing: 12) {
+                LazyVGrid(columns: KitchenGrid.columns(isCompact: isCompact), spacing: 12) {
                     ForEach(orders, id: \.id) { order in
                         OnlineOrderCard(
                             order: order,
                             accentColor: accentColor,
+                            onSelect: { onSelect(order) },
                             onAccept: { onAccept(order) },
+                            onMarkPaid: { onMarkPaid(order) },
+                            onSendToKitchen: { onSendToKitchen(order) },
                             onDecline: { onDecline(order) }
                         )
                     }
@@ -2504,61 +5116,51 @@ private struct OnlineOrderReviewSection: View {
 private struct OnlineOrderCard: View {
     let order: KitchenOnlineOrder
     let accentColor: Color
+    let onSelect: () -> Void
     let onAccept: () -> Void
+    let onMarkPaid: () -> Void
+    let onSendToKitchen: () -> Void
     let onDecline: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SourceArtwork(source: .website, status: .pending)
-                .frame(height: 108)
+            Button(action: onSelect) {
+                VStack(alignment: .leading, spacing: 12) {
+                    SourceArtwork(source: .website, status: .pending)
+                        .frame(height: 108)
 
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(order.orderNumber)
-                        .font(GlacialFont.title3(.semibold))
-                        .foregroundStyle(AppPalette.ink)
-                    Spacer(minLength: 6)
-                    Text(order.elapsedText)
-                        .font(GlacialFont.caption(.bold))
-                        .foregroundStyle(accentColor)
-                }
-
-                Text(order.customerDisplay)
-                    .font(GlacialFont.subheadline(.medium))
-                    .foregroundStyle(AppPalette.muted)
-                    .lineLimit(1)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(order.items.prefix(3), id: \.id) { item in
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("\(item.quantity)x")
-                            .font(GlacialFont.caption(.bold))
-                            .foregroundStyle(accentColor)
-                            .frame(width: 30, alignment: .leading)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(item.productName)
-                                .font(GlacialFont.subheadline(.semibold))
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(order.orderNumber)
+                                .font(GlacialFont.title3(.semibold))
                                 .foregroundStyle(AppPalette.ink)
-                            if !item.toppings.isEmpty {
-                                Text(item.toppings.compactMap(\.name).joined(separator: ", "))
-                                    .font(GlacialFont.caption(.medium))
-                                    .foregroundStyle(AppPalette.muted)
-                                    .lineLimit(1)
-                            }
+                            Spacer(minLength: 6)
+                            Text(order.elapsedText)
+                                .font(GlacialFont.caption(.bold))
+                                .foregroundStyle(accentColor)
                         }
-                        Spacer(minLength: 0)
+
+                        HStack(spacing: 8) {
+                            FulfillmentBadge(text: order.typeText, icon: order.fulfillmentIcon, tint: accentColor)
+                            Text(order.cardContactText)
+                                .font(GlacialFont.subheadline(.medium))
+                                .foregroundStyle(AppPalette.muted)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.82)
+                        }
+                    }
+
+                    OnlineOrderItemPreview(items: order.items, accentColor: accentColor)
+
+                    if let notes = order.notes, !notes.isEmpty {
+                        Text(notes)
+                            .font(GlacialFont.caption(.medium))
+                            .foregroundStyle(AppPalette.muted)
+                            .lineLimit(2)
                     }
                 }
             }
-            .frame(minHeight: 72, alignment: .top)
-
-            if let notes = order.notes, !notes.isEmpty {
-                Text(notes)
-                    .font(GlacialFont.caption(.medium))
-                    .foregroundStyle(AppPalette.muted)
-                    .lineLimit(2)
-            }
+            .buttonStyle(.plain)
 
             Spacer(minLength: 0)
 
@@ -2595,22 +5197,35 @@ private struct OnlineOrderCard: View {
                 }
             } else {
                 HStack(spacing: 10) {
-                    Text("Accepted. Waiting for prep.")
+                    Text(order.acceptedStateText)
                         .font(GlacialFont.caption2(.semibold))
                         .foregroundStyle(AppPalette.muted)
                         .lineLimit(1)
                         .minimumScaleFactor(0.82)
                         .frame(maxWidth: .infinity, alignment: .leading)
 
-                    Button(action: onDecline) {
-                        Label("Cancel", systemImage: "trash")
-                            .font(GlacialFont.caption(.bold))
-                            .frame(height: 34)
-                            .padding(.horizontal, 12)
+                    OnlineOrderCardActionButton(
+                        systemImage: "trash",
+                        tint: AppPalette.red,
+                        accessibilityLabel: "Cancel order",
+                        action: onDecline
+                    )
+
+                    if order.canMarkPaid {
+                        OnlineOrderCardActionButton(
+                            systemImage: "creditcard.fill",
+                            tint: AppPalette.green,
+                            accessibilityLabel: "Mark paid",
+                            action: onMarkPaid
+                        )
+                    } else if order.canSendToKitchen {
+                        OnlineOrderCardActionButton(
+                            systemImage: "paperplane.fill",
+                            tint: accentColor,
+                            accessibilityLabel: "Send to kitchen",
+                            action: onSendToKitchen
+                        )
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(AppPalette.red)
-                    .background(AppPalette.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
                 }
             }
         }
@@ -2624,13 +5239,86 @@ private struct OnlineOrderCard: View {
     }
 }
 
+private struct OnlineOrderCardActionButton: View {
+    let systemImage: String
+    let tint: Color
+    let accessibilityLabel: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 14, weight: .semibold))
+                .frame(width: 34, height: 34)
+                .foregroundStyle(tint)
+                .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(tint.opacity(0.16), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text(accessibilityLabel))
+    }
+}
+
+private struct OnlineOrderItemPreview: View {
+    let items: [KitchenOnlineOrderItem]
+    let accentColor: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(items.prefix(3), id: \.id) { item in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("\(item.quantity)x")
+                        .font(GlacialFont.caption(.bold))
+                        .foregroundStyle(accentColor)
+                        .frame(width: 30, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.productName)
+                            .font(GlacialFont.subheadline(.semibold))
+                            .foregroundStyle(AppPalette.ink)
+                        if !item.toppingText.isEmpty {
+                            Text(item.toppingText)
+                                .font(GlacialFont.caption(.medium))
+                                .foregroundStyle(AppPalette.muted)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .frame(minHeight: 72, alignment: .top)
+    }
+}
+
+private struct FulfillmentBadge: View {
+    let text: String
+    let icon: String
+    let tint: Color
+
+    var body: some View {
+        Label(text, systemImage: icon)
+            .font(GlacialFont.caption2(.bold))
+            .foregroundStyle(tint)
+            .lineLimit(1)
+            .minimumScaleFactor(0.78)
+            .padding(.horizontal, 8)
+            .frame(height: 24)
+            .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
 private struct QueueSection: View {
     let orders: [KitchenOrder]
+    let onlineDetailsBySaleID: [Int: KitchenOnlineOrder]
     let isInitialLoading: Bool
     let isRefreshing: Bool
     let accentColor: Color
     let onSelect: (KitchenOrder) -> Void
     let onStatus: (KitchenOrder, KitchenStatus) -> Void
+    let isCompact: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -2639,31 +5327,222 @@ private struct QueueSection: View {
                     .font(GlacialFont.heading())
                     .foregroundStyle(AppPalette.ink)
                 Spacer()
-                HStack(spacing: 8) {
-                    if isRefreshing {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(accentColor)
-                    }
+                if isRefreshing || isInitialLoading || !orders.isEmpty {
+                    HStack(spacing: 8) {
+                        if isRefreshing {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(accentColor)
+                        }
 
-                    Text(isInitialLoading && orders.isEmpty ? "loading" : "\(orders.count) tickets")
-                        .font(GlacialFont.footnote(.semibold))
-                        .foregroundStyle(AppPalette.muted)
+                        Text(isInitialLoading && orders.isEmpty ? "loading" : "\(orders.count) tickets")
+                            .font(GlacialFont.footnote(.semibold))
+                            .foregroundStyle(AppPalette.muted)
+                    }
                 }
             }
 
             if orders.isEmpty && isInitialLoading {
                 InitialLoadingView(accentColor: accentColor)
-            } else if orders.isEmpty {
-                EmptyKitchenView()
-            } else {
-                LazyVGrid(columns: KitchenGrid.threeColumns, spacing: 12) {
+            } else if !orders.isEmpty {
+                LazyVGrid(columns: KitchenGrid.columns(isCompact: isCompact), spacing: 12) {
                     ForEach(orders, id: \.id) { order in
-                        OrderCard(order: order, onSelect: { onSelect(order) }, onStatus: { onStatus(order, $0) })
+                        OrderCard(
+                            order: order,
+                            onlineDetails: onlineDetailsBySaleID[order.id],
+                            onSelect: { onSelect(order) },
+                            onStatus: { onStatus(order, $0) }
+                        )
                     }
                 }
             }
         }
+        .padding(.bottom, orders.isEmpty && !isInitialLoading ? 12 : 0)
+    }
+}
+
+private struct CompletedKitchenSection: View {
+    let tickets: [CompletedKitchenTicket]
+    let accentColor: Color
+    let onSelect: (CompletedKitchenTicket) -> Void
+    let isCompact: Bool
+
+    private var channels: [CompletedKitchenChannel] {
+        CompletedKitchenChannel.allCases.map { channel in
+            CompletedKitchenChannel(
+                kind: channel.kind,
+                tickets: tickets.filter { channel.contains($0) }
+            )
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Completed")
+                    .font(GlacialFont.heading())
+                    .foregroundStyle(AppPalette.ink)
+                Spacer()
+                if !tickets.isEmpty {
+                    Text("\(tickets.count) saved")
+                        .font(GlacialFont.footnote(.semibold))
+                        .foregroundStyle(accentColor)
+                }
+            }
+
+            if !tickets.isEmpty {
+                LazyVGrid(columns: KitchenGrid.columns(isCompact: isCompact), spacing: 12) {
+                    ForEach(channels) { channel in
+                        CompletedKitchenChannelCard(
+                            channel: channel,
+                            accentColor: accentColor,
+                            onSelect: onSelect
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct CompletedKitchenChannel: Identifiable {
+    let kind: CompletedKitchenChannelKind
+    let tickets: [CompletedKitchenTicket]
+
+    var id: String { kind.rawValue }
+
+    static var allCases: [CompletedKitchenChannel] {
+        CompletedKitchenChannelKind.allCases.map { CompletedKitchenChannel(kind: $0, tickets: []) }
+    }
+
+    func contains(_ ticket: CompletedKitchenTicket) -> Bool {
+        kind.contains(ticket)
+    }
+}
+
+private enum CompletedKitchenChannelKind: String, CaseIterable {
+    case store
+    case grab
+    case shopee
+
+    var title: String {
+        switch self {
+        case .store: "STORE"
+        case .grab: "GRAB"
+        case .shopee: "SHOPEE"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .store: "storefront"
+        case .grab: "scooter"
+        case .shopee: "bag"
+        }
+    }
+
+    func contains(_ ticket: CompletedKitchenTicket) -> Bool {
+        switch self {
+        case .store:
+            return ticket.source != "GRAB" && ticket.source != "SHOPEE"
+        case .grab:
+            return ticket.source == "GRAB"
+        case .shopee:
+            return ticket.source == "SHOPEE"
+        }
+    }
+}
+
+private struct CompletedKitchenChannelCard: View {
+    let channel: CompletedKitchenChannel
+    let accentColor: Color
+    let onSelect: (CompletedKitchenTicket) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: channel.kind.icon)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(accentColor)
+                    .frame(width: 26, height: 26)
+                    .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(channel.kind.title)
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(2)
+                        .foregroundStyle(AppPalette.ink)
+
+                    Text("\(channel.tickets.count) \(channel.tickets.count == 1 ? "receipt" : "receipts")")
+                        .font(GlacialFont.caption2(.semibold))
+                        .foregroundStyle(AppPalette.muted)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            if channel.tickets.isEmpty {
+                Text("No receipts yet")
+                    .font(GlacialFont.caption(.medium))
+                    .foregroundStyle(AppPalette.muted)
+                    .frame(maxWidth: .infinity, minHeight: 130, alignment: .center)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(channel.tickets.prefix(7).enumerated()), id: \.element.id) { index, ticket in
+                        CompletedKitchenReceiptRow(ticket: ticket, accentColor: accentColor) {
+                            onSelect(ticket)
+                        }
+
+                        if index < min(channel.tickets.count, 7) - 1 {
+                            SettingsDivider()
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 214, alignment: .topLeading)
+        .padding(14)
+        .background(.white, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppPalette.green.opacity(0.24), lineWidth: 1)
+        )
+    }
+}
+
+private struct CompletedKitchenReceiptRow: View {
+    let ticket: CompletedKitchenTicket
+    let accentColor: Color
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(ticket.orderNumber)
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.2)
+                        .foregroundStyle(AppPalette.ink)
+
+                    Text("\(ticket.completedTimeText) · \(ticket.paymentText)")
+                        .font(GlacialFont.caption2(.medium))
+                        .foregroundStyle(AppPalette.muted)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 0)
+
+                Text(ticket.totalText)
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(0.6)
+                    .foregroundStyle(accentColor)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 9)
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -2687,20 +5566,9 @@ private struct InitialLoadingView: View {
 
 private struct EmptyKitchenView: View {
     var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "checkmark.circle")
-                .font(.system(size: 44))
-                .foregroundStyle(AppPalette.green)
-            Text("No active orders")
-                .font(GlacialFont.title3(.semibold))
-            Text("The rail is clean. New Store, Website, Grab, and Shopee orders will appear here.")
-                .font(GlacialFont.subheadline())
-                .foregroundStyle(AppPalette.muted)
-                .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity, minHeight: 220)
-        .padding(18)
-        .background(.white, in: RoundedRectangle(cornerRadius: 8))
+        Color.clear
+            .frame(maxWidth: .infinity, minHeight: 220)
+            .padding(18)
     }
 }
 
@@ -2759,6 +5627,36 @@ private enum POSAccentColor: String, CaseIterable, Identifiable {
         case .berry: Color(red: 0.54, green: 0.22, blue: 0.30)
         }
     }
+
+    var wallpaperAssetName: String {
+        switch self {
+        case .ember: "POSLightWallpaper"
+        case .cocoa: "POSCocoaWallpaper"
+        case .matcha: "POSMatchaWallpaper"
+        case .midnight: "POSMidnightWallpaper"
+        case .graphite: "POSGraphiteWallpaper"
+        case .berry: "POSBerryWallpaper"
+        }
+    }
+}
+
+private enum POSCardSizeStorage {
+    static func decode(_ raw: String) -> [Int: POSCardSize] {
+        raw.split(separator: "|").reduce(into: [:]) { result, pair in
+            let parts = pair.split(separator: ":", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let id = Int(parts[0]), let size = POSCardSize(rawValue: parts[1]) else {
+                return
+            }
+            result[id] = size
+        }
+    }
+
+    static func encode(_ sizes: [Int: POSCardSize]) -> String {
+        sizes
+            .sorted { lhs, rhs in lhs.key < rhs.key }
+            .map { entry in "\(entry.key):\(entry.value.rawValue)" }
+            .joined(separator: "|")
+    }
 }
 
 private enum POSCardSize: String, CaseIterable {
@@ -2805,29 +5703,163 @@ private enum POSCardSize: String, CaseIterable {
     }
 }
 
+private struct POSSwipeCategoryPager<Content: View>: View {
+    let pageCount: Int
+    @Binding var currentIndex: Int
+    let onSwipeActivity: () -> Void
+    @ViewBuilder let content: (Int, CGFloat) -> Content
+
+    @State private var dragOffset: CGFloat = 0
+
+    private var visiblePageIndices: [Int] {
+        guard pageCount > 0 else { return [] }
+        let lowerBound = max(0, currentIndex - 1)
+        let upperBound = min(pageCount - 1, currentIndex + 1)
+        return Array(lowerBound...upperBound)
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+
+            ZStack(alignment: .topLeading) {
+                ForEach(visiblePageIndices, id: \.self) { index in
+                    pageView(at: index, width: width)
+                        .offset(x: CGFloat(index - currentIndex) * width)
+                }
+            }
+            .frame(width: width, height: geo.size.height, alignment: .topLeading)
+            .offset(x: dragOffset)
+            .contentShape(Rectangle())
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 30)
+                    .onChanged { value in
+                        let horizontal = value.translation.width
+                        let vertical = value.translation.height
+                        guard abs(horizontal) > 34, abs(horizontal) > abs(vertical) * 2.35 else { return }
+
+                        var translation = horizontal
+                        if (currentIndex == 0 && translation > 0) || (currentIndex == pageCount - 1 && translation < 0) {
+                            translation *= 0.35
+                        }
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            dragOffset = translation
+                        }
+                        onSwipeActivity()
+                    }
+                    .onEnded { value in
+                        let horizontal = value.translation.width
+                        let vertical = value.translation.height
+                        guard abs(horizontal) > abs(vertical) * 1.9 else {
+                            withAnimation(.interactiveSpring(response: 0.28, dampingFraction: 0.88, blendDuration: 0.08)) {
+                                dragOffset = 0
+                            }
+                            return
+                        }
+
+                        let threshold = width * 0.28
+                        let oldIndex = currentIndex
+                        var next = currentIndex
+                        if value.translation.width < -threshold || value.predictedEndTranslation.width < -width * 0.5 {
+                            next = min(pageCount - 1, currentIndex + 1)
+                        } else if value.translation.width > threshold || value.predictedEndTranslation.width > width * 0.5 {
+                            next = max(0, currentIndex - 1)
+                        }
+
+                        let targetOffset: CGFloat
+                        if next > oldIndex {
+                            targetOffset = -width
+                        } else if next < oldIndex {
+                            targetOffset = width
+                        } else {
+                            targetOffset = 0
+                        }
+
+                        withAnimation(.interactiveSpring(response: 0.34, dampingFraction: 0.86, blendDuration: 0.12)) {
+                            dragOffset = targetOffset
+                        }
+
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) {
+                            var transaction = Transaction()
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                currentIndex = next
+                                dragOffset = 0
+                            }
+                        }
+
+                        if next != oldIndex {
+                            Haptics.selectionChanged()
+                        }
+                        if abs(horizontal) > 18 {
+                            onSwipeActivity()
+                        }
+                    }
+            , including: .gesture)
+        }
+        .clipped()
+    }
+
+    @ViewBuilder
+    private func pageView(at index: Int, width: CGFloat) -> some View {
+        let horizontalInset: CGFloat = 7
+        let contentWidth = max(1, width - (horizontalInset * 2))
+
+        Group {
+            if index >= 0, index < pageCount {
+                content(index, contentWidth)
+            } else {
+                Color.clear
+            }
+        }
+        .padding(.horizontal, horizontalInset)
+        .frame(width: width)
+    }
+}
+
 private struct POSDashboardView: View {
     @ObservedObject var store: POSStore
     let baseURL: String
     let token: String
     let displayStyle: POSProductDisplayStyle
+    let toppingCategoryOrder: [String]
     let accentColor: Color
+    @Binding var isArrangeMode: Bool
     @Binding var isCheckoutOpen: Bool
+    let categorySwipeCommand: POSCategorySwipeCommand
+    let isCompact: Bool
     @State private var selectedCategory: String?
     @State private var selectedProduct: POSProduct?
-    @State private var isArrangeMode = false
     @State private var wobblePhase = false
     @State private var arrangedCategoryNames: [String] = []
     @State private var arrangedProductIDsByScope: [String: [Int]] = [:]
     @State private var draggingCategoryName: String?
     @State private var draggingProductID: Int?
+    @State private var draggingProductOffset: CGSize = .zero
     @State private var lastCategoryDropTarget: String?
     @State private var lastProductDropTarget: Int?
     @State private var productAnimationToken = UUID()
-    @State private var productCardSizes: [Int: POSCardSize] = [:]
+    @State private var categorySlideDirection = 1
+    @State private var suppressProductTapUntil = Date.distantPast
+    @AppStorage("POSProductCardSizes") private var productCardSizesRaw = ""
     @State private var productGridWidth: CGFloat = 720
     @Namespace private var categorySelectionNamespace
 
     private let allProductsScope = "__all_products__"
+    private var layoutProductGridWidth: CGFloat {
+        isCompact ? min(productGridWidth, 430) : productGridWidth
+    }
+
+    private var compactPagerMinimumHeight: CGFloat {
+        max(520, UIScreen.main.bounds.height - 360)
+    }
+
+    private var productCardSizes: [Int: POSCardSize] {
+        get { POSCardSizeStorage.decode(productCardSizesRaw) }
+        nonmutating set { productCardSizesRaw = POSCardSizeStorage.encode(newValue) }
+    }
 
     private var categories: [POSCategory] {
         let source = store.bootstrap?.catalog.categories ?? []
@@ -2844,8 +5876,12 @@ private struct POSDashboardView: View {
     private var products: [POSProduct] {
         guard let selectedCategory else { return [] }
 
-        let source = store.bootstrap?.catalog.products.filter { $0.category == selectedCategory } ?? []
-        return orderedProducts(source, scope: selectedCategory)
+        return products(for: selectedCategory)
+    }
+
+    private func products(for categoryName: String) -> [POSProduct] {
+        let source = store.bootstrap?.catalog.products.filter { $0.category == categoryName } ?? []
+        return orderedProducts(source, scope: categoryName)
     }
 
     private func orderedProducts(_ source: [POSProduct], scope: String) -> [POSProduct] {
@@ -2873,7 +5909,7 @@ private struct POSDashboardView: View {
         var id: Int { product.id }
     }
 
-    private func productTilePlacements(width: CGFloat, spacing: CGFloat) -> (placements: [ProductTilePlacement], height: CGFloat) {
+    private func productTilePlacements(products: [POSProduct], width: CGFloat, spacing: CGFloat) -> (placements: [ProductTilePlacement], height: CGFloat) {
         let columns = 4
         let cell = max(72, (width - (spacing * CGFloat(columns - 1))) / CGFloat(columns))
         var placements: [ProductTilePlacement] = []
@@ -2881,8 +5917,8 @@ private struct POSDashboardView: View {
 
         for product in products {
             let cardSize = productCardSize(for: product)
-            let columnSpan = min(max(1, cardSize.columnSpan), columns)
-            let rowSpan = max(1, cardSize.rowSpan)
+            let columnSpan = min(max(1, columnSpan(for: cardSize)), columns)
+            let rowSpan = max(1, rowSpan(for: cardSize))
             let slot = firstAvailableProductTileSlot(columnSpan: columnSpan, rowSpan: rowSpan, columns: columns, occupied: occupied)
 
             for row in slot.row..<(slot.row + rowSpan) {
@@ -2905,6 +5941,64 @@ private struct POSDashboardView: View {
 
         let height = placements.map { $0.y + $0.height }.max() ?? 0
         return (placements, height)
+    }
+
+    private func productTilePlacements(width: CGFloat, spacing: CGFloat) -> (placements: [ProductTilePlacement], height: CGFloat) {
+        productTilePlacements(products: products, width: width, spacing: spacing)
+    }
+
+    private func productGridHeight(for categoryName: String) -> CGFloat {
+        let spacing: CGFloat = 14
+        switch displayStyle {
+        case .productCard:
+            return max(productTilePlacements(products: products(for: categoryName), width: layoutProductGridWidth, spacing: spacing).height, 1)
+        case .grabGrid:
+            let productCount = products(for: categoryName).count
+            guard productCount > 0 else { return 1 }
+            let width = max(1, layoutProductGridWidth)
+            let columns = max(1, Int((width + 12) / (150 + 12)))
+            let rows = Int(ceil(Double(productCount) / Double(columns)))
+            return CGFloat(rows * 118) + CGFloat(max(0, rows - 1) * 12)
+        case .simpleList:
+            let productCount = products(for: categoryName).count
+            guard productCount > 0 else { return 1 }
+            return CGFloat(productCount * 102) + CGFloat(max(0, productCount - 1) * 10)
+        }
+    }
+
+    private var compactPagerHeight: CGFloat {
+        let categoryHeights = categories.map { productGridHeight(for: $0.name) }
+        return max(categoryHeights.max() ?? 1, compactPagerMinimumHeight)
+    }
+
+    private var productPagerHeight: CGFloat {
+        guard !isCompact else { return compactPagerHeight }
+        let categoryHeights = categories.map { productGridHeight(for: $0.name) }
+        return max(categoryHeights.max() ?? 1, 1)
+    }
+
+    private func columnSpan(for cardSize: POSCardSize) -> Int {
+        guard isCompact else { return cardSize.columnSpan }
+
+        return switch compactCardSize(cardSize) {
+        case .small: 2
+        case .medium: 2
+        case .big: 4
+        }
+    }
+
+    private func rowSpan(for cardSize: POSCardSize) -> Int {
+        guard isCompact else { return cardSize.rowSpan }
+
+        return switch compactCardSize(cardSize) {
+        case .small: 2
+        case .medium: 2
+        case .big: 4
+        }
+    }
+
+    private func compactCardSize(_ cardSize: POSCardSize) -> POSCardSize {
+        cardSize == .big ? .big : .small
     }
 
     private func firstAvailableProductTileSlot(columnSpan: Int, rowSpan: Int, columns: Int, occupied: Set<String>) -> (row: Int, column: Int) {
@@ -2935,8 +6029,47 @@ private struct POSDashboardView: View {
         "\(row)-\(column)"
     }
 
+    private var productInsertionEdge: Edge {
+        categorySlideDirection >= 0 ? .trailing : .leading
+    }
+
+    private var productRemovalEdge: Edge {
+        categorySlideDirection >= 0 ? .leading : .trailing
+    }
+
+    private func categoryIndex(_ name: String?) -> Int? {
+        guard let name else { return nil }
+        return categories.firstIndex { $0.name == name }
+    }
+
+    private func selectCategory(_ name: String) {
+        let currentIndex = categoryIndex(selectedCategory) ?? 0
+        let nextIndex = categoryIndex(name) ?? currentIndex
+        guard selectedCategory != name else { return }
+        categorySlideDirection = nextIndex >= currentIndex ? 1 : -1
+        selectedCategory = name
+        productAnimationToken = UUID()
+    }
+
+    private func selectAdjacentCategory(offset: Int) {
+        guard !isArrangeMode,
+              categories.count > 1,
+              let currentIndex = categoryIndex(selectedCategory) else {
+            return
+        }
+
+        let nextIndex = currentIndex + offset
+        guard categories.indices.contains(nextIndex) else {
+            Haptics.impact(.light)
+            return
+        }
+
+        selectCategory(categories[nextIndex].name)
+        Haptics.selectionChanged()
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             if let message = store.errorMessage {
                 ErrorBanner(message: message) {
                     Task { await store.refresh(baseURL: baseURL, token: token) }
@@ -2965,41 +6098,50 @@ private struct POSDashboardView: View {
             } else if store.bootstrap != nil {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(alignment: .center, spacing: 12) {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 10) {
-                                ForEach(categories) { category in
-                                    POSCategoryChip(
-                                        title: category.name.uppercased(),
-                                        isSelected: selectedCategory == category.name,
-                                        isArranging: isArrangeMode,
-                                        wobblePhase: wobblePhase,
-                                        namespace: categorySelectionNamespace,
-                                        accentColor: accentColor
-                                    ) {
-                                        withAnimation(.spring(response: 0.34, dampingFraction: 0.78, blendDuration: 0.05)) {
-                                            selectedCategory = category.name
-                                            productAnimationToken = UUID()
+                        ScrollViewReader { categoryProxy in
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 10) {
+                                    ForEach(categories) { category in
+                                        POSCategoryChip(
+                                            title: category.name.uppercased(),
+                                            isSelected: selectedCategory == category.name,
+                                            isArranging: isArrangeMode,
+                                            wobblePhase: wobblePhase,
+                                            namespace: categorySelectionNamespace,
+                                            accentColor: accentColor
+                                        ) {
+                                            withAnimation(.spring(response: 0.34, dampingFraction: 0.78, blendDuration: 0.05)) {
+                                                selectCategory(category.name)
+                                                categoryProxy.scrollTo(category.name, anchor: .center)
+                                            }
+                                        } onArrange: {
+                                            enterArrangeMode()
                                         }
-                                    } onArrange: {
-                                        enterArrangeMode()
-                                    }
-                                    .onDrag {
-                                        enterArrangeMode()
-                                        draggingCategoryName = category.name
-                                        return NSItemProvider(object: category.name as NSString)
-                                    }
-                                    .onDrop(
-                                        of: [UTType.text],
-                                        delegate: POSCategoryDropDelegate(
-                                            targetName: category.name,
-                                            draggingName: $draggingCategoryName,
-                                            lastDropTarget: $lastCategoryDropTarget,
-                                            categoryNames: $arrangedCategoryNames
+                                        .id(category.name)
+                                        .onDrag {
+                                            enterArrangeMode()
+                                            draggingCategoryName = category.name
+                                            return NSItemProvider(object: category.name as NSString)
+                                        }
+                                        .onDrop(
+                                            of: [UTType.text],
+                                            delegate: POSCategoryDropDelegate(
+                                                targetName: category.name,
+                                                draggingName: $draggingCategoryName,
+                                                lastDropTarget: $lastCategoryDropTarget,
+                                                categoryNames: $arrangedCategoryNames
+                                            )
                                         )
-                                    )
+                                    }
+                                }
+                                .padding(.vertical, 2)
+                            }
+                            .onChange(of: selectedCategory) { _, categoryName in
+                                guard let categoryName else { return }
+                                withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                                    categoryProxy.scrollTo(categoryName, anchor: .center)
                                 }
                             }
-                            .padding(.vertical, 2)
                         }
 
                         if store.isRefreshing {
@@ -3007,102 +6149,66 @@ private struct POSDashboardView: View {
                                 .tint(accentColor)
                         }
 
-                        if isArrangeMode {
-                            Button {
-                                finishArrangeMode()
-                            } label: {
-                                Text("done")
-                                    .font(GlacialFont.caption(.bold))
-                                    .foregroundStyle(.white)
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 9)
-                                    .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
-                            }
-                            .buttonStyle(.plain)
-                        }
                     }
                 }
-                .padding(.vertical, 18)
+                .padding(.top, 14)
+                .padding(.bottom, 8)
                 .background(.white, in: RoundedRectangle(cornerRadius: 8))
 
-                ZStack {
-                    switch displayStyle {
-                    case .productCard:
-                        let spacing: CGFloat = 14
-                        let layout = productTilePlacements(width: productGridWidth, spacing: spacing)
-
-                        ZStack(alignment: .topLeading) {
-                            GeometryReader { proxy in
-                                Color.clear
-                                    .onAppear {
-                                        productGridWidth = max(1, proxy.size.width)
-                                    }
-                                    .onChange(of: proxy.size.width) { _, width in
-                                        productGridWidth = max(1, width)
-                                    }
+                if !isArrangeMode, !categories.isEmpty {
+                    POSSwipeCategoryPager(
+                        pageCount: categories.count,
+                        currentIndex: Binding(
+                            get: { categoryIndex(selectedCategory) ?? 0 },
+                            set: { newIndex in
+                                guard categories.indices.contains(newIndex) else { return }
+                                selectCategory(categories[newIndex].name)
                             }
-
-                            ForEach(layout.placements) { placement in
-                                posProductCard(for: placement.product)
-                                    .frame(width: placement.width, height: placement.height)
-                                    .contentShape(RoundedRectangle(cornerRadius: 8))
-                                    .position(x: placement.x + (placement.width / 2), y: placement.y + (placement.height / 2))
-                                    .modifier(productReorderModifier(for: placement.product))
-                            }
+                        ),
+                        onSwipeActivity: {
+                            suppressProductTapUntil = Date().addingTimeInterval(0.28)
                         }
-                        .frame(height: max(layout.height, 1), alignment: .topLeading)
-                    case .grabGrid:
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
-                            ForEach(products) { product in
-                                POSCompactProductCard(
-                                    product: product,
-                                    imageURL: store.imageURL(for: product),
-                                    quantityInCart: store.quantityInCart(for: product),
-                                    accentColor: accentColor,
-                                    isArranging: isArrangeMode,
-                                    wobblePhase: wobblePhase
-                                ) {
-                                    handleProductTap(product)
-                                } onArrange: {
-                                    enterArrangeMode()
-                                }
-                                .modifier(productReorderModifier(for: product))
-                            }
-                        }
-                    case .simpleList:
-                        VStack(spacing: 10) {
-                            ForEach(products) { product in
-                                POSProductListRow(
-                                    product: product,
-                                    imageURL: store.imageURL(for: product),
-                                    quantityInCart: store.quantityInCart(for: product),
-                                    accentColor: accentColor,
-                                    isArranging: isArrangeMode,
-                                    wobblePhase: wobblePhase
-                                ) {
-                                    handleProductTap(product)
-                                } onArrange: {
-                                    enterArrangeMode()
-                                }
-                                .modifier(productReorderModifier(for: product))
-                            }
-                        }
+                    ) { index, width in
+                        productGrid(for: categories[index].name, fixedWidth: width)
                     }
+                    .frame(
+                        height: productPagerHeight,
+                        alignment: .top
+                    )
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear
+                                .onAppear {
+                                    productGridWidth = max(1, proxy.size.width - 14)
+                                }
+                                .onChange(of: proxy.size.width) { _, width in
+                                    productGridWidth = max(1, width - 14)
+                                }
+                        }
+                    )
+                    .contentShape(Rectangle())
+                } else {
+                    productGrid(for: selectedCategory ?? "")
+                        .transition(.asymmetric(
+                            insertion: .move(edge: productInsertionEdge),
+                            removal: .move(edge: productRemovalEdge)
+                        ))
+                        .id(productAnimationToken)
+                        .clipped()
+                        .contentShape(Rectangle())
+                        .animation(.spring(response: 0.34, dampingFraction: 0.88, blendDuration: 0.04), value: productAnimationToken)
                 }
-                .transition(.asymmetric(
-                    insertion: .move(edge: .trailing).combined(with: .opacity),
-                    removal: .move(edge: .leading).combined(with: .opacity)
-                ))
-                .animation(.spring(response: 0.42, dampingFraction: 0.82), value: productAnimationToken)
             } else {
                 EmptyKitchenView()
             }
         }
+        .contentShape(Rectangle())
         .sheet(item: $selectedProduct) { product in
-            POSProductSheet(product: product, imageURL: store.imageURL(for: product), accentColor: accentColor) { toppings in
+            POSProductSheet(product: product, imageURL: store.imageURL(for: product), toppingCategoryOrder: toppingCategoryOrder, accentColor: accentColor) { toppings in
                 store.add(product: product, toppings: toppings)
                 selectedProduct = nil
             }
+            .emberSheetChrome()
         }
         .onChange(of: store.bootstrap) { _, bootstrap in
             guard let catalog = bootstrap?.catalog else { return }
@@ -3110,6 +6216,16 @@ private struct POSDashboardView: View {
         }
         .onChange(of: displayStyle) { _, _ in
             productAnimationToken = UUID()
+        }
+        .onChange(of: categorySwipeCommand) { _, command in
+            guard command.offset != 0 else { return }
+            selectAdjacentCategory(offset: command.offset)
+        }
+        .onChange(of: isArrangeMode) { _, isArranging in
+            if !isArranging {
+                wobblePhase = false
+                clearArrangeDragState()
+            }
         }
     }
 
@@ -3121,7 +6237,8 @@ private struct POSDashboardView: View {
             cardSize: productCardSize(for: product),
             accentColor: accentColor,
             isArranging: isArrangeMode,
-            wobblePhase: wobblePhase
+            wobblePhase: wobblePhase,
+            isCompact: isCompact
         ) {
             handleProductTap(product)
         } onArrange: {
@@ -3131,7 +6248,95 @@ private struct POSDashboardView: View {
         }
     }
 
+    @ViewBuilder
+    private func productGrid(for categoryName: String, fixedWidth: CGFloat? = nil) -> some View {
+        let categoryProducts = products(for: categoryName)
+
+        switch displayStyle {
+        case .productCard:
+            let spacing: CGFloat = 14
+            let gridWidth = fixedWidth.map { max(1, $0) } ?? layoutProductGridWidth
+            let layout = productTilePlacements(products: categoryProducts, width: gridWidth, spacing: spacing)
+
+            ZStack(alignment: .topLeading) {
+                if fixedWidth == nil {
+                    GeometryReader { proxy in
+                        Color.clear
+                            .onAppear {
+                                productGridWidth = max(1, proxy.size.width)
+                            }
+                            .onChange(of: proxy.size.width) { _, width in
+                                productGridWidth = max(1, width)
+                            }
+                        }
+                }
+
+                ForEach(layout.placements) { placement in
+                    productTile(for: placement, in: layout.placements)
+                }
+            }
+            .frame(width: fixedWidth, alignment: .topLeading)
+            .frame(height: max(layout.height, 1), alignment: .topLeading)
+        case .grabGrid:
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
+                ForEach(categoryProducts) { product in
+                    POSCompactProductCard(
+                        product: product,
+                        imageURL: store.imageURL(for: product),
+                        quantityInCart: store.quantityInCart(for: product),
+                        accentColor: accentColor,
+                        isArranging: isArrangeMode,
+                        wobblePhase: wobblePhase
+                    ) {
+                        handleProductTap(product)
+                    } onArrange: {
+                        enterArrangeMode()
+                    }
+                    .modifier(productReorderModifier(for: product))
+                }
+            }
+            .frame(width: fixedWidth, alignment: .topLeading)
+        case .simpleList:
+            LazyVStack(spacing: 10) {
+                ForEach(categoryProducts) { product in
+                    POSProductListRow(
+                        product: product,
+                        imageURL: store.imageURL(for: product),
+                        quantityInCart: store.quantityInCart(for: product),
+                        accentColor: accentColor,
+                        isArranging: isArrangeMode,
+                        wobblePhase: wobblePhase
+                    ) {
+                        handleProductTap(product)
+                    } onArrange: {
+                        enterArrangeMode()
+                    }
+                    .modifier(productReorderModifier(for: product))
+                }
+            }
+            .frame(width: fixedWidth, alignment: .topLeading)
+        }
+    }
+
+    @ViewBuilder
+    private func productTile(for placement: ProductTilePlacement, in placements: [ProductTilePlacement]) -> some View {
+        let tile = posProductCard(for: placement.product)
+            .frame(width: placement.width, height: placement.height)
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+            .position(x: placement.x + (placement.width / 2), y: placement.y + (placement.height / 2))
+            .offset(draggingProductID == placement.product.id ? draggingProductOffset : .zero)
+            .zIndex(draggingProductID == placement.product.id ? 2 : 0)
+
+        if isArrangeMode {
+            tile.gesture(productCardDragGesture(for: placement, in: placements))
+        } else {
+            tile
+        }
+    }
+
     private func handleProductTap(_ product: POSProduct) {
+        guard Date() >= suppressProductTapUntil else { return }
+
         if isArrangeMode {
             cycleProductCardSize(product)
         } else {
@@ -3140,7 +6345,8 @@ private struct POSDashboardView: View {
     }
 
     private func productCardSize(for product: POSProduct) -> POSCardSize {
-        productCardSizes[product.id] ?? .small
+        let size = productCardSizes[product.id] ?? .small
+        return isCompact ? compactCardSize(size) : size
     }
 
     private func cycleProductCardSize(_ product: POSProduct) {
@@ -3149,8 +6355,13 @@ private struct POSDashboardView: View {
             return
         }
 
+        var sizes = productCardSizes
+        sizes[product.id] = isCompact
+            ? (productCardSize(for: product) == .big ? .small : .big)
+            : productCardSize(for: product).next
+
         withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
-            productCardSizes[product.id] = productCardSize(for: product).next
+            productCardSizes = sizes
             productAnimationToken = UUID()
         }
         Haptics.selectionChanged()
@@ -3160,11 +6371,41 @@ private struct POSDashboardView: View {
         POSProductReorderModifier(
             productID: product.id,
             scope: arrangeScope(for: selectedCategory),
+            isArranging: isArrangeMode,
             draggingProductID: $draggingProductID,
             lastDropTarget: $lastProductDropTarget,
             productIDsByScope: $arrangedProductIDsByScope,
             onBeginDrag: { enterArrangeMode() }
         )
+    }
+
+    private func productCardDragGesture(for placement: ProductTilePlacement, in placements: [ProductTilePlacement]) -> some Gesture {
+        DragGesture(minimumDistance: 8)
+            .onChanged { value in
+                guard isArrangeMode else { return }
+
+                draggingProductID = placement.product.id
+                draggingProductOffset = value.translation
+
+                let currentCenter = CGPoint(
+                    x: placement.x + (placement.width / 2) + value.translation.width,
+                    y: placement.y + (placement.height / 2) + value.translation.height
+                )
+
+                guard let target = placements.first(where: { candidate in
+                    candidate.product.id != placement.product.id &&
+                    CGRect(x: candidate.x, y: candidate.y, width: candidate.width, height: candidate.height).contains(currentCenter)
+                }) else {
+                    return
+                }
+
+                reorderProduct(placement.product.id, before: target.product.id)
+            }
+            .onEnded { _ in
+                draggingProductID = nil
+                draggingProductOffset = .zero
+                lastProductDropTarget = nil
+            }
     }
 
     private func syncArrangeOrders(catalog: POSCatalog) {
@@ -3216,21 +6457,30 @@ private struct POSDashboardView: View {
     private func enterArrangeMode() {
         guard !isArrangeMode else { return }
         Haptics.notification(.success)
-        withAnimation(.snappy(duration: 0.22)) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
             isArrangeMode = true
             wobblePhase = true
         }
     }
 
     private func finishArrangeMode() {
-        withAnimation(.snappy(duration: 0.2)) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
             isArrangeMode = false
             wobblePhase = false
-            draggingCategoryName = nil
-            draggingProductID = nil
-            lastCategoryDropTarget = nil
-            lastProductDropTarget = nil
+            clearArrangeDragState()
         }
+    }
+
+    private func clearArrangeDragState() {
+        draggingCategoryName = nil
+        draggingProductID = nil
+        draggingProductOffset = .zero
+        lastCategoryDropTarget = nil
+        lastProductDropTarget = nil
     }
 
     private func canMoveCategory(_ name: String, offset: Int) -> Bool {
@@ -3270,6 +6520,30 @@ private struct POSDashboardView: View {
 
         withAnimation(.snappy(duration: 0.2)) {
             order.swapAt(index, destination)
+            arrangedProductIDsByScope[scope] = order
+        }
+        Haptics.impact(.light)
+    }
+
+    private func reorderProduct(_ draggingID: Int, before targetID: Int) {
+        guard draggingID != targetID,
+              lastProductDropTarget != targetID else {
+            return
+        }
+
+        let scope = arrangeScope(for: selectedCategory)
+        guard var order = arrangedProductIDsByScope[scope],
+              let fromIndex = order.firstIndex(of: draggingID),
+              let toIndex = order.firstIndex(of: targetID) else {
+            return
+        }
+
+        lastProductDropTarget = targetID
+        withAnimation(.snappy(duration: 0.16)) {
+            order.move(
+                fromOffsets: IndexSet(integer: fromIndex),
+                toOffset: toIndex > fromIndex ? toIndex + 1 : toIndex
+            )
             arrangedProductIDsByScope[scope] = order
         }
         Haptics.impact(.light)
@@ -3314,28 +6588,36 @@ private struct POSCategoryDropDelegate: DropDelegate {
 private struct POSProductReorderModifier: ViewModifier {
     let productID: Int
     let scope: String
+    let isArranging: Bool
     @Binding var draggingProductID: Int?
     @Binding var lastDropTarget: Int?
     @Binding var productIDsByScope: [String: [Int]]
     let onBeginDrag: () -> Void
 
     func body(content: Content) -> some View {
-        content
-            .onDrag {
-                onBeginDrag()
-                draggingProductID = productID
-                return NSItemProvider(object: "\(productID)" as NSString)
-            }
-            .onDrop(
-                of: [UTType.text],
-                delegate: POSProductDropDelegate(
-                    targetID: productID,
-                    scope: scope,
-                    draggingProductID: $draggingProductID,
-                    lastDropTarget: $lastDropTarget,
-                    productIDsByScope: $productIDsByScope
+        if isArranging {
+            content
+                .onDrag {
+                    onBeginDrag()
+                    draggingProductID = productID
+                    return NSItemProvider(object: "\(productID)" as NSString)
+                } preview: {
+                    Color.clear
+                        .frame(width: 1, height: 1)
+                }
+                .onDrop(
+                    of: [UTType.text],
+                    delegate: POSProductDropDelegate(
+                        targetID: productID,
+                        scope: scope,
+                        draggingProductID: $draggingProductID,
+                        lastDropTarget: $lastDropTarget,
+                        productIDsByScope: $productIDsByScope
+                    )
                 )
-            )
+        } else {
+            content
+        }
     }
 }
 
@@ -3429,7 +6711,7 @@ private struct POSShiftCard: View {
                     .foregroundStyle(AppPalette.muted)
 
                 if let activeShift = shift.shift {
-                    Text("Shift #\(activeShift.id)")
+                    Text("#\(activeShift.id)")
                         .font(GlacialFont.caption())
                         .foregroundStyle(AppPalette.muted)
                 }
@@ -3479,16 +6761,23 @@ private struct POSShiftControlSheet: View {
     let onCashIn: () -> Void
     let onCashOut: () -> Void
     let onCloseShift: () -> Void
+    let onSignOff: () -> Void
+    var onClose: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    private var isCompact: Bool {
+        horizontalSizeClass == .compact
+    }
 
     var body: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .center, spacing: 13) {
+                HStack(alignment: .center, spacing: 15) {
                     Image(systemName: "person.crop.circle.badge.checkmark")
-                        .font(.title3.weight(.semibold))
+                        .font(.system(size: 35, weight: .semibold))
                         .foregroundStyle(accentColor)
-                        .frame(width: 42, height: 42)
+                        .frame(width: 64, height: 64)
                         .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
 
                     VStack(alignment: .leading, spacing: 4) {
@@ -3497,12 +6786,25 @@ private struct POSShiftControlSheet: View {
                             .tracking(2)
                             .foregroundStyle(accentColor)
                         Text(`operator`.name.uppercased())
-                            .font(GlacialFont.custom(28, .medium))
-                            .tracking(1.4)
+                            .font(GlacialFont.custom(22, .medium))
+                            .tracking(1.1)
                             .foregroundStyle(AppPalette.ink)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.74)
+                        Text(`operator`.roleLabel)
+                            .font(GlacialFont.caption2(.bold))
+                            .tracking(1.4)
+                            .foregroundStyle(`operator`.canAccessAdminFeatures ? accentColor : AppPalette.muted)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke((`operator`.canAccessAdminFeatures ? accentColor : AppPalette.line).opacity(0.55), lineWidth: 1)
+                            )
                     }
                 }
-                .padding(14)
+                .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
                 .overlay(
@@ -3518,7 +6820,7 @@ private struct POSShiftControlSheet: View {
                                 .tracking(1.8)
                                 .foregroundStyle(AppPalette.ink)
                             if let activeShift = shift.shift {
-                                Text("Shift #\(activeShift.id)")
+                                Text("#\(activeShift.id)")
                                     .font(GlacialFont.caption())
                                     .foregroundStyle(AppPalette.muted)
                             }
@@ -3558,6 +6860,8 @@ private struct POSShiftControlSheet: View {
                     } else {
                         POSShiftMenuButton(title: "OPEN SHIFT", icon: "lock.open", isSubmitting: isSubmitting, accentColor: accentColor, action: onOpenShift)
                     }
+
+                    POSShiftMenuButton(title: "SIGN OFF", icon: "rectangle.portrait.and.arrow.right", isSubmitting: isSubmitting, accentColor: accentColor, tone: .danger, action: onSignOff)
                 }
 
                 Spacer()
@@ -3566,23 +6870,231 @@ private struct POSShiftControlSheet: View {
             .background(AppPalette.background.ignoresSafeArea())
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    Text("AUTHENTICATION")
+            .safeAreaInset(edge: .top, spacing: 0) {
+                authenticationTopBar
+            }
+        }
+    }
+
+    private var authenticationTopBar: some View {
+        ZStack {
+            Text("AUTHENTICATION")
+                .font(GlacialFont.subheadline(.medium))
+                .tracking(2.4)
+                .foregroundStyle(AppPalette.ink)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
+        .background(AppPalette.background)
+    }
+
+    private func close() {
+        if let onClose {
+            onClose()
+        } else {
+            dismiss()
+        }
+    }
+}
+
+private struct POSShiftLoadingSheet: View {
+    let accentColor: Color
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 14) {
+                ProgressView()
+                    .tint(accentColor)
+
+                Text("LOADING SHIFT")
+                    .font(GlacialFont.subheadline(.medium))
+                    .tracking(2)
+                    .foregroundStyle(AppPalette.ink)
+
+                Text("POS data is connecting.")
+                    .font(GlacialFont.caption())
+                    .foregroundStyle(AppPalette.muted)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(AppPalette.background.ignoresSafeArea())
+            .safeAreaInset(edge: .top, spacing: 0) {
+                ZStack {
+                    Text("SHIFT")
                         .font(GlacialFont.subheadline(.medium))
                         .tracking(2.4)
                         .foregroundStyle(AppPalette.ink)
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("SAVE") {
-                        dismiss()
+
+                    HStack {
+                        Spacer()
+                        POSCloseIconButton {
+                            dismiss()
+                        }
                     }
-                    .font(GlacialFont.caption(.bold))
-                    .tracking(1.8)
-                    .foregroundStyle(accentColor)
                 }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    dismiss()
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 14)
+                .padding(.bottom, 12)
+                .background(AppPalette.background)
             }
         }
+    }
+}
+
+private struct CompactPOSShiftDrawer: View {
+    let `operator`: POSOperator
+    let shift: POSShiftEnvelope
+    let isSubmitting: Bool
+    let accentColor: Color
+    var bottomInset: CGFloat = 18
+    let onDismiss: () -> Void
+    let onOpenShift: () -> Void
+    let onCashIn: () -> Void
+    let onCashOut: () -> Void
+    let onCloseShift: () -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("SHIFT")
+                            .font(GlacialFont.caption(.bold))
+                            .tracking(2)
+                            .foregroundStyle(accentColor)
+                        Text(`operator`.name.uppercased())
+                            .font(GlacialFont.title3(.semibold))
+                            .foregroundStyle(AppPalette.ink)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.74)
+                    }
+
+                    Spacer()
+
+                    POSCloseIconButton(action: onDismiss)
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(shift.isOpen ? "SHIFT OPEN" : "SHIFT CLOSED")
+                                .font(GlacialFont.subheadline(.medium))
+                                .tracking(1.6)
+                                .foregroundStyle(AppPalette.ink)
+                            if let activeShift = shift.shift {
+                                Text("#\(activeShift.id)")
+                                    .font(GlacialFont.caption())
+                                    .foregroundStyle(AppPalette.muted)
+                            }
+                        }
+
+                        Spacer()
+
+                        Text(shift.isOpen ? "READY" : "CLOSED")
+                            .font(GlacialFont.caption(.bold))
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 7)
+                            .foregroundStyle(shift.isOpen ? AppPalette.green : accentColor)
+                            .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                    }
+
+                    if let recap = shift.recap {
+                        HStack(spacing: 8) {
+                            POSShiftRecapTile(title: "ORDERS", value: "\(recap.orders)")
+                            POSShiftRecapTile(title: "REVENUE", value: "\(Int(recap.revenue).formatted())")
+                            POSShiftRecapTile(title: "CASH", value: "\(Int(recap.expectedCash).formatted())")
+                        }
+                    }
+                }
+                .padding(14)
+                .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line.opacity(0.8), lineWidth: 1)
+                )
+
+                VStack(spacing: 9) {
+                    if shift.isOpen {
+                        POSShiftMenuButton(title: "CASH IN", icon: "plus", isSubmitting: isSubmitting, accentColor: accentColor, action: onCashIn)
+                        POSShiftMenuButton(title: "CASH OUT", icon: "minus", isSubmitting: isSubmitting, accentColor: accentColor, action: onCashOut)
+                        POSShiftMenuButton(title: "CLOSE SHIFT", icon: "lock", isSubmitting: isSubmitting, accentColor: accentColor, tone: .danger, action: onCloseShift)
+                    } else {
+                        POSShiftMenuButton(title: "OPEN SHIFT", icon: "lock.open", isSubmitting: isSubmitting, accentColor: accentColor, action: onOpenShift)
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, bottomInset)
+        }
+        .animation(.spring(response: 0.30, dampingFraction: 0.88), value: shift.isOpen)
+    }
+}
+
+private struct CompactFullScreenPanel<Content: View>: View {
+    let accentColor: Color
+    let onDismiss: () -> Void
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.bottom, 104)
+            .background(AppPalette.background.ignoresSafeArea())
+            .ignoresSafeArea(edges: .bottom)
+    }
+}
+
+private struct CompactPersistentBottomDrawer<Content: View>: View {
+    let bottomInset: CGFloat
+    let onDismiss: () -> Void
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .bottom) {
+                Color.black.opacity(0.001)
+                    .ignoresSafeArea()
+                    .onTapGesture(perform: onDismiss)
+
+                content
+                    .frame(maxWidth: .infinity)
+                    .frame(maxHeight: proxy.size.height * 0.82)
+                    .clipShape(UnevenRoundedRectangle(topLeadingRadius: 14, topTrailingRadius: 14))
+                    .overlay(alignment: .top) {
+                        UnevenRoundedRectangle(topLeadingRadius: 14, topTrailingRadius: 14)
+                            .stroke(.white.opacity(0.58), lineWidth: 1)
+                    }
+                    .shadow(color: .black.opacity(0.16), radius: 24, y: 10)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, bottomInset)
+                    .onTapGesture {}
+            }
+        }
+    }
+}
+
+private struct POSCloseIconButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "xmark")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(AppPalette.ink)
+                .frame(width: 30, height: 30)
+                .background(AppPalette.card, in: Circle())
+                .overlay(
+                    Circle()
+                        .stroke(AppPalette.line.opacity(0.85), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Close")
     }
 }
 
@@ -3791,6 +7303,11 @@ private struct POSShiftFormShell<Content: View>: View {
     let submit: () async -> Bool
     @ViewBuilder let content: Content
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    private var isCompact: Bool {
+        horizontalSizeClass == .compact
+    }
 
     var body: some View {
         NavigationStack {
@@ -3810,19 +7327,13 @@ private struct POSShiftFormShell<Content: View>: View {
                             }
                         }
                     } label: {
-                        HStack(spacing: 10) {
-                            if isSubmitting {
-                                ProgressView()
-                                    .tint(.white)
-                            }
-                            Text(isSubmitting ? "SAVING" : "SAVE")
-                                .font(GlacialFont.caption(.bold))
-                                .tracking(2.2)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 15)
-                        .foregroundStyle(.white)
-                        .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
+                        POSRectActionLabel(
+                            title: isSubmitting ? "SAVING" : "SAVE",
+                            tint: accentColor,
+                            isPrimary: true,
+                            isLoading: isSubmitting,
+                            fillsWidth: true
+                        )
                     }
                     .buttonStyle(.plain)
                     .disabled(isSubmitting || !canSubmit)
@@ -3834,21 +7345,40 @@ private struct POSShiftFormShell<Content: View>: View {
             .background(AppPalette.background.ignoresSafeArea())
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    Text(title)
-                        .font(GlacialFont.subheadline(.medium))
-                        .tracking(2.4)
-                        .foregroundStyle(AppPalette.ink)
-                }
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Close") {
+            .safeAreaInset(edge: .top, spacing: 0) {
+                formTopBar
+            }
+        }
+    }
+
+    private var formTopBar: some View {
+        ZStack {
+            Text(title)
+                .font(GlacialFont.subheadline(.medium))
+                .tracking(2.4)
+                .foregroundStyle(AppPalette.ink)
+
+            HStack {
+                Spacer()
+                if isCompact {
+                    POSCloseIconButton {
                         dismiss()
                     }
-                    .foregroundStyle(AppPalette.ink)
+                } else {
+                    POSCheckoutTopAction(title: "CLOSE", tint: AppPalette.ink) {
+                        dismiss()
+                    }
                 }
             }
         }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            dismiss()
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
+        .background(AppPalette.background)
     }
 }
 
@@ -3865,9 +7395,22 @@ private struct POSMoneyField: View {
                 .foregroundStyle(AppPalette.muted)
             TextField(placeholder, text: $text)
                 .font(GlacialFont.custom(28, .semibold))
+                .foregroundStyle(AppPalette.ink)
+                .foregroundColor(AppPalette.ink)
+                .tint(AppPalette.orange)
                 .keyboardType(.numberPad)
                 .padding(14)
-                .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                )
+                .onChange(of: text) { _, newValue in
+                    let formatted = POSMoneyParser.formattedInput(newValue)
+                    if formatted != newValue {
+                        text = formatted
+                    }
+                }
         }
     }
 }
@@ -3885,14 +7428,30 @@ private struct POSNotesField: View {
                 .foregroundStyle(AppPalette.muted)
             TextField(placeholder, text: $text, axis: .vertical)
                 .font(GlacialFont.subheadline())
+                .foregroundStyle(AppPalette.ink)
+                .foregroundColor(AppPalette.ink)
+                .tint(AppPalette.orange)
                 .lineLimit(2...4)
                 .padding(14)
-                .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                )
         }
     }
 }
 
 private enum POSMoneyParser {
+    static func formattedInput(_ text: String) -> String {
+        let digits = text.filter(\.isNumber)
+        guard !digits.isEmpty, let value = Int(digits) else {
+            return ""
+        }
+
+        return value.formatted()
+    }
+
     static func value(_ text: String) -> Double? {
         let normalized = text
             .replacingOccurrences(of: ",", with: "")
@@ -3911,6 +7470,24 @@ private extension String {
     var emptyAsNil: String? {
         isEmpty ? nil : self
     }
+
+    var csvValues: [String] {
+        split(separator: "|")
+            .map { String($0) }
+            .filter { !$0.isEmpty }
+    }
+
+    var normalizedCustomerSearchValue: String {
+        trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .lowercased()
+    }
+}
+
+private extension Array where Element == String {
+    var csvStorageValue: String {
+        joined(separator: "|")
+    }
 }
 
 private extension UIImage {
@@ -3921,6 +7498,22 @@ private extension UIImage {
         let targetSize = CGSize(width: size.width * scale, height: size.height * scale)
 
         let renderer = UIGraphicsImageRenderer(size: targetSize)
+        return renderer.image { _ in
+            draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+    }
+
+    func normalizedForPOSLogo() -> UIImage {
+        let maxSide: CGFloat = 1200
+        let largestSide = max(size.width, size.height)
+        let scale = largestSide > maxSide ? maxSide / largestSide : 1
+        let targetSize = CGSize(width: size.width * scale, height: size.height * scale)
+
+        let format = UIGraphicsImageRendererFormat()
+        format.opaque = false
+        format.scale = 1
+
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
         return renderer.image { _ in
             draw(in: CGRect(origin: .zero, size: targetSize))
         }
@@ -3962,9 +7555,11 @@ private struct POSCategoryChip: View {
 }
 
 private struct POSProductAreaWallpaper: View {
+    let assetName: String
+
     var body: some View {
         GeometryReader { proxy in
-            Image("POSLightWallpaper")
+            Image(assetName)
                 .resizable()
                 .scaledToFill()
                 .frame(width: proxy.size.width, height: proxy.size.height)
@@ -3984,111 +7579,130 @@ private struct POSProductCard: View {
     let accentColor: Color
     let isArranging: Bool
     let wobblePhase: Bool
+    let isCompact: Bool
     let action: () -> Void
     let onArrange: () -> Void
     let onCycleSize: () -> Void
+    @State private var ignoresNextTap = false
+
+    private var titleFont: Font {
+        isCompact ? GlacialFont.subheadline(.semibold) : GlacialFont.headline(.semibold)
+    }
+
+    private var titlePadding: CGFloat {
+        isCompact ? 10 : 14
+    }
+
+    private var arrangeLongPressDuration: Double {
+        isCompact ? 0.62 : 0.36
+    }
 
     var body: some View {
-        Button(action: action) {
-            GeometryReader { proxy in
-                ZStack(alignment: .bottomLeading) {
-                    POSProductImage(url: imageURL)
-                        .frame(width: proxy.size.width, height: proxy.size.height)
-                        .clipped()
-
-                    LinearGradient(
-                        colors: [
-                            .black.opacity(0.02),
-                            .black.opacity(0.22),
-                            .black.opacity(0.64)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
+        GeometryReader { proxy in
+            ZStack(alignment: .bottomLeading) {
+                POSProductImage(url: imageURL)
                     .frame(width: proxy.size.width, height: proxy.size.height)
+                    .clipped()
 
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(product.name.uppercased())
-                            .font(GlacialFont.headline(.semibold))
-                            .tracking(1.1)
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    }
-                    .padding(14)
-                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .bottomLeading)
+                LinearGradient(
+                    colors: [
+                        .black.opacity(0.02),
+                        .black.opacity(0.22),
+                        .black.opacity(0.64)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(width: proxy.size.width, height: proxy.size.height)
 
-                    VStack {
-                        HStack {
-                            Spacer()
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(product.name.uppercased())
+                        .font(titleFont)
+                        .tracking(isCompact ? 0.7 : 1.1)
+                        .foregroundStyle(.white)
+                        .lineLimit(isCompact ? 2 : 1)
+                        .truncationMode(.tail)
+                        .minimumScaleFactor(0.78)
+                }
+                .padding(titlePadding)
+                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .bottomLeading)
 
-                            if !isArranging {
-                                ZStack(alignment: .topTrailing) {
-                                    Image(systemName: "plus")
-                                        .font(.system(size: 16, weight: .semibold))
-                                        .foregroundStyle(.white)
-                                        .frame(width: 38, height: 38)
-                                        .background(accentColor.opacity(0.94), in: Circle())
+                productActionControl
+                    .padding(isCompact ? 8 : 12)
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(quantityInCart > 0 ? accentColor.opacity(0.8) : AppPalette.line.opacity(0.8), lineWidth: 1)
+        )
+        .onTapGesture {
+            if ignoresNextTap {
+                ignoresNextTap = false
+                return
+            }
 
-                                    if quantityInCart > 0 {
-                                        Text("\(quantityInCart)")
-                                            .font(GlacialFont.caption2(.bold))
-                                            .foregroundStyle(accentColor)
-                                            .frame(minWidth: 17, minHeight: 17)
-                                            .background(.white, in: Circle())
-                                            .offset(x: 3, y: -3)
-                                    }
-                                }
-                            }
-                        }
-                        Spacer()
-                    }
-                    .padding(12)
-                    .frame(width: proxy.size.width, height: proxy.size.height)
+            action()
+        }
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: arrangeLongPressDuration)
+                .onEnded { _ in
+                    ignoresNextTap = true
+                    onArrange()
+                }
+        )
+    }
 
-                    if isArranging {
-                        VStack {
-                            HStack {
-                                Button(action: onCycleSize) {
-                                    Text(cardSize.shortLabel)
-                                        .font(GlacialFont.caption(.bold))
-                                            .foregroundStyle(.white)
-                                            .frame(width: 30, height: 30)
-                                            .background(.ultraThinMaterial, in: Circle())
-                                            .overlay(
-                                                Circle()
-                                                    .fill(accentColor.opacity(0.78))
-                                                    .blendMode(.plusLighter)
-                                            )
-                                        .overlay(
-                                            Circle()
-                                                .stroke(.white.opacity(0.42), lineWidth: 1)
-                                        )
-                                        .shadow(color: .black.opacity(0.18), radius: 8, y: 4)
-                                }
-                                .buttonStyle(.plain)
+    @ViewBuilder
+    private var productActionControl: some View {
+        HStack {
+            if isArranging {
+                Button(action: onCycleSize) {
+                    Text(cardSize.shortLabel)
+                        .font(GlacialFont.caption(.bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 30, height: 30)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(
+                            Circle()
+                                .fill(accentColor.opacity(0.78))
+                                .blendMode(.plusLighter)
+                        )
+                        .overlay(
+                            Circle()
+                                .stroke(.white.opacity(0.42), lineWidth: 1)
+                        )
+                        .shadow(color: .black.opacity(0.18), radius: 8, y: 4)
+                }
+                .buttonStyle(NoHighlightButtonStyle())
+            }
 
-                                Spacer()
-                            }
-                            Spacer()
-                        }
-                        .padding(12)
-                        .frame(width: proxy.size.width, height: proxy.size.height)
+            Spacer()
+
+            if !isArranging {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 38, height: 38)
+                        .background(accentColor.opacity(0.94), in: Circle())
+
+                    if quantityInCart > 0 {
+                        Text("\(quantityInCart)")
+                            .font(GlacialFont.caption2(.bold))
+                            .foregroundStyle(accentColor)
+                            .frame(minWidth: 17, minHeight: 17)
+                            .background(.white, in: Circle())
+                            .offset(x: 3, y: -3)
                     }
                 }
-                .frame(width: proxy.size.width, height: proxy.size.height)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(quantityInCart > 0 ? accentColor.opacity(0.8) : AppPalette.line.opacity(0.8), lineWidth: 1)
-            )
-            .scaleEffect(isArranging ? 0.992 : 1)
-            .animation(.snappy(duration: 0.18), value: isArranging)
         }
-        .buttonStyle(.plain)
     }
 }
 
@@ -4101,9 +7715,17 @@ private struct POSCompactProductCard: View {
     let wobblePhase: Bool
     let action: () -> Void
     let onArrange: () -> Void
+    @State private var ignoresNextTap = false
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            if ignoresNextTap {
+                ignoresNextTap = false
+                return
+            }
+
+            action()
+        } label: {
             VStack(alignment: .leading, spacing: 8) {
                 ZStack(alignment: .bottomLeading) {
                     POSProductImage(url: imageURL)
@@ -4157,10 +7779,15 @@ private struct POSCompactProductCard: View {
                         .padding(7)
                 }
             }
-            .scaleEffect(isArranging ? 0.992 : 1)
-            .animation(.snappy(duration: 0.18), value: isArranging)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(NoHighlightButtonStyle())
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.36)
+                .onEnded { _ in
+                    ignoresNextTap = true
+                    onArrange()
+                }
+        )
     }
 
 }
@@ -4174,9 +7801,17 @@ private struct POSProductListRow: View {
     let wobblePhase: Bool
     let action: () -> Void
     let onArrange: () -> Void
+    @State private var ignoresNextTap = false
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            if ignoresNextTap {
+                ignoresNextTap = false
+                return
+            }
+
+            action()
+        } label: {
             HStack(spacing: 13) {
                 POSProductImage(url: imageURL)
                     .frame(width: 82, height: 82)
@@ -4222,45 +7857,133 @@ private struct POSProductListRow: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(quantityInCart > 0 ? accentColor.opacity(0.8) : AppPalette.line.opacity(0.75), lineWidth: 1)
             )
-            .scaleEffect(isArranging ? 0.992 : 1)
-            .animation(.snappy(duration: 0.18), value: isArranging)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(NoHighlightButtonStyle())
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.36)
+                .onEnded { _ in
+                    ignoresNextTap = true
+                    onArrange()
+                }
+        )
+    }
+}
+
+private final class POSProductImageCache {
+    static let shared = POSProductImageCache()
+
+    private let cache = NSCache<NSURL, UIImage>()
+
+    private init() {}
+
+    func image(for url: URL) -> UIImage? {
+        cache.object(forKey: url as NSURL)
+    }
+
+    func store(_ image: UIImage, for url: URL) {
+        cache.setObject(image, forKey: url as NSURL)
+    }
+
+    func prewarm(urls: [URL], limit: Int = 18) async {
+        let uniqueURLs = Array(Set(urls)).prefix(limit)
+
+        await withTaskGroup(of: (URL, UIImage?).self) { group in
+            for url in uniqueURLs where image(for: url) == nil {
+                group.addTask {
+                    let image: UIImage?
+                    if url.isFileURL {
+                        image = UIImage(contentsOfFile: url.path)
+                    } else if let data = try? Data(contentsOf: url) {
+                        image = UIImage(data: data)
+                    } else {
+                        image = nil
+                    }
+
+                    return (url, image)
+                }
+            }
+
+            for await (url, image) in group {
+                guard let image else { continue }
+                store(image, for: url)
+            }
+        }
     }
 }
 
 private struct POSProductImage: View {
     let url: URL?
+    @State private var loadedImage: UIImage?
+    @State private var loadedURL: URL?
+
+    private var cachedImage: UIImage? {
+        guard let url else { return nil }
+
+        if let image = POSProductImageCache.shared.image(for: url) {
+            return image
+        }
+
+        guard url.isFileURL,
+              let image = UIImage(contentsOfFile: url.path) else {
+            return nil
+        }
+
+        POSProductImageCache.shared.store(image, for: url)
+        return image
+    }
+
+    private var currentImage: UIImage? {
+        cachedImage ?? (loadedURL == url ? loadedImage : nil)
+    }
 
     var body: some View {
-        if let url, url.isFileURL {
-            if let image = UIImage(contentsOfFile: url.path) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                POSProductImageFallback()
-            }
+        if let image = currentImage {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
         } else {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image
-                        .resizable()
-                        .scaledToFill()
-                case .failure:
-                    POSProductImageFallback()
-                case .empty:
-                    ZStack {
-                        AppPalette.card
-                        ProgressView()
-                            .tint(AppPalette.orange)
-                    }
-                @unknown default:
-                    AppPalette.card
+            ZStack {
+                POSProductImageFallback()
+
+                if url != nil {
+                    ProgressView()
+                        .tint(AppPalette.orange)
                 }
             }
+            .task(id: url) {
+                await loadImage()
+            }
         }
+    }
+
+    private func loadImage() async {
+        guard let url else {
+            loadedURL = nil
+            loadedImage = nil
+            return
+        }
+
+        if let image = POSProductImageCache.shared.image(for: url) {
+            loadedURL = url
+            loadedImage = image
+            return
+        }
+
+        let image = await Task.detached(priority: .utility) { () -> UIImage? in
+            if url.isFileURL {
+                return UIImage(contentsOfFile: url.path)
+            }
+
+            guard let data = try? Data(contentsOf: url) else {
+                return nil
+            }
+            return UIImage(data: data)
+        }.value
+
+        guard let image else { return }
+        POSProductImageCache.shared.store(image, for: url)
+        loadedURL = url
+        loadedImage = image
     }
 }
 
@@ -4278,17 +8001,33 @@ private struct POSProductImageFallback: View {
 private struct POSProductSheet: View {
     let product: POSProduct
     let imageURL: URL?
+    let toppingCategoryOrder: [String]
     let accentColor: Color
+    let actionTitle: String
     let onAdd: ([POSTopping]) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var selectedToppingIDs = Set<Int>()
 
-    private var selectedToppings: [POSTopping] {
-        product.toppings.filter { selectedToppingIDs.contains($0.id) }
+    init(
+        product: POSProduct,
+        imageURL: URL?,
+        toppingCategoryOrder: [String],
+        accentColor: Color,
+        initialToppings: [POSTopping] = [],
+        actionTitle: String = "ADD TO CART",
+        onAdd: @escaping ([POSTopping]) -> Void
+    ) {
+        self.product = product
+        self.imageURL = imageURL
+        self.toppingCategoryOrder = toppingCategoryOrder
+        self.accentColor = accentColor
+        self.actionTitle = actionTitle
+        self.onAdd = onAdd
+        _selectedToppingIDs = State(initialValue: Set(initialToppings.map(\.id)))
     }
 
-    private var total: Double {
-        product.price + selectedToppings.reduce(0) { $0 + $1.price }
+    private var selectedToppings: [POSTopping] {
+        product.toppings.filter { selectedToppingIDs.contains($0.id) }
     }
 
     private var toppingGroups: [(String, [POSTopping])] {
@@ -4301,7 +8040,21 @@ private struct POSProductSheet: View {
                     }
                 )
             }
-            .sorted { $0.0 < $1.0 }
+            .sorted { lhs, rhs in
+                let lhsIndex = toppingCategoryOrder.firstIndex(of: lhs.0)
+                let rhsIndex = toppingCategoryOrder.firstIndex(of: rhs.0)
+
+                switch (lhsIndex, rhsIndex) {
+                case let (lhsIndex?, rhsIndex?):
+                    return lhsIndex < rhsIndex
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                case (nil, nil):
+                    return lhs.0 < rhs.0
+                }
+            }
     }
 
     var body: some View {
@@ -4349,38 +8102,53 @@ private struct POSProductSheet: View {
                 .padding(.bottom, 20)
             }
             .background(Color.white.ignoresSafeArea())
-            .navigationTitle("Customize")
+            .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Close") {
-                        dismiss()
-                    }
-                    .foregroundStyle(AppPalette.ink)
-                }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                productSheetTopBar
             }
             .safeAreaInset(edge: .bottom) {
                 Button {
                     onAdd(selectedToppings)
                 } label: {
-                    HStack {
-                        Text("Add to cart")
-                        Spacer()
-                        Text("\(Int(total).formatted()) VND")
-                    }
-                    .font(GlacialFont.caption(.bold))
-                    .tracking(1.8)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 15)
-                    .padding(.horizontal, 18)
-                    .foregroundStyle(.white)
-                    .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
+                    Text(actionTitle)
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(2)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 13)
+                        .padding(.horizontal, 18)
+                        .foregroundStyle(.white)
+                        .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(accentColor.opacity(0.12), lineWidth: 1)
+                        )
                 }
                 .buttonStyle(.plain)
                 .padding(20)
                 .background(.white)
             }
         }
+    }
+
+    private var productSheetTopBar: some View {
+        ZStack {
+            Text("CUSTOMIZE")
+                .font(GlacialFont.subheadline(.medium))
+                .tracking(2.4)
+                .foregroundStyle(AppPalette.ink)
+
+            HStack {
+                Spacer()
+                POSCloseIconButton {
+                    dismiss()
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
+        .background(.white)
     }
 
     private var productHeader: some View {
@@ -4422,7 +8190,6 @@ private struct POSProductSheet: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 8))
-        .padding(.top, 14)
     }
 
     private func toggle(_ topping: POSTopping) {
@@ -4657,19 +8424,32 @@ private struct POSCartLineRow: View {
 
 private struct POSCheckoutSheet: View {
     let lines: [POSCartLine]
+    let tickets: [POSDraftTicket]
+    let activeTicketID: UUID
     let total: Double
     let baseURL: String
     let token: String
+    let posSessionToken: String
     let isSubmitting: Bool
     let accentColor: Color
+    let toppingCategoryOrder: [String]
     let productImageURL: (POSProduct) -> URL?
+    let onIncrement: (POSCartLine) -> Void
+    let onDecrement: (POSCartLine) -> Void
+    let onRemove: (POSCartLine) -> Void
+    let onClearCart: () -> Void
+    let onNewTicket: () -> Void
+    let onSwitchTicket: (POSDraftTicket) -> Void
     let defaultPrintReceipt: (POSOrderSource) -> Bool
-    let submit: (POSPaymentMethod, POSOrderSource, String, POSCustomer?, Double, String, Bool) async -> Bool
+    let onMarketplacePriceChange: (POSCartLine, Double?) -> Void
+    let onToppingsChange: (POSCartLine, [POSTopping]) -> Void
+    let submit: (POSPaymentMethod, POSOrderSource, String, POSCustomer?, Double, String, Double, Bool) async -> Bool
     @Environment(\.dismiss) private var dismiss
     @State private var paymentMethod: POSPaymentMethod = .cash
     @State private var orderSource: POSOrderSource = .inStore
     @State private var externalReference = ""
     @State private var discountPercent = ""
+    @State private var cashReceived = ""
     @State private var notes = ""
     @State private var selectedCustomer: POSCustomer?
     @State private var shouldPrintReceipt = true
@@ -4682,6 +8462,15 @@ private struct POSCheckoutSheet: View {
     @State private var newCustomerName = ""
     @State private var newCustomerPhone = ""
     @State private var newCustomerEmail = ""
+    @State private var pendingCartReset: POSCartResetAction?
+    @State private var editingToppingsLine: POSCartLine?
+    @State private var isToppingLinePickerOpen = false
+    @State private var customerSearchTask: Task<Void, Never>?
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    private var isCompact: Bool {
+        horizontalSizeClass == .compact
+    }
 
     private var parsedDiscountPercent: Double {
         let normalized = discountPercent
@@ -4692,11 +8481,40 @@ private struct POSCheckoutSheet: View {
     }
 
     private var discountAmount: Double {
-        total * parsedDiscountPercent / 100
+        checkoutSubtotal * parsedDiscountPercent / 100
+    }
+
+    private var isMarketplaceOrder: Bool {
+        orderSource.isMarketplace
+    }
+
+    private var checkoutSubtotal: Double {
+        lines.reduce(0) { $0 + $1.lineTotal(for: orderSource) }
+    }
+
+    private var editableToppingLines: [POSCartLine] {
+        lines.filter { !$0.product.toppings.isEmpty }
+    }
+
+    private var grossTotal: Double {
+        max(0, checkoutSubtotal - discountAmount)
+    }
+
+    private var marketplaceDeduction: Double {
+        isMarketplaceOrder ? POSMarketplaceFees.deductionAmount(grossTotal) : 0
     }
 
     private var finalTotal: Double {
-        max(0, total - discountAmount)
+        isMarketplaceOrder ? POSMarketplaceFees.actualReceived(grossTotal) : grossTotal
+    }
+
+    private var parsedCashReceived: Double? {
+        POSMoneyParser.value(cashReceived)
+    }
+
+    private var cashChange: Double? {
+        guard paymentMethod == .cash, let parsedCashReceived else { return nil }
+        return parsedCashReceived - finalTotal
     }
 
     var body: some View {
@@ -4704,38 +8522,35 @@ private struct POSCheckoutSheet: View {
             VStack(spacing: 0) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        recapSection
-                        customerSection
                         sourceSelector
-                        printReceiptSection
 
                         if orderSource != .inStore {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("order reference")
-                                    .font(GlacialFont.caption(.bold))
-                                    .tracking(1.5)
-                                    .foregroundStyle(AppPalette.muted)
-                                TextField("Grab / Shopee code", text: $externalReference)
-                                    .font(GlacialFont.subheadline())
-                                    .textInputAutocapitalization(.characters)
-                                    .padding(12)
-                                    .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
-                            }
+                            marketplaceReferenceSection
                         }
 
+                        ticketSwitcher
+                        recapSection
+                        customerSection
+                        printReceiptSection
+
                         paymentSelector
+                        cashBackSection
                         discountSection
                         notesSection
                     }
                     .padding(20)
                 }
+                .scrollDismissesKeyboard(.interactively)
 
                 VStack(spacing: 12) {
                     Divider()
                     VStack(spacing: 6) {
-                        POSCheckoutTotalRow(title: "subtotal", value: total)
+                        POSCheckoutTotalRow(title: isMarketplaceOrder ? "marketplace gross" : "subtotal", value: checkoutSubtotal)
                         if parsedDiscountPercent > 0 {
                             POSCheckoutTotalRow(title: "discount \(String(format: "%.1f", parsedDiscountPercent))%", value: -discountAmount, tint: accentColor)
+                        }
+                        if isMarketplaceOrder {
+                            POSCheckoutTotalRow(title: "grab/shopee deduction", value: -marketplaceDeduction, tint: AppPalette.red)
                         }
                         HStack(alignment: .firstTextBaseline) {
                             Text("TOTAL")
@@ -4751,13 +8566,15 @@ private struct POSCheckoutSheet: View {
 
                     Button {
                         Task {
+                            let attachedCustomer = checkoutCustomerForSubmission
                             let didSubmit = await submit(
                                 paymentMethod,
                                 orderSource,
                                 externalReference,
-                                selectedCustomer,
+                                attachedCustomer,
                                 parsedDiscountPercent,
                                 notes,
+                                finalTotal,
                                 shouldPrintReceipt
                             )
                             if didSubmit {
@@ -4765,19 +8582,13 @@ private struct POSCheckoutSheet: View {
                             }
                         }
                     } label: {
-                        HStack {
-                            if isSubmitting {
-                                ProgressView()
-                                    .tint(.white)
-                            }
-                            Text(isSubmitting ? "COMPLETING" : "COMPLETE")
-                                .font(GlacialFont.caption(.bold))
-                                .tracking(2.2)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 15)
-                        .foregroundStyle(.white)
-                        .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
+                        POSRectActionLabel(
+                            title: isSubmitting ? "COMPLETING" : "COMPLETE",
+                            tint: accentColor,
+                            isPrimary: true,
+                            isLoading: isSubmitting,
+                            fillsWidth: true
+                        )
                     }
                     .buttonStyle(.plain)
                     .disabled(isSubmitting)
@@ -4789,17 +8600,54 @@ private struct POSCheckoutSheet: View {
             .background(AppPalette.background.ignoresSafeArea())
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Close") {
-                        dismiss()
+            .safeAreaInset(edge: .top, spacing: 0) {
+                checkoutTopBar
+            }
+            .confirmationDialog(
+                pendingCartReset?.title ?? "",
+                isPresented: Binding(
+                    get: { pendingCartReset != nil },
+                    set: { if !$0 { pendingCartReset = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                if let pendingCartReset {
+                    Button(pendingCartReset.confirmTitle, role: pendingCartReset.role) {
+                        pendingCartReset.perform(
+                            clearCart: onClearCart,
+                            newTicket: onNewTicket
+                        )
+                        self.pendingCartReset = nil
+                        if pendingCartReset.shouldDismiss {
+                            dismiss()
+                        }
                     }
-                    .foregroundStyle(AppPalette.ink)
                 }
+                Button("KEEP CART", role: .cancel) {
+                    pendingCartReset = nil
+                }
+            } message: {
+                Text(pendingCartReset?.message ?? "")
+            }
+            .confirmationDialog(
+                "Edit toppings",
+                isPresented: $isToppingLinePickerOpen,
+                titleVisibility: .visible
+            ) {
+                ForEach(editableToppingLines) { line in
+                    Button(line.product.name) {
+                        editingToppingsLine = line
+                    }
+                }
+
+                Button("CANCEL", role: .cancel) {}
+            } message: {
+                Text("Choose the item to customize.")
             }
             .onChange(of: orderSource) { _, newSource in
                 if newSource != .inStore {
                     paymentMethod = .bank
+                    cashReceived = ""
                 } else {
                     paymentMethod = .cash
                 }
@@ -4809,17 +8657,170 @@ private struct POSCheckoutSheet: View {
             .onAppear {
                 shouldPrintReceipt = defaultPrintReceipt(orderSource)
             }
+            .sheet(item: $editingToppingsLine) { line in
+                POSProductSheet(
+                    product: line.product,
+                    imageURL: productImageURL(line.product),
+                    toppingCategoryOrder: toppingCategoryOrder,
+                    accentColor: accentColor,
+                    initialToppings: line.toppings,
+                    actionTitle: "UPDATE CART"
+                ) { toppings in
+                    onToppingsChange(line, toppings)
+                    editingToppingsLine = nil
+                }
+                .emberSheetChrome()
+            }
+        }
+    }
+
+    private func openToppingEditor() {
+        let editableLines = editableToppingLines
+
+        if editableLines.count == 1 {
+            editingToppingsLine = editableLines[0]
+        } else if editableLines.count > 1 {
+            isToppingLinePickerOpen = true
+        }
+    }
+
+    private var checkoutCustomerForSubmission: POSCustomer? {
+        if let selectedCustomer {
+            return selectedCustomer
+        }
+
+        let normalizedSearch = customerSearch.normalizedCustomerSearchValue
+        guard !normalizedSearch.isEmpty else { return nil }
+
+        return customerResults.first { customer in
+            customer.name.normalizedCustomerSearchValue == normalizedSearch
+                || customer.phone?.normalizedCustomerSearchValue == normalizedSearch
+                || customer.email?.normalizedCustomerSearchValue == normalizedSearch
+        }
+    }
+
+    private var checkoutTopBar: some View {
+        HStack(spacing: 8) {
+            Spacer()
+
+            POSCheckoutTopAction(title: "NEW TICKET", tint: AppPalette.ink) {
+                onNewTicket()
+                dismiss()
+            }
+            .disabled(isSubmitting)
+            .opacity(isSubmitting ? 0.38 : 1)
+
+            if isCompact {
+                POSCloseIconButton {
+                    dismiss()
+                }
+            } else {
+                POSCheckoutTopAction(title: "CLOSE", tint: AppPalette.ink) {
+                    dismiss()
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
+        .background(AppPalette.background)
+    }
+
+    private var ticketSwitcher: some View {
+        Group {
+            if tickets.count > 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 9) {
+                        ForEach(tickets) { ticket in
+                            Button {
+                                onSwitchTicket(ticket)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(ticket.title)
+                                        .font(GlacialFont.caption(.bold))
+                                        .tracking(1.5)
+                                    Text("\(ticket.itemCount) \(ticket.itemCount == 1 ? "ITEM" : "ITEMS")")
+                                        .font(GlacialFont.caption2(.bold))
+                                        .tracking(1.1)
+                                        .opacity(0.72)
+                                }
+                                .foregroundStyle(ticket.id == activeTicketID ? .white : AppPalette.ink)
+                                .padding(.horizontal, 13)
+                                .padding(.vertical, 10)
+                                .background(ticket.id == activeTicketID ? accentColor : .white, in: RoundedRectangle(cornerRadius: 8))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(ticket.id == activeTicketID ? accentColor.opacity(0.18) : AppPalette.line.opacity(0.82), lineWidth: 1)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 1)
+                }
+            }
         }
     }
 
     private var recapSection: some View {
         POSCheckoutChoiceGroup(title: "order recap") {
+            HStack(spacing: 12) {
+                Button {
+                    openToppingEditor()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 11, weight: .bold))
+                        Text("EDIT TOPPINGS")
+                    }
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(1.2)
+                    .foregroundStyle(accentColor)
+                }
+                .buttonStyle(.plain)
+                .disabled(editableToppingLines.isEmpty || isSubmitting)
+                .opacity(editableToppingLines.isEmpty || isSubmitting ? 0.34 : 1)
+
+                Button {
+                    pendingCartReset = .clearCart
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11, weight: .bold))
+                        Text("CLEAR CART")
+                    }
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(1.2)
+                    .foregroundStyle(AppPalette.red)
+                }
+                .buttonStyle(.plain)
+                .disabled(lines.isEmpty || isSubmitting)
+            }
+        } content: {
             VStack(spacing: 0) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("\(lines.reduce(0) { $0 + $1.quantity }) \(lines.reduce(0) { $0 + $1.quantity } == 1 ? "ITEM" : "ITEMS")")
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.7)
+                        .foregroundStyle(AppPalette.muted)
+
+                    Spacer()
+                }
+                .padding(.bottom, lines.isEmpty ? 0 : 12)
+
                 ForEach(Array(lines.enumerated()), id: \.element.id) { index, line in
                     POSCheckoutRecapLine(
                         index: index + 1,
                         line: line,
-                        imageURL: productImageURL(line.product)
+                        imageURL: productImageURL(line.product),
+                        accentColor: accentColor,
+                        onIncrement: { onIncrement(line) },
+                        onDecrement: { decrement(line) },
+                        onRemove: { remove(line) },
+                        orderSource: orderSource,
+                        onMarketplacePriceChange: { price in
+                            onMarketplacePriceChange(line, price)
+                        }
                     )
 
                     if index < lines.count - 1 {
@@ -4832,6 +8833,20 @@ private struct POSCheckoutSheet: View {
         }
     }
 
+    private func decrement(_ line: POSCartLine) {
+        onDecrement(line)
+        if line.quantity <= 1 && lines.count <= 1 {
+            dismiss()
+        }
+    }
+
+    private func remove(_ line: POSCartLine) {
+        onRemove(line)
+        if lines.count <= 1 {
+            dismiss()
+        }
+    }
+
     private var sourceSelector: some View {
         POSCheckoutChoiceGroup(title: "order source") {
             HStack(spacing: 10) {
@@ -4840,6 +8855,28 @@ private struct POSCheckoutSheet: View {
                 sourcePill(.shopeefood)
             }
         }
+    }
+
+    private var marketplaceReferenceSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("order reference")
+                .font(GlacialFont.caption(.bold))
+                .tracking(1.5)
+                .foregroundStyle(AppPalette.muted)
+            TextField("Grab / Shopee code", text: $externalReference)
+                .font(GlacialFont.subheadline())
+                .foregroundStyle(AppPalette.ink)
+                .foregroundColor(AppPalette.ink)
+                .tint(accentColor)
+                .textInputAutocapitalization(.characters)
+                .padding(12)
+                .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                )
+        }
+        .transition(.move(edge: .top).combined(with: .opacity))
     }
 
     private var printReceiptSection: some View {
@@ -4855,7 +8892,7 @@ private struct POSCheckoutSheet: View {
                         .fill(shouldPrintReceipt ? accentColor.opacity(0.14) : AppPalette.card)
                         .frame(width: 42, height: 42)
 
-                    Image(systemName: shouldPrintReceipt ? "printer.fill" : "printer.slash")
+                    Image(systemName: shouldPrintReceipt ? "printer.fill" : "printer")
                         .font(.headline.weight(.semibold))
                         .foregroundStyle(shouldPrintReceipt ? accentColor : AppPalette.muted)
                 }
@@ -4911,6 +8948,42 @@ private struct POSCheckoutSheet: View {
         }
     }
 
+    @ViewBuilder
+    private var cashBackSection: some View {
+        if paymentMethod == .cash {
+            POSCheckoutChoiceGroup(title: "cash back") {
+                VStack(alignment: .leading, spacing: 12) {
+                    POSMoneyField(title: "cash received", placeholder: "\(Int(finalTotal).formatted())", text: $cashReceived)
+
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(cashChangeText.title)
+                            .font(GlacialFont.caption(.bold))
+                            .tracking(1.7)
+                            .foregroundStyle(AppPalette.muted)
+                        Spacer()
+                        Text(cashChangeText.value)
+                            .font(GlacialFont.title3(.semibold))
+                            .foregroundStyle(cashChangeText.color)
+                    }
+                    .padding(14)
+                    .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
+    }
+
+    private var cashChangeText: (title: String, value: String, color: Color) {
+        guard let cashChange else {
+            return ("CHANGE", "ENTER CASH", AppPalette.muted)
+        }
+
+        if cashChange >= 0 {
+            return ("CHANGE", "\(Int(cashChange).formatted()) VND", accentColor)
+        }
+
+        return ("REMAINING", "\(Int(abs(cashChange)).formatted()) VND", AppPalette.red)
+    }
+
     private var customerSection: some View {
         POSCheckoutChoiceGroup(title: "customer info") {
             VStack(alignment: .leading, spacing: 12) {
@@ -4923,10 +8996,11 @@ private struct POSCheckoutSheet: View {
                             Text(selectedCustomer.detailLine)
                                 .font(GlacialFont.caption())
                                 .foregroundStyle(AppPalette.muted)
+                            POSLoyaltyStarsView(customer: selectedCustomer, accentColor: accentColor)
                         }
                         Spacer()
                         Button("clear") {
-                            self.selectedCustomer = nil
+                            clearSelectedCustomer()
                         }
                         .font(GlacialFont.caption(.bold))
                         .foregroundStyle(accentColor)
@@ -4938,15 +9012,25 @@ private struct POSCheckoutSheet: View {
                 HStack(spacing: 8) {
                     TextField("name, phone number, email", text: $customerSearch)
                         .font(GlacialFont.subheadline())
+                        .foregroundStyle(AppPalette.ink)
+                        .foregroundColor(AppPalette.ink)
+                        .tint(accentColor)
                         .textInputAutocapitalization(.words)
                         .padding(12)
-                        .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                        .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                        )
                         .onSubmit {
-                            Task { await searchCustomers() }
+                            Task { await searchCustomers(showEmptyMessage: true) }
+                        }
+                        .onChange(of: customerSearch) { _, newValue in
+                            scheduleCustomerSuggestions(for: newValue)
                         }
 
                     Button {
-                        Task { await searchCustomers() }
+                        Task { await searchCustomers(showEmptyMessage: true) }
                     } label: {
                         if isSearchingCustomer {
                             ProgressView()
@@ -4973,9 +9057,7 @@ private struct POSCheckoutSheet: View {
                     VStack(spacing: 8) {
                         ForEach(customerResults) { customer in
                             POSCustomerResultRow(customer: customer, accentColor: accentColor) {
-                                selectedCustomer = customer
-                                customerResults = []
-                                customerSearch = customer.name
+                                attachCustomer(customer)
                             }
                         }
                     }
@@ -5002,10 +9084,19 @@ private struct POSCheckoutSheet: View {
                 if isCreateCustomerOpen {
                     VStack(spacing: 8) {
                         TextField("name", text: $newCustomerName)
+                            .foregroundStyle(AppPalette.ink)
+                            .foregroundColor(AppPalette.ink)
+                            .tint(accentColor)
                             .textInputAutocapitalization(.words)
                         TextField("phone number", text: $newCustomerPhone)
+                            .foregroundStyle(AppPalette.ink)
+                            .foregroundColor(AppPalette.ink)
+                            .tint(accentColor)
                             .keyboardType(.phonePad)
                         TextField("email optional", text: $newCustomerEmail)
+                            .foregroundStyle(AppPalette.ink)
+                            .foregroundColor(AppPalette.ink)
+                            .tint(accentColor)
                             .keyboardType(.emailAddress)
                             .textInputAutocapitalization(.never)
                         Button {
@@ -5043,9 +9134,16 @@ private struct POSCheckoutSheet: View {
             HStack(spacing: 10) {
                 TextField("0", text: $discountPercent)
                     .font(GlacialFont.subheadline(.semibold))
+                    .foregroundStyle(AppPalette.ink)
+                    .foregroundColor(AppPalette.ink)
+                    .tint(accentColor)
                     .keyboardType(.decimalPad)
                     .padding(12)
-                    .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                    .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                    )
                 Text("%")
                     .font(GlacialFont.subheadline(.semibold))
                     .foregroundStyle(AppPalette.muted)
@@ -5057,15 +9155,24 @@ private struct POSCheckoutSheet: View {
         POSCheckoutChoiceGroup(title: "order notes") {
             TextField("Optional order note", text: $notes, axis: .vertical)
                 .font(GlacialFont.subheadline())
+                .foregroundStyle(AppPalette.ink)
+                .foregroundColor(AppPalette.ink)
+                .tint(accentColor)
                 .lineLimit(2...4)
                 .padding(12)
-                .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                )
         }
     }
 
     private func sourcePill(_ source: POSOrderSource) -> some View {
         POSCheckoutPill(title: source.label, isSelected: orderSource == source, accentColor: accentColor) {
-            orderSource = source
+            withAnimation(.smooth(duration: 0.24)) {
+                orderSource = source
+            }
         }
     }
 
@@ -5076,16 +9183,23 @@ private struct POSCheckoutSheet: View {
     }
 
     @MainActor
-    private func searchCustomers() async {
+    private func searchCustomers(showEmptyMessage: Bool = false) async {
         guard !isSearchingCustomer else { return }
+        let query = customerSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard query.count >= 2 else {
+            customerResults = []
+            customerError = nil
+            return
+        }
 
         isSearchingCustomer = true
         customerError = nil
 
         do {
-            let response = try await KitchenAPIClient(baseURL: baseURL, token: token).searchPOSCustomers(search: customerSearch)
+            let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: posSessionToken).searchPOSCustomers(search: query)
             customerResults = response.customers
-            if response.customers.isEmpty {
+            if response.customers.isEmpty && showEmptyMessage {
                 customerError = "No customer found."
             }
         } catch {
@@ -5093,6 +9207,44 @@ private struct POSCheckoutSheet: View {
         }
 
         isSearchingCustomer = false
+    }
+
+    private func scheduleCustomerSuggestions(for value: String) {
+        customerSearchTask?.cancel()
+
+        if let selectedCustomer, value == selectedCustomer.name {
+            return
+        }
+
+        let query = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.count >= 2 else {
+            customerResults = []
+            customerError = nil
+            return
+        }
+
+        customerSearchTask = Task {
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            guard !Task.isCancelled else { return }
+            await searchCustomers(showEmptyMessage: false)
+        }
+    }
+
+    private func attachCustomer(_ customer: POSCustomer) {
+        customerSearchTask?.cancel()
+        selectedCustomer = customer
+        customerResults = []
+        customerSearch = customer.name
+        customerError = nil
+        Haptics.selectionChanged()
+    }
+
+    private func clearSelectedCustomer() {
+        customerSearchTask?.cancel()
+        selectedCustomer = nil
+        customerSearch = ""
+        customerResults = []
+        customerError = nil
     }
 
     @MainActor
@@ -5109,16 +9261,14 @@ private struct POSCheckoutSheet: View {
         customerError = nil
 
         do {
-            let response = try await KitchenAPIClient(baseURL: baseURL, token: token).createPOSCustomer(
+            let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: posSessionToken).createPOSCustomer(
                 POSCreateCustomerRequest(
                     name: name,
                     phone: newCustomerPhone.trimmingCharacters(in: .whitespacesAndNewlines).emptyAsNil,
                     email: newCustomerEmail.trimmingCharacters(in: .whitespacesAndNewlines).emptyAsNil
                 )
             )
-            selectedCustomer = response.customer
-            customerSearch = response.customer.name
-            customerResults = []
+            attachCustomer(response.customer)
             newCustomerName = ""
             newCustomerPhone = ""
             newCustomerEmail = ""
@@ -5130,6 +9280,111 @@ private struct POSCheckoutSheet: View {
         }
 
         isCreatingCustomer = false
+    }
+}
+
+private enum POSCartResetAction: Identifiable {
+    case clearCart
+
+    var id: String {
+        switch self {
+        case .clearCart:
+            return "clear-cart"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .clearCart:
+            return "Clear cart?"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .clearCart:
+            return "This removes every item from the current checkout."
+        }
+    }
+
+    var confirmTitle: String {
+        switch self {
+        case .clearCart:
+            return "CLEAR CART"
+        }
+    }
+
+    var role: ButtonRole? {
+        switch self {
+        case .clearCart:
+            return .destructive
+        }
+    }
+
+    var shouldDismiss: Bool {
+        switch self {
+        case .clearCart:
+            return true
+        }
+    }
+
+    func perform(clearCart: () -> Void, newTicket: () -> Void) {
+        switch self {
+        case .clearCart:
+            clearCart()
+        }
+    }
+}
+
+private struct POSCheckoutTopAction: View {
+    let title: String
+    let tint: Color
+    var isPrimary = false
+    let action: () -> Void
+
+    var body: some View {
+        POSRectActionLabel(
+            title: title,
+            tint: tint,
+            isPrimary: isPrimary,
+            minWidth: title.count > 6 ? 108 : 76
+        )
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+            .onTapGesture(perform: action)
+            .accessibilityAddTraits(.isButton)
+    }
+}
+
+private struct POSRectActionLabel: View {
+    let title: String
+    let tint: Color
+    var isPrimary = true
+    var isLoading = false
+    var minWidth: CGFloat? = nil
+    var fillsWidth = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if isLoading {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(isPrimary ? .white : tint)
+            }
+
+            Text(title)
+                .font(GlacialFont.caption(.bold))
+                .tracking(2)
+        }
+        .foregroundStyle(isPrimary ? .white : tint)
+        .frame(minWidth: minWidth)
+        .frame(maxWidth: fillsWidth ? .infinity : nil)
+        .padding(.vertical, 13)
+        .padding(.horizontal, fillsWidth ? 18 : 14)
+        .background(isPrimary ? tint : .white, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(isPrimary ? tint.opacity(0.12) : AppPalette.line.opacity(0.82), lineWidth: 1)
+        )
     }
 }
 
@@ -5150,6 +9405,7 @@ private struct POSCustomerResultRow: View {
                     Text(customer.detailLine)
                         .font(GlacialFont.caption())
                         .foregroundStyle(AppPalette.muted)
+                    POSLoyaltyStarsView(customer: customer, accentColor: accentColor)
                 }
                 Spacer()
                 Text("Level \(customer.level)")
@@ -5160,6 +9416,29 @@ private struct POSCustomerResultRow: View {
             .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct POSLoyaltyStarsView: View {
+    let customer: POSCustomer
+    let accentColor: Color
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(0..<customer.loyaltyTarget, id: \.self) { index in
+                Image(systemName: index < customer.loyaltyStamps ? "star.fill" : "star")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(index < customer.loyaltyStamps ? accentColor : AppPalette.muted.opacity(0.42))
+            }
+
+            if customer.rewardCount > 0 {
+                Text("\(customer.rewardCount) reward\(customer.rewardCount == 1 ? "" : "s")")
+                    .font(GlacialFont.caption2(.bold))
+                    .foregroundStyle(accentColor)
+                    .padding(.leading, 4)
+            }
+        }
+        .accessibilityLabel("\(customer.loyaltyStamps) of \(customer.loyaltyTarget) stamps")
     }
 }
 
@@ -5184,14 +9463,33 @@ private struct POSCheckoutTotalRow: View {
 
 private struct POSCheckoutChoiceGroup<Content: View>: View {
     let title: String
+    let trailing: AnyView?
     @ViewBuilder let content: Content
+
+    init(title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.trailing = nil
+        self.content = content()
+    }
+
+    init<Trailing: View>(title: String, @ViewBuilder trailing: () -> Trailing, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.trailing = AnyView(trailing())
+        self.content = content()
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title.uppercased())
-                .font(GlacialFont.caption(.bold))
-                .tracking(1.8)
-                .foregroundStyle(AppPalette.muted)
+            HStack(alignment: .firstTextBaseline) {
+                Text(title.uppercased())
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(1.8)
+                    .foregroundStyle(AppPalette.muted)
+
+                Spacer()
+
+                trailing
+            }
             content
         }
         .padding(14)
@@ -5212,14 +9510,26 @@ private struct POSCheckoutPill: View {
 
     var body: some View {
         Button(action: action) {
-            Text(title.uppercased())
-                .font(GlacialFont.caption(.bold))
-                .tracking(1.1)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .frame(maxWidth: .infinity)
-                .foregroundStyle(isSelected ? .white : AppPalette.ink)
-                .background(isSelected ? accentColor : AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(AppPalette.card)
+
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(accentColor)
+                    .scaleEffect(isSelected ? 1 : 0.82, anchor: .center)
+                    .opacity(isSelected ? 1 : 0)
+
+                Text(title.uppercased())
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(1.1)
+                    .foregroundStyle(isSelected ? .white : AppPalette.ink)
+                    .contentTransition(.opacity)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .frame(maxWidth: .infinity)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .animation(.smooth(duration: 0.2), value: isSelected)
         }
         .buttonStyle(.plain)
     }
@@ -5229,8 +9539,36 @@ private struct POSCheckoutRecapLine: View {
     let index: Int
     let line: POSCartLine
     let imageURL: URL?
+    let accentColor: Color
+    let onIncrement: () -> Void
+    let onDecrement: () -> Void
+    let onRemove: () -> Void
+    let orderSource: POSOrderSource
+    let onMarketplacePriceChange: (Double?) -> Void
+    @State private var dragOffset: CGFloat = 0
+    @State private var isDeleteRevealed = false
+    @State private var isHorizontalSwipeActive = false
+    @State private var marketplacePriceText = ""
+    @State private var isEditingMarketplacePrice = false
+    @FocusState private var isMarketplacePriceFocused: Bool
+
+    private let revealWidth: CGFloat = 84
+    private let deleteThreshold: CGFloat = 136
+
+    private var effectiveUnitPrice: Double {
+        line.unitPrice(for: orderSource)
+    }
+
+    private var effectiveLineTotal: Double {
+        line.lineTotal(for: orderSource)
+    }
 
     var body: some View {
+        rowContent
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var rowContent: some View {
         HStack(alignment: .top, spacing: 12) {
             POSProductImage(url: imageURL)
                 .frame(width: 58, height: 58)
@@ -5250,7 +9588,20 @@ private struct POSCheckoutRecapLine: View {
 
                     Spacer(minLength: 8)
 
-                    Text("\(Int(line.product.price * Double(line.quantity)).formatted()) VND")
+                    Button(action: removeLine) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(AppPalette.muted)
+                            .frame(width: 28, height: 28)
+                            .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+
+                    Text("\(Int(effectiveLineTotal).formatted()) VND")
                         .font(GlacialFont.subheadline(.semibold))
                         .foregroundStyle(AppPalette.ink)
                         .lineLimit(1)
@@ -5258,16 +9609,14 @@ private struct POSCheckoutRecapLine: View {
                 }
 
                 if line.quantity > 1 {
-                    Text("quantity \(line.quantity)")
-                        .font(GlacialFont.caption(.bold))
-                        .foregroundStyle(AppPalette.orange)
+                    Text("\(line.quantity) x \(line.product.name)")
+                        .font(GlacialFont.caption())
+                        .foregroundStyle(AppPalette.ink.opacity(0.72))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
                 }
 
-                if line.toppings.isEmpty {
-                    Text("no toppings")
-                        .font(GlacialFont.caption())
-                        .foregroundStyle(AppPalette.muted)
-                } else {
+                if !line.toppings.isEmpty {
                     VStack(spacing: 5) {
                         ForEach(line.toppings) { topping in
                             HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -5287,68 +9636,170 @@ private struct POSCheckoutRecapLine: View {
                         }
                     }
                 }
+
+                if orderSource.isMarketplace {
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text("Marketplace unit")
+                            .font(GlacialFont.caption(.medium))
+                            .foregroundStyle(AppPalette.muted)
+
+                        Spacer(minLength: 12)
+
+                        TextField("\(Int(effectiveUnitPrice).formatted())", text: $marketplacePriceText)
+                            .font(GlacialFont.subheadline(.semibold))
+                            .foregroundStyle(AppPalette.ink)
+                            .foregroundColor(AppPalette.ink)
+                            .tint(accentColor)
+                            .multilineTextAlignment(.trailing)
+                            .keyboardType(.numberPad)
+                            .submitLabel(.done)
+                            .focused($isMarketplacePriceFocused)
+                            .frame(width: 92)
+                            .padding(.bottom, 2)
+                            .overlay(alignment: .bottom) {
+                                Rectangle()
+                                    .fill(isMarketplacePriceFocused ? accentColor.opacity(0.72) : AppPalette.line.opacity(0.55))
+                                    .frame(height: isMarketplacePriceFocused ? 1.2 : 0.7)
+                            }
+                            .onTapGesture {
+                                beginMarketplacePriceEdit()
+                            }
+                            .onSubmit {
+                                commitMarketplacePriceEdit()
+                            }
+                            .onChange(of: marketplacePriceText) { _, newValue in
+                                let formatted = POSMoneyParser.formattedInput(newValue)
+                                if formatted != newValue {
+                                    marketplacePriceText = formatted
+                                    updateMarketplacePriceIfPossible(formatted)
+                                } else {
+                                    updateMarketplacePriceIfPossible(newValue)
+                                }
+                            }
+                            .onChange(of: isMarketplacePriceFocused) { _, isFocused in
+                                if isFocused {
+                                    beginMarketplacePriceEdit()
+                                } else {
+                                    commitMarketplacePriceEdit()
+                                }
+                            }
+
+                        Text("VND")
+                            .font(GlacialFont.caption(.semibold))
+                            .foregroundStyle(AppPalette.muted)
+                    }
+                    .padding(.top, 2)
+                    .onAppear {
+                        syncMarketplacePriceText()
+                    }
+                    .onChange(of: line.adjustedUnitPrice) { _, _ in
+                        syncMarketplacePriceText()
+                    }
+                    .onChange(of: orderSource) { _, _ in
+                        syncMarketplacePriceText()
+                    }
+                    .transition(
+                        .asymmetric(
+                            insertion: .move(edge: .top).combined(with: .opacity),
+                            removal: .opacity
+                        )
+                    )
+                }
+
+                HStack(spacing: 13) {
+                    Button(action: onDecrement) {
+                        Image(systemName: "minus")
+                            .font(.system(size: 11, weight: .bold))
+                    }
+
+                    Text("\(line.quantity)")
+                        .font(GlacialFont.caption(.bold))
+                        .frame(minWidth: 18)
+                        .foregroundStyle(AppPalette.ink)
+
+                    Button(action: onIncrement) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 11, weight: .bold))
+                    }
+
+                    Spacer()
+                }
+                .foregroundStyle(accentColor)
+                .buttonStyle(.plain)
+                .padding(.top, 2)
             }
         }
+        .padding(.vertical, 2)
+        .padding(.trailing, 12)
+        .background(.white)
+        .animation(.smooth(duration: 0.24), value: orderSource.isMarketplace)
+    }
+
+    private func settleSwipe(revealed: Bool) {
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+            isDeleteRevealed = revealed
+            dragOffset = revealed ? -revealWidth : 0
+        }
+    }
+
+    private func removeLine() {
+        withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+            isDeleteRevealed = false
+            isHorizontalSwipeActive = false
+            dragOffset = 0
+        }
+        Haptics.impact(.medium)
+        onRemove()
+    }
+
+    private func beginMarketplacePriceEdit() {
+        guard !isEditingMarketplacePrice else { return }
+        isEditingMarketplacePrice = true
+        marketplacePriceText = ""
+    }
+
+    private func commitMarketplacePriceEdit() {
+        guard isEditingMarketplacePrice else { return }
+        isEditingMarketplacePrice = false
+
+        guard let price = POSMoneyParser.value(marketplacePriceText) else {
+            syncMarketplacePriceText()
+            return
+        }
+
+        marketplacePriceText = Int(price).formatted()
+        onMarketplacePriceChange(price)
+    }
+
+    private func updateMarketplacePriceIfPossible(_ text: String) {
+        guard isEditingMarketplacePrice,
+              let price = POSMoneyParser.value(text) else {
+            return
+        }
+
+        onMarketplacePriceChange(price)
+    }
+
+    private func syncMarketplacePriceText() {
+        guard !isEditingMarketplacePrice else { return }
+        marketplacePriceText = Int(effectiveUnitPrice).formatted()
     }
 }
 
 private struct OrderCard: View {
     let order: KitchenOrder
+    let onlineDetails: KitchenOnlineOrder?
     let onSelect: () -> Void
     let onStatus: (KitchenStatus) -> Void
-    @State private var dragOffset: CGFloat = 0
-    @State private var isCancelRevealed = false
-
-    private let revealWidth: CGFloat = 92
 
     var body: some View {
-        ZStack(alignment: .trailing) {
-            if order.canCancel {
-                Button {
-                    resetSwipe()
-                    onStatus(.cancelled)
-                } label: {
-                    VStack(spacing: 6) {
-                        Image(systemName: "trash")
-                            .font(.title3.weight(.semibold))
-                        Text("Cancel")
-                            .font(GlacialFont.caption2(.bold))
-                    }
-                    .foregroundStyle(.white)
-                    .frame(width: revealWidth)
-                    .frame(maxHeight: .infinity)
-                }
-                .buttonStyle(.plain)
-                .background(AppPalette.red, in: RoundedRectangle(cornerRadius: 8))
-            }
-
-            cardContent
-                .offset(x: dragOffset)
-                .gesture(
-                    DragGesture(minimumDistance: 12)
-                        .onChanged { value in
-                            guard order.canCancel else { return }
-                            let baseOffset = isCancelRevealed ? -revealWidth : 0
-                            dragOffset = min(0, max(-revealWidth, baseOffset + value.translation.width))
-                        }
-                        .onEnded { value in
-                            guard order.canCancel else { return }
-                            let shouldReveal = dragOffset < -42 || value.predictedEndTranslation.width < -revealWidth
-
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                                isCancelRevealed = shouldReveal
-                                dragOffset = shouldReveal ? -revealWidth : 0
-                            }
-                        }
-                )
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        cardContent
+            .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private var cardContent: some View {
         VStack(alignment: .leading, spacing: 14) {
             Button {
-                resetSwipe()
                 onSelect()
             } label: {
                 VStack(alignment: .leading, spacing: 12) {
@@ -5413,6 +9864,11 @@ private struct OrderCard: View {
             StatusBadge(status: order.status)
                 .fixedSize()
 
+            if let onlineDetails {
+                FulfillmentBadge(text: onlineDetails.typeText, icon: onlineDetails.fulfillmentIcon, tint: AppPalette.blue)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack(spacing: 10) {
             Label(order.source.rawValue, systemImage: order.source.icon)
             Label(order.elapsedText, systemImage: "clock")
@@ -5436,7 +9892,6 @@ private struct OrderCard: View {
 
     private func statusButton(_ status: KitchenStatus) -> some View {
         Button {
-            resetSwipe()
             onStatus(status)
         } label: {
             Text(status.actionLabel)
@@ -5447,13 +9902,6 @@ private struct OrderCard: View {
         .buttonStyle(.plain)
         .foregroundStyle(status == .completed ? .white : AppPalette.ink)
         .background(status == .completed ? AppPalette.ink : status.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-    }
-
-    private func resetSwipe() {
-        withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
-            isCancelRevealed = false
-            dragOffset = 0
-        }
     }
 }
 
@@ -5475,25 +9923,475 @@ private struct ItemPreviewLine: View {
     }
 }
 
+private struct OnlineOrderDetailView: View {
+    let order: KitchenOnlineOrder
+    let accentColor: Color
+    let onAccept: () -> Void
+    let onMarkPaid: () -> Void
+    let onSendToKitchen: () -> Void
+    let onDecline: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    DetailHeroHeader(
+                        eyebrow: order.typeText,
+                        title: order.orderNumber,
+                        subtitle: order.customerDisplay,
+                        icon: order.fulfillmentIcon
+                    )
+
+                    OnlineOrderSummary(order: order, accentColor: accentColor)
+
+                    OnlineOrderItemsDetail(items: order.items, accentColor: accentColor)
+
+                    if let notes = order.notes, !notes.isEmpty {
+                        DetailNoteCard(title: "Order Notes", text: notes)
+                    }
+
+                    if order.status == .submitted {
+                        HStack(spacing: 10) {
+                            Button(action: onDecline) {
+                                Text("Decline")
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 44)
+                            }
+                            .buttonStyle(.plain)
+                            .font(GlacialFont.callout(.bold))
+                            .foregroundStyle(AppPalette.ink)
+                            .background(AppPalette.muted.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+
+                            Button(action: onAccept) {
+                                Text("Accept")
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 44)
+                            }
+                            .buttonStyle(.plain)
+                            .font(GlacialFont.callout(.bold))
+                            .foregroundStyle(.white)
+                            .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
+                        }
+                    } else if order.status == .accepted {
+                        HStack(spacing: 10) {
+                            Button(action: onDecline) {
+                                Text("Cancel")
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 44)
+                            }
+                            .buttonStyle(.plain)
+                            .font(GlacialFont.callout(.bold))
+                            .foregroundStyle(AppPalette.red)
+                            .background(AppPalette.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+                            Button(action: order.canMarkPaid ? onMarkPaid : onSendToKitchen) {
+                                Text(order.canMarkPaid ? "Mark Paid" : (order.canSendToKitchen ? "Send to Kitchen" : "Waiting for Payment"))
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 44)
+                            }
+                            .buttonStyle(.plain)
+                            .font(GlacialFont.callout(.bold))
+                            .foregroundStyle(.white)
+                            .background(order.canMarkPaid ? AppPalette.green : (order.canSendToKitchen ? accentColor : AppPalette.muted.opacity(0.45)), in: RoundedRectangle(cornerRadius: 8))
+                            .disabled(!order.canMarkPaid && !order.canSendToKitchen)
+                        }
+                    }
+                }
+                .padding(18)
+            }
+            .background(AppPalette.background)
+            .navigationTitle("Online Order")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
+private struct CompletedKitchenTicketDetailView: View {
+    let ticket: CompletedKitchenTicket
+    let accentColor: Color
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        HStack(alignment: .top, spacing: 12) {
+                            Image(systemName: ticket.fulfillmentIcon)
+                                .font(.headline.weight(.semibold))
+                                .foregroundStyle(accentColor)
+                                .frame(width: 40, height: 40)
+                                .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(ticket.typeText.uppercased())
+                                    .font(GlacialFont.caption2(.bold))
+                                    .tracking(2)
+                                    .foregroundStyle(accentColor)
+
+                                Text(ticket.orderNumber)
+                                    .font(GlacialFont.title3(.semibold))
+                                    .foregroundStyle(AppPalette.ink)
+                            }
+
+                            Spacer(minLength: 0)
+                        }
+
+                        DetailInfoList(rows: [
+                            DetailInfoRow(title: "DATE", value: ticket.completedDateText),
+                            DetailInfoRow(title: "TIME", value: ticket.completedTimeText),
+                            DetailInfoRow(title: "TYPE", value: ticket.typeText),
+                            DetailInfoRow(title: "PAYMENT", value: ticket.paymentText)
+                        ])
+
+                        VStack(spacing: 0) {
+                            ForEach(Array(ticket.items.enumerated()), id: \.element.id) { index, item in
+                                CompletedReceiptItemRow(item: item, accentColor: accentColor)
+
+                                if index < ticket.items.count - 1 {
+                                    SettingsDivider()
+                                }
+                            }
+                        }
+
+                        SettingsDivider()
+
+                        HStack {
+                            Text("TOTAL")
+                                .font(GlacialFont.caption(.bold))
+                                .tracking(2)
+                                .foregroundStyle(AppPalette.ink)
+
+                            Spacer()
+
+                            Text(ticket.totalText)
+                                .font(GlacialFont.title3(.semibold))
+                                .foregroundStyle(accentColor)
+                        }
+                    }
+                    .padding(16)
+                    .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                    )
+
+                    if let notes = ticket.notes, !notes.isEmpty {
+                        DetailNoteCard(title: "Order Notes", text: notes)
+                    }
+                }
+                .padding(18)
+            }
+            .background(AppPalette.background)
+            .navigationTitle("Completed")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
+private struct CompletedReceiptItemRow: View {
+    let item: CompletedKitchenTicketItem
+    let accentColor: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("\(item.quantity)x")
+                    .font(GlacialFont.caption(.bold))
+                    .foregroundStyle(accentColor)
+                    .frame(width: 30, alignment: .leading)
+
+                Text(item.productName)
+                    .font(GlacialFont.subheadline(.semibold))
+                    .foregroundStyle(AppPalette.ink)
+                    .lineLimit(2)
+
+                Spacer(minLength: 0)
+
+                Text(item.priceText)
+                    .font(GlacialFont.caption(.bold))
+                    .foregroundStyle(AppPalette.ink)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+
+            if !item.toppingText.isEmpty {
+                Text(item.toppingText)
+                    .font(GlacialFont.caption(.medium))
+                    .foregroundStyle(AppPalette.muted)
+                    .padding(.leading, 40)
+            }
+        }
+        .padding(.vertical, 10)
+    }
+}
+
+private struct OnlineOrderSummary: View {
+    let order: KitchenOnlineOrder
+    let accentColor: Color
+
+    var body: some View {
+        DetailInfoList(rows: [
+            DetailInfoRow(title: "TYPE", value: order.typeText),
+            DetailInfoRow(title: "NAME", value: order.contactName),
+            DetailInfoRow(title: "PHONE", value: order.contactPhone ?? "None"),
+            DetailInfoRow(title: order.isDelivery ? "ADDRESS" : "PICKUP", value: order.destinationText),
+            DetailInfoRow(title: "VERIFIED", value: order.isDelivery ? (order.deliveryAddressVerified ? "Yes" : "No") : "Not needed"),
+            DetailInfoRow(title: "PAYMENT", value: order.paymentSummaryText),
+            DetailInfoRow(title: "TOTAL", value: order.totalText)
+        ])
+    }
+}
+
+private struct CompletedTicketSummary: View {
+    let ticket: CompletedKitchenTicket
+    let accentColor: Color
+
+    var body: some View {
+        DetailInfoList(rows: [
+            DetailInfoRow(title: "TYPE", value: ticket.typeText),
+            DetailInfoRow(title: "NAME", value: ticket.customerName),
+            DetailInfoRow(title: "PHONE", value: ticket.customerPhone ?? "None"),
+            DetailInfoRow(title: ticket.isDelivery ? "ADDRESS" : "PICKUP", value: ticket.destinationText),
+            DetailInfoRow(title: "PAYMENT", value: ticket.paymentText),
+            DetailInfoRow(title: "COMPLETED", value: ticket.completedText),
+            DetailInfoRow(title: "TOTAL", value: ticket.totalText)
+        ])
+    }
+}
+
+private struct DetailInfoList: View {
+    let rows: [DetailInfoRow]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                DetailInfoLine(row: row)
+
+                if index < rows.count - 1 {
+                    Rectangle()
+                        .fill(AppPalette.line)
+                        .frame(height: 1)
+                        .padding(.leading, 14)
+                }
+            }
+        }
+        .background(.white, in: RoundedRectangle(cornerRadius: 4))
+    }
+}
+
+private struct DetailInfoRow {
+    let title: String
+    let value: String
+}
+
+private struct DetailInfoLine: View {
+    let row: DetailInfoRow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(row.title)
+                .font(GlacialFont.caption(.bold))
+                .tracking(1.8)
+                .foregroundStyle(AppPalette.muted)
+
+            Text(row.value)
+                .font(GlacialFont.body(.semibold))
+                .foregroundStyle(AppPalette.ink)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 13)
+    }
+}
+
+private struct DetailHeroHeader: View {
+    let eyebrow: String
+    let title: String
+    let subtitle: String
+    let icon: String
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 7) {
+                Text(eyebrow.uppercased())
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(2.1)
+                    .foregroundStyle(AppPalette.muted)
+                Text(title)
+                    .font(GlacialFont.largeTitle(.semibold))
+                    .foregroundStyle(AppPalette.ink)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.76)
+                Text(subtitle)
+                    .font(GlacialFont.title3(.medium))
+                    .foregroundStyle(AppPalette.muted)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+            }
+
+            Spacer(minLength: 12)
+
+            Image(systemName: icon)
+                .symbolVariant(.fill)
+                .font(.system(size: 42, weight: .semibold))
+                .foregroundStyle(AppPalette.ink)
+                .frame(width: 64, height: 64)
+        }
+        .padding(16)
+        .background(.white, in: RoundedRectangle(cornerRadius: 4))
+    }
+}
+
+private struct OnlineOrderItemsDetail: View {
+    let items: [KitchenOnlineOrderItem]
+    let accentColor: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Items")
+                .font(GlacialFont.headline())
+                .foregroundStyle(AppPalette.ink)
+
+            ForEach(items) { item in
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Text("\(item.quantity)x")
+                            .font(GlacialFont.headline())
+                            .foregroundStyle(accentColor)
+                            .frame(width: 44, alignment: .leading)
+
+                        Text(item.productName)
+                            .font(GlacialFont.body(.semibold))
+                            .foregroundStyle(AppPalette.ink)
+
+                        Spacer()
+                    }
+
+                    if !item.toppings.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(item.toppings) { topping in
+                                Text("+ \(topping.displayName) x \(topping.quantity)")
+                                    .font(GlacialFont.caption(.medium))
+                                    .foregroundStyle(AppPalette.muted)
+                            }
+                        }
+                        .padding(.leading, 56)
+                    }
+
+                    if let notes = item.notes, !notes.isEmpty {
+                        Text(notes)
+                            .font(GlacialFont.caption(.medium))
+                            .foregroundStyle(AppPalette.muted)
+                            .padding(.leading, 56)
+                    }
+                }
+                .padding(12)
+                .background(AppPalette.background, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(AppPalette.line, lineWidth: 1)
+                )
+            }
+        }
+    }
+}
+
+private struct CompletedTicketItemCard: View {
+    let item: CompletedKitchenTicketItem
+    let accentColor: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text("\(item.quantity)x")
+                    .font(GlacialFont.headline())
+                    .foregroundStyle(accentColor)
+                    .frame(width: 44, alignment: .leading)
+
+                Text(item.productName)
+                    .font(GlacialFont.body(.semibold))
+                    .foregroundStyle(AppPalette.ink)
+
+                Spacer()
+            }
+
+            if !item.toppings.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(item.toppings) { topping in
+                        Text("+ \(topping.name) x \(topping.quantity)")
+                            .font(GlacialFont.caption(.medium))
+                            .foregroundStyle(AppPalette.muted)
+                    }
+                }
+                .padding(.leading, 56)
+            }
+
+            if let notes = item.notes, !notes.isEmpty {
+                Text(notes)
+                    .font(GlacialFont.caption(.medium))
+                    .foregroundStyle(AppPalette.muted)
+                    .padding(.leading, 56)
+            }
+        }
+        .padding(12)
+        .background(AppPalette.background, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppPalette.line, lineWidth: 1)
+        )
+    }
+}
+
+private struct DetailNoteCard: View {
+    let title: String
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(GlacialFont.headline())
+                .foregroundStyle(AppPalette.ink)
+            Text(text)
+                .font(GlacialFont.subheadline(.medium))
+                .foregroundStyle(AppPalette.muted)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.white, in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
 private struct OrderDetailView: View {
     let order: KitchenOrder
+    let onlineDetails: KitchenOnlineOrder?
     let onStatus: (KitchenStatus) -> Void
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        StatusBadge(status: order.status)
-                        Text(order.orderNumber)
-                            .font(GlacialFont.largeTitle(.semibold))
-                            .foregroundStyle(AppPalette.ink)
-                        Text(order.customerDisplay)
-                            .font(GlacialFont.title3(.medium))
-                            .foregroundStyle(AppPalette.muted)
+                    if let onlineDetails {
+                        DetailHeroHeader(
+                            eyebrow: "\(order.status.label) · \(onlineDetails.typeText)",
+                            title: order.orderNumber,
+                            subtitle: order.customerDisplay,
+                            icon: onlineDetails.fulfillmentIcon
+                        )
+                    } else {
+                        VStack(alignment: .leading, spacing: 10) {
+                            StatusBadge(status: order.status)
+                            Text(order.orderNumber)
+                                .font(GlacialFont.largeTitle(.semibold))
+                                .foregroundStyle(AppPalette.ink)
+                            Text(order.customerDisplay)
+                                .font(GlacialFont.title3(.medium))
+                                .foregroundStyle(AppPalette.muted)
+                        }
                     }
 
-                    DetailSummary(order: order)
+                    DetailSummary(order: order, onlineDetails: onlineDetails)
 
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Items")
@@ -5562,14 +10460,28 @@ private struct OrderDetailView: View {
 
 private struct DetailSummary: View {
     let order: KitchenOrder
+    let onlineDetails: KitchenOnlineOrder?
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 10)], spacing: 10) {
-            SummaryTile(title: "Source", value: order.source.rawValue, icon: order.source.icon)
-            SummaryTile(title: "Elapsed", value: order.elapsedText, icon: "clock")
-            SummaryTile(title: "Total", value: order.totalText, icon: "banknote")
-            SummaryTile(title: "Phone", value: order.customer.phone ?? "None", icon: "phone")
+        DetailInfoList(rows: detailRows)
+    }
+
+    private var detailRows: [DetailInfoRow] {
+        var rows = [
+            DetailInfoRow(title: "TYPE", value: onlineDetails?.typeText ?? order.source.rawValue),
+            DetailInfoRow(title: "NAME", value: onlineDetails?.contactName ?? order.customerDisplay),
+            DetailInfoRow(title: "PHONE", value: onlineDetails?.contactPhone ?? order.customer.phone ?? "None")
+        ]
+
+        if let onlineDetails {
+            rows.append(DetailInfoRow(title: onlineDetails.isDelivery ? "ADDRESS" : "PICKUP", value: onlineDetails.destinationText))
+            rows.append(DetailInfoRow(title: "PAYMENT", value: onlineDetails.paymentSummaryText))
+        } else {
+            rows.append(DetailInfoRow(title: "ELAPSED", value: order.elapsedText))
         }
+
+        rows.append(DetailInfoRow(title: "TOTAL", value: order.totalText))
+        return rows
     }
 }
 
@@ -5581,9 +10493,9 @@ private struct SummaryTile: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: icon)
-                .foregroundStyle(AppPalette.orange)
+                .symbolVariant(.fill)
+                .foregroundStyle(AppPalette.ink)
                 .frame(width: 30, height: 30)
-                .background(AppPalette.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
@@ -5599,7 +10511,7 @@ private struct SummaryTile: View {
             Spacer(minLength: 0)
         }
         .padding(12)
-        .background(.white, in: RoundedRectangle(cornerRadius: 8))
+        .background(.white, in: RoundedRectangle(cornerRadius: 4))
     }
 }
 
@@ -5621,8 +10533,15 @@ private struct POSRecapSheet: View {
     let isLoading: Bool
     let errorMessage: String?
     let accentColor: Color
+    var onClose: (() -> Void)?
     let refresh: () -> Void
+    @State private var expandedSourceKey: String?
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    private var isCompact: Bool {
+        horizontalSizeClass == .compact
+    }
 
     var body: some View {
         NavigationStack {
@@ -5637,7 +10556,12 @@ private struct POSRecapSheet: View {
                         }
 
                         POSRecapSplitSection(title: "PAYMENT", emptyText: "No payments yet today.", splits: recap.paymentSplit, accentColor: accentColor)
-                        POSRecapSplitSection(title: "SOURCE", emptyText: "No sources yet today.", splits: recap.sourceSplit, accentColor: accentColor)
+                        POSRecapSourceSection(
+                            emptyText: "No sources yet today.",
+                            splits: recap.sourceSplit,
+                            expandedSourceKey: $expandedSourceKey,
+                            accentColor: accentColor
+                        )
                         POSRecapBestSellersSection(bestSellers: recap.bestSellers, accentColor: accentColor)
                     } else if isLoading {
                         VStack(spacing: 14) {
@@ -5683,26 +10607,35 @@ private struct POSRecapSheet: View {
             .background(Color.white.ignoresSafeArea())
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Close") {
-                        dismiss()
-                    }
-                    .foregroundStyle(AppPalette.ink)
-                }
-
-                ToolbarItem(placement: .principal) {
-                    Text("RECAP")
-                        .font(GlacialFont.subheadline(.medium))
-                        .tracking(2.4)
-                        .foregroundStyle(AppPalette.ink)
-                }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                recapTopBar
             }
             .onAppear {
                 if recap == nil {
                     refresh()
                 }
             }
+        }
+    }
+
+    private var recapTopBar: some View {
+        ZStack {
+            Text("RECAP")
+                .font(GlacialFont.subheadline(.medium))
+                .tracking(2.4)
+                .foregroundStyle(AppPalette.ink)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
+        .background(.white)
+    }
+
+    private func close() {
+        if let onClose {
+            onClose()
+        } else {
+            dismiss()
         }
     }
 }
@@ -5814,6 +10747,39 @@ private struct POSRecapSplitSection: View {
     }
 }
 
+private struct POSRecapSourceSection: View {
+    let emptyText: String
+    let splits: [POSRecapSplit]
+    @Binding var expandedSourceKey: String?
+    let accentColor: Color
+
+    var body: some View {
+        POSRecapCard(title: "SOURCE", icon: "point.3.connected.trianglepath.dotted") {
+            if splits.isEmpty {
+                POSRecapEmptyLine(text: emptyText)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(splits.enumerated()), id: \.element.id) { index, split in
+                        POSRecapSourceRow(
+                            split: split,
+                            isExpanded: expandedSourceKey == split.key,
+                            accentColor: accentColor
+                        ) {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                expandedSourceKey = expandedSourceKey == split.key ? nil : split.key
+                            }
+                        }
+
+                        if index < splits.count - 1 {
+                            SettingsDivider()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 private struct POSRecapCard<Content: View>: View {
     let title: String
     let icon: String
@@ -5870,6 +10836,164 @@ private struct POSRecapSplitRow: View {
                 .minimumScaleFactor(0.78)
         }
         .padding(.vertical, 11)
+    }
+}
+
+private struct POSRecapSourceRow: View {
+    let split: POSRecapSplit
+    let isExpanded: Bool
+    let accentColor: Color
+    let toggle: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button(action: toggle) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(split.label.uppercased())
+                            .font(GlacialFont.subheadline(.semibold))
+                            .tracking(0.8)
+                            .foregroundStyle(AppPalette.ink)
+                            .lineLimit(1)
+
+                        Text("\(split.ordersCount) \(split.ordersCount == 1 ? "order" : "orders")")
+                            .font(GlacialFont.caption())
+                            .foregroundStyle(AppPalette.muted)
+                    }
+
+                    Spacer()
+
+                    Text(split.salesTotal.currencyText)
+                        .font(GlacialFont.subheadline(.semibold))
+                        .foregroundStyle(accentColor)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+
+                    Image(systemName: "chevron.down")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(AppPalette.muted)
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                        .frame(width: 18, height: 18)
+                }
+                .contentShape(Rectangle())
+                .padding(.vertical, 11)
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(spacing: 0) {
+                    if split.isMarketplaceSource {
+                        POSRecapSourceTotals(split: split, accentColor: accentColor)
+                        SettingsDivider()
+                    }
+
+                    if split.orders.isEmpty {
+                        POSRecapEmptyLine(text: "No orders recorded for this source.")
+                    } else {
+                        ForEach(Array(split.orders.enumerated()), id: \.element.id) { index, order in
+                            POSRecapSourceOrderRow(order: order, accentColor: accentColor)
+
+                            if index < split.orders.count - 1 {
+                                SettingsDivider()
+                            }
+                        }
+                    }
+                }
+                .padding(.leading, 10)
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .fill(accentColor.opacity(0.35))
+                        .frame(width: 2)
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+                .padding(.bottom, 8)
+            }
+        }
+    }
+}
+
+private struct POSRecapSourceTotals: View {
+    let split: POSRecapSplit
+    let accentColor: Color
+
+    var body: some View {
+        VStack(spacing: 0) {
+            POSRecapSourceTotalLine(
+                title: "TOTAL \(split.marketplaceName.uppercased()) REVENUE",
+                value: split.salesTotal.currencyText,
+                accentColor: accentColor
+            )
+
+            SettingsDivider()
+
+            POSRecapSourceTotalLine(
+                title: "REVENUE",
+                value: split.receivedTotal.currencyText,
+                accentColor: accentColor
+            )
+        }
+        .padding(.vertical, 5)
+    }
+}
+
+private struct POSRecapSourceTotalLine: View {
+    let title: String
+    let value: String
+    let accentColor: Color
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(GlacialFont.caption2(.bold))
+                .tracking(1.7)
+                .foregroundStyle(AppPalette.muted)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+
+            Spacer()
+
+            Text(value)
+                .font(GlacialFont.caption(.bold))
+                .tracking(0.7)
+                .foregroundStyle(accentColor)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+        }
+        .padding(.vertical, 8)
+    }
+}
+
+private struct POSRecapSourceOrderRow: View {
+    let order: POSRecapOrder
+    let accentColor: Color
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(order.reference.uppercased())
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(1.3)
+                    .foregroundStyle(AppPalette.ink)
+                    .lineLimit(1)
+
+                if let time = order.time, !time.isEmpty {
+                    Text(time)
+                        .font(GlacialFont.caption2())
+                        .tracking(0.8)
+                        .foregroundStyle(AppPalette.muted)
+                }
+            }
+
+            Spacer()
+
+            Text(order.amount.currencyText)
+                .font(GlacialFont.caption(.bold))
+                .tracking(0.7)
+                .foregroundStyle(accentColor)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+        }
+        .padding(.vertical, 8)
     }
 }
 
@@ -5948,11 +11072,17 @@ private struct SettingsView: View {
     @ObservedObject var store: KitchenStore
     @ObservedObject var posStore: POSStore
     @ObservedObject var printStore: PrintBridgeStore
+    var onClose: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @AppStorage("POSProductDisplayStyle") private var posProductDisplayStyleRaw = POSProductDisplayStyle.productCard.rawValue
     @AppStorage("POSAccentColor") private var posAccentColorRaw = POSAccentColor.ember.rawValue
+    @AppStorage("POSToppingCategoryOrder") private var posToppingCategoryOrderRaw = ""
+    @AppStorage("POSBrandLogoHidden") private var posBrandLogoHidden = false
+    @AppStorage("POSBrandLogoScale") private var posBrandLogoScale = 1.0
+    @AppStorage("StudioToken") private var savedStudioToken = ""
     @State private var baseURL: String = ""
     @State private var token: String = ""
+    @State private var studioToken: String = ""
     @State private var printServerURL: String = ""
     @State private var printToken: String = ""
     @State private var printerHost: String = ""
@@ -5978,6 +11108,19 @@ private struct SettingsView: View {
         POSAccentColor(rawValue: posAccentColorRaw) ?? .ember
     }
 
+    private var toppingCategories: [String] {
+        let source = Set(
+            (posStore.bootstrap?.catalog.products ?? [])
+                .flatMap(\.toppings)
+                .map(\.category)
+                .filter { !$0.isEmpty }
+        )
+
+        let saved = posToppingCategoryOrderRaw.csvValues.filter { source.contains($0) }
+        let missing = source.filter { !saved.contains($0) }.sorted()
+        return saved + missing
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -5993,6 +11136,8 @@ private struct SettingsView: View {
                             SettingsTextFieldRow(title: "Base URL", text: $baseURL, isSecure: false)
                             SettingsDivider()
                             SettingsTextFieldRow(title: "emberOS Key", text: $token, isSecure: true)
+                            SettingsDivider()
+                            SettingsTextFieldRow(title: "Studio Key", text: $studioToken, isSecure: true)
                         }
                     }
 
@@ -6152,6 +11297,22 @@ private struct SettingsView: View {
                         accentColor: selectedPOSAccentColor.color
                     ) {
                         VStack(spacing: 0) {
+                            POSBrandLogoSettingsCard(
+                                logoURL: posStore.brandLogoOverrideURL,
+                                isHidden: $posBrandLogoHidden,
+                                scale: $posBrandLogoScale,
+                                accentColor: selectedPOSAccentColor.color
+                            ) { data in
+                                await posStore.setBrandLogoOverride(data: data)
+                            } onReset: {
+                                posStore.clearBrandLogoOverride()
+                                posBrandLogoHidden = false
+                                posBrandLogoScale = 1.0
+                            }
+
+                            SettingsDivider()
+                                .padding(.vertical, 4)
+
                             ForEach(Array(POSProductDisplayStyle.allCases.enumerated()), id: \.element.id) { index, style in
                                 Button {
                                     posProductDisplayStyleRaw = style.rawValue
@@ -6249,22 +11410,29 @@ private struct SettingsView: View {
                         VStack(spacing: 14) {
                             POSProductPictureSettingsList(posStore: posStore, accentColor: selectedPOSAccentColor.color)
                             SettingsDivider()
+                            POSToppingCategoryOrderSettings(
+                                categories: toppingCategories,
+                                accentColor: selectedPOSAccentColor.color
+                            ) { category, offset in
+                                moveToppingCategory(category, offset: offset)
+                            }
+                            SettingsDivider()
                             LockedCatalogSettingsCard(accentColor: selectedPOSAccentColor.color)
                         }
                     }
 
                     Button {
                         store.saveSettings(baseURL: baseURL, token: token)
+                        savedStudioToken = studioToken.trimmingCharacters(in: .whitespacesAndNewlines)
                         savePrintSettings()
-                        dismiss()
+                        close()
                     } label: {
-                        Text("SAVE")
-                            .font(GlacialFont.subheadline(.medium))
-                            .tracking(2.4)
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 15)
-                            .background(selectedPOSAccentColor.color, in: RoundedRectangle(cornerRadius: 8))
+                        POSRectActionLabel(
+                            title: "SAVE",
+                            tint: selectedPOSAccentColor.color,
+                            isPrimary: true,
+                            fillsWidth: true
+                        )
                     }
                     .buttonStyle(.plain)
                     .padding(.top, 4)
@@ -6274,17 +11442,13 @@ private struct SettingsView: View {
             .background(Color.white.ignoresSafeArea())
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    Text("SETTINGS")
-                        .font(GlacialFont.subheadline(.medium))
-                        .tracking(2.4)
-                        .foregroundStyle(AppPalette.ink)
-                }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                settingsTopBar
             }
             .onAppear {
                 baseURL = store.baseURL
                 token = store.kitchenToken
+                studioToken = savedStudioToken
                 printServerURL = printStore.serverURL
                 printToken = printStore.printToken
                 printerHost = printStore.printerHost
@@ -6296,6 +11460,27 @@ private struct SettingsView: View {
                 printGrabSource = printStore.enabledSources.grab
                 printShopeeSource = printStore.enabledSources.shopee
             }
+        }
+    }
+
+    private var settingsTopBar: some View {
+        ZStack {
+            Text("SETTINGS")
+                .font(GlacialFont.subheadline(.medium))
+                .tracking(2.4)
+                .foregroundStyle(AppPalette.ink)
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
+        .background(.white)
+    }
+
+    private func close() {
+        if let onClose {
+            onClose()
+        } else {
+            dismiss()
         }
     }
 
@@ -6314,6 +11499,18 @@ private struct SettingsView: View {
                 shopee: printShopeeSource
             )
         )
+    }
+
+    private func moveToppingCategory(_ category: String, offset: Int) {
+        var categories = toppingCategories
+        guard let index = categories.firstIndex(of: category) else { return }
+
+        let destination = index + offset
+        guard categories.indices.contains(destination) else { return }
+
+        categories.swapAt(index, destination)
+        posToppingCategoryOrderRaw = categories.csvStorageValue
+        Haptics.impact(.light)
     }
 }
 
@@ -6488,11 +11685,231 @@ private struct PrintSourceToggleRow: View {
     }
 }
 
+private struct POSBrandLogoSettingsCard: View {
+    let logoURL: URL?
+    @Binding var isHidden: Bool
+    @Binding var scale: Double
+    let accentColor: Color
+    let onPicked: (Data) async -> Void
+    let onReset: () -> Void
+    @State private var selectedPhoto: PhotosPickerItem?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                logoPreview
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("BRAND LOGO")
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.8)
+                        .foregroundStyle(AppPalette.muted)
+                    Text(logoURL == nil ? "emberOS default" : "custom logo")
+                        .font(GlacialFont.subheadline(.semibold))
+                        .foregroundStyle(AppPalette.ink)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { !isHidden },
+                    set: { isHidden = !$0 }
+                ))
+                .labelsHidden()
+                .tint(accentColor)
+            }
+            .padding(.vertical, 12)
+
+            SettingsDivider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("LOGO SIZE")
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.8)
+                        .foregroundStyle(AppPalette.muted)
+
+                    Spacer()
+
+                    Text("\(Int((scale * 100).rounded()))%")
+                        .font(GlacialFont.caption(.semibold))
+                        .foregroundStyle(AppPalette.ink)
+                        .monospacedDigit()
+                }
+
+                Slider(value: $scale, in: 0.6...1.3, step: 0.05)
+                    .tint(accentColor)
+                    .disabled(isHidden)
+            }
+            .padding(.vertical, 12)
+
+            SettingsDivider()
+
+            HStack(spacing: 10) {
+                PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                    POSRectActionLabel(
+                        title: logoURL == nil ? "CHOOSE LOGO" : "CHANGE LOGO",
+                        tint: accentColor,
+                        isPrimary: true,
+                        minWidth: 132
+                    )
+                }
+                .buttonStyle(.plain)
+
+                if logoURL != nil || isHidden {
+                    Button {
+                        onReset()
+                    } label: {
+                        POSRectActionLabel(
+                            title: "RESET",
+                            tint: AppPalette.ink,
+                            isPrimary: false,
+                            minWidth: 84
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Spacer()
+            }
+            .padding(.vertical, 12)
+        }
+        .onChange(of: selectedPhoto) { _, item in
+            guard let item else { return }
+            Task {
+                if let data = try? await item.loadTransferable(type: Data.self) {
+                    await onPicked(data)
+                    isHidden = false
+                }
+                selectedPhoto = nil
+            }
+        }
+    }
+
+    private var logoPreview: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(AppPalette.card)
+                .frame(width: 86, height: 52)
+
+            if isHidden {
+                Image(systemName: "eye.slash")
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(AppPalette.muted)
+            } else if let logoURL, logoURL.isFileURL, let image = UIImage(contentsOfFile: logoURL.path) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(7)
+            } else {
+                Image("EmberOSLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .padding(7)
+            }
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AppPalette.line.opacity(0.76), lineWidth: 1)
+        )
+    }
+}
+
 private struct SettingsDivider: View {
     var body: some View {
         Rectangle()
             .fill(AppPalette.line.opacity(0.66))
             .frame(height: 1)
+    }
+}
+
+private struct POSToppingCategoryOrderSettings: View {
+    let categories: [String]
+    let accentColor: Color
+    let onMove: (String, Int) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "line.3.horizontal.decrease.circle")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(accentColor)
+                    .frame(width: 34, height: 34)
+                    .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Topping order")
+                        .font(GlacialFont.body(.semibold))
+                        .foregroundStyle(AppPalette.ink)
+                    Text("Arrange topping categories in the product drawer.")
+                        .font(GlacialFont.caption())
+                        .foregroundStyle(AppPalette.muted)
+                }
+
+                Spacer()
+            }
+
+            if categories.isEmpty {
+                Text("No topping categories found yet.")
+                    .font(GlacialFont.subheadline())
+                    .foregroundStyle(AppPalette.muted)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 10)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(categories.enumerated()), id: \.element) { index, category in
+                        HStack(spacing: 12) {
+                            Text("\(index + 1)")
+                                .font(GlacialFont.caption(.bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 26, height: 26)
+                                .background(accentColor, in: RoundedRectangle(cornerRadius: 7))
+
+                            Text(category.uppercased())
+                                .font(GlacialFont.subheadline(.semibold))
+                                .tracking(1.2)
+                                .foregroundStyle(AppPalette.ink)
+                                .lineLimit(1)
+
+                            Spacer()
+
+                            HStack(spacing: 6) {
+                                toppingOrderButton(systemName: "chevron.up", disabled: index == 0) {
+                                    onMove(category, -1)
+                                }
+
+                                toppingOrderButton(systemName: "chevron.down", disabled: index == categories.count - 1) {
+                                    onMove(category, 1)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 10)
+
+                        if index < categories.count - 1 {
+                            SettingsDivider()
+                        }
+                    }
+                }
+                .padding(.horizontal, 10)
+                .background(AppPalette.card.opacity(0.76), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+
+    private func toppingOrderButton(systemName: String, disabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(disabled ? AppPalette.muted.opacity(0.45) : accentColor)
+                .frame(width: 30, height: 30)
+                .background(.white, in: RoundedRectangle(cornerRadius: 7))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7)
+                        .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
     }
 }
 
@@ -6779,7 +12196,7 @@ struct KitchenOnlineOrderResponse: Decodable {
     }
 }
 
-struct KitchenAcceptOnlineOrderResponse: Decodable {
+struct KitchenSendOnlineOrderToKitchenResponse: Decodable {
     let onlineOrder: KitchenOnlineOrder
     let sale: KitchenOrder
     let alreadyConverted: Bool
@@ -6802,6 +12219,39 @@ struct KitchenOrderResponse: Decodable {
 
 struct KitchenStatusRequest: Encodable {
     let status: String
+}
+
+struct POSPinSessionRequest: Encodable {
+    let pin: String
+    let openingCash: Double
+    let deviceName: String
+
+    enum CodingKeys: String, CodingKey {
+        case pin
+        case openingCash = "opening_cash"
+        case deviceName = "device_name"
+    }
+}
+
+struct POSPinSessionResponse: Decodable, Equatable {
+    let message: String
+    let `operator`: POSOperator
+    let sessionToken: String
+    let shift: POSShiftEnvelope
+    let openingCash: Double
+
+    enum CodingKeys: String, CodingKey {
+        case message
+        case `operator`
+        case sessionToken = "session_token"
+        case shift
+        case openingCash = "opening_cash"
+    }
+}
+
+private struct POSPinWelcome: Equatable {
+    let operatorName: String
+    let openingCash: Double
 }
 
 struct POSBootstrapResponse: Decodable, Equatable {
@@ -6863,15 +12313,44 @@ struct POSRecapSplit: Identifiable, Decodable, Equatable {
     let label: String
     let ordersCount: Int
     let salesTotal: Double
+    let receivedTotal: Double
+    let orders: [POSRecapOrder]
 
     var id: String { key }
+
+    var isMarketplaceSource: Bool {
+        key == "grabfood" || key == "shopeefood"
+    }
+
+    var marketplaceName: String {
+        key == "shopeefood" ? "Shopee" : "Grab"
+    }
 
     enum CodingKeys: String, CodingKey {
         case key
         case label
         case ordersCount = "orders_count"
         case salesTotal = "sales_total"
+        case receivedTotal = "received_total"
+        case orders
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        key = try container.decode(String.self, forKey: .key)
+        label = try container.decode(String.self, forKey: .label)
+        ordersCount = try container.decode(Int.self, forKey: .ordersCount)
+        salesTotal = container.lossyDouble(forKey: .salesTotal) ?? 0
+        receivedTotal = container.lossyDouble(forKey: .receivedTotal) ?? salesTotal
+        orders = try container.decodeIfPresent([POSRecapOrder].self, forKey: .orders) ?? []
+    }
+}
+
+struct POSRecapOrder: Identifiable, Decodable, Equatable {
+    let id: Int
+    let reference: String
+    let amount: Double
+    let time: String?
 }
 
 struct POSBestSeller: Identifiable, Decodable, Equatable {
@@ -6894,6 +12373,18 @@ struct POSOperator: Decodable, Equatable {
     let id: Int
     let name: String
     let role: String
+
+    var normalizedRole: String {
+        role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    var canAccessAdminFeatures: Bool {
+        normalizedRole == "admin" || normalizedRole == "administrator" || normalizedRole == "owner"
+    }
+
+    var roleLabel: String {
+        canAccessAdminFeatures ? "ADMIN" : "STAFF"
+    }
 }
 
 struct POSCatalog: Decodable, Equatable {
@@ -6977,11 +12468,36 @@ struct POSTopping: Identifiable, Decodable, Equatable {
     }
 }
 
+struct POSDraftTicket: Identifiable, Equatable {
+    let id: UUID
+    let number: Int
+    var lines: [POSCartLine]
+
+    init(id: UUID = UUID(), number: Int, lines: [POSCartLine] = []) {
+        self.id = id
+        self.number = number
+        self.lines = lines
+    }
+
+    var title: String {
+        "TICKET \(number)"
+    }
+
+    var itemCount: Int {
+        lines.reduce(0) { $0 + $1.quantity }
+    }
+
+    var total: Double {
+        lines.reduce(0) { $0 + $1.lineTotal }
+    }
+}
+
 struct POSCartLine: Identifiable, Equatable {
     let id: String
     let product: POSProduct
     let toppings: [POSTopping]
     var quantity: Int
+    var adjustedUnitPrice: Double?
 
     var unitPrice: Double {
         product.price + toppings.reduce(0) { $0 + $1.price }
@@ -6991,13 +12507,22 @@ struct POSCartLine: Identifiable, Equatable {
         unitPrice * Double(quantity)
     }
 
-    init(product: POSProduct, toppings: [POSTopping], quantity: Int) {
+    func unitPrice(for source: POSOrderSource) -> Double {
+        source.isMarketplace ? (adjustedUnitPrice ?? unitPrice) : unitPrice
+    }
+
+    func lineTotal(for source: POSOrderSource) -> Double {
+        unitPrice(for: source) * Double(quantity)
+    }
+
+    init(product: POSProduct, toppings: [POSTopping], quantity: Int, adjustedUnitPrice: Double? = nil) {
         self.id = Self.makeID(product: product, toppings: toppings)
         self.product = product
         self.toppings = toppings.sorted {
             $0.sortOrder == $1.sortOrder ? $0.name < $1.name : $0.sortOrder < $1.sortOrder
         }
         self.quantity = quantity
+        self.adjustedUnitPrice = adjustedUnitPrice
     }
 
     static func makeID(product: POSProduct, toppings: [POSTopping]) -> String {
@@ -7033,6 +12558,22 @@ enum POSOrderSource: String, CaseIterable, Identifiable {
         case .shopeefood:
             return "shopeefood"
         }
+    }
+
+    var isMarketplace: Bool {
+        self == .grabfood || self == .shopeefood
+    }
+}
+
+private enum POSMarketplaceFees {
+    static let deductionRate = 0.29037520
+
+    static func deductionAmount(_ grossTotal: Double) -> Double {
+        grossTotal * deductionRate
+    }
+
+    static func actualReceived(_ grossTotal: Double) -> Double {
+        max(0, grossTotal - deductionAmount(grossTotal))
     }
 }
 
@@ -7122,11 +12663,20 @@ struct POSSaleCartItem: Encodable {
     let id: Int
     let quantity: Int
     let toppings: [POSSaleTopping]
+    let adjustedUnitPrice: Double?
 
     init(line: POSCartLine) {
         self.id = line.product.id
         self.quantity = line.quantity
         self.toppings = line.toppings.map { POSSaleTopping(id: $0.id) }
+        self.adjustedUnitPrice = line.adjustedUnitPrice
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case quantity
+        case toppings
+        case adjustedUnitPrice = "adjusted_unit_price"
     }
 }
 
@@ -7189,6 +12739,7 @@ struct PrintReceiptPayload: Decodable {
     let items: [PrintReceiptItem]
     let totals: PrintReceiptTotals
     let notes: String?
+    let loyalty: PrintReceiptLoyalty?
 }
 
 struct PrintReceiptStore: Decodable {
@@ -7218,6 +12769,89 @@ struct PrintReceiptCustomer: Decodable {
     let id: Int?
     let name: String?
     let phone: String?
+}
+
+struct PrintReceiptLoyalty: Decodable {
+    let level: Int
+    let xp: Int
+    let stamps: Int
+    let target: Int
+    let rewardCount: Int
+
+    var safeTarget: Int {
+        max(1, min(target, 12))
+    }
+
+    var safeStamps: Int {
+        max(0, min(stamps, safeTarget))
+    }
+
+    var receiptStarsLine: String {
+        let filled = String(repeating: "*", count: safeStamps)
+        let empty = String(repeating: ".", count: safeTarget - safeStamps)
+        return "[\(filled)\(empty)] \(safeStamps)/\(safeTarget)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case level
+        case xp
+        case stamps
+        case target
+        case rewardCount = "reward_count"
+    }
+
+    init(level: Int, xp: Int, stamps: Int, target: Int, rewardCount: Int) {
+        self.level = max(1, level)
+        self.xp = max(0, xp)
+        self.stamps = max(0, stamps)
+        self.target = max(1, target)
+        self.rewardCount = max(0, rewardCount)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            level: container.lossyInt(forKey: .level) ?? 1,
+            xp: container.lossyInt(forKey: .xp) ?? 0,
+            stamps: container.lossyInt(forKey: .stamps) ?? 0,
+            target: container.lossyInt(forKey: .target) ?? 9,
+            rewardCount: container.lossyInt(forKey: .rewardCount) ?? 0
+        )
+    }
+}
+
+private extension KeyedDecodingContainer {
+    func lossyInt(forKey key: Key) -> Int? {
+        if let intValue = try? decodeIfPresent(Int.self, forKey: key) {
+            return intValue
+        }
+
+        if let doubleValue = try? decodeIfPresent(Double.self, forKey: key) {
+            return Int(doubleValue)
+        }
+
+        if let stringValue = try? decodeIfPresent(String.self, forKey: key) {
+            return Int(stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        return nil
+    }
+
+    func lossyDouble(forKey key: Key) -> Double? {
+        if let doubleValue = try? decodeIfPresent(Double.self, forKey: key) {
+            return doubleValue
+        }
+
+        if let intValue = try? decodeIfPresent(Int.self, forKey: key) {
+            return Double(intValue)
+        }
+
+        if let stringValue = try? decodeIfPresent(String.self, forKey: key) {
+            return Double(stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        return nil
+    }
 }
 
 struct PrintReceiptItem: Decodable {
@@ -7427,6 +13061,11 @@ struct KitchenOnlineOrder: Identifiable, Decodable, Equatable {
     let fulfillmentMethod: String?
     let paymentMethod: String?
     let paymentStatus: String?
+    let deliveryRecipientName: String?
+    let deliveryPhone: String?
+    let deliveryAddress: String?
+    let deliveryAddressVerified: Bool
+    let pickupTime: String?
     let createdAt: Date?
     let elapsedMinutes: Int
     let customer: KitchenCustomer
@@ -7441,6 +13080,13 @@ struct KitchenOnlineOrder: Identifiable, Decodable, Equatable {
         case fulfillmentMethod = "fulfillment_method"
         case paymentMethod = "payment_method"
         case paymentStatus = "payment_status"
+        case deliveryAddress = "delivery_address"
+        case shippingAddress = "shipping_address"
+        case address
+        case pickupTime = "pickup_time"
+        case pickupAt = "pickup_at"
+        case scheduledFor = "scheduled_for"
+        case scheduledAt = "scheduled_at"
         case createdAt = "created_at"
         case elapsedMinutes = "elapsed_minutes"
         case customer
@@ -7449,8 +13095,104 @@ struct KitchenOnlineOrder: Identifiable, Decodable, Equatable {
         case totals
     }
 
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let flexibleContainer = try decoder.container(keyedBy: FlexibleCodingKey.self)
+        id = try container.decode(Int.self, forKey: .id)
+        orderNumber = try container.decode(String.self, forKey: .orderNumber)
+        status = try container.decode(KitchenOnlineOrderStatus.self, forKey: .status)
+        fulfillmentMethod = try container.decodeIfPresent(String.self, forKey: .fulfillmentMethod)
+        paymentMethod = try container.decodeIfPresent(String.self, forKey: .paymentMethod)
+        paymentStatus = try container.decodeIfPresent(String.self, forKey: .paymentStatus)
+        deliveryRecipientName = try flexibleContainer.decodeFirstPresentStringOrNested(
+            keys: ["recipient_name", "delivery_recipient_name", "delivery", "shipping"],
+            nestedKeys: ["recipient_name", "name", "customer_name"]
+        )
+        deliveryPhone = try flexibleContainer.decodeFirstPresentStringOrNested(
+            keys: ["delivery_phone", "phone", "delivery", "shipping"],
+            nestedKeys: ["phone", "delivery_phone", "customer_phone"]
+        )
+        deliveryAddress = try flexibleContainer.decodeFirstPresentStringOrNested(
+            keys: [
+                "delivery_address",
+                "shipping_address",
+                "customer_address",
+                "address",
+                "deliveryAddress",
+                "shippingAddress",
+                "delivery",
+                "shipping",
+                "fulfillment"
+            ],
+            nestedKeys: [
+                "full_address",
+                "formatted_address",
+                "delivery_address",
+                "shipping_address",
+                "customer_address",
+                "address",
+                "street",
+                "line1",
+                "line_1",
+                "address_line_1"
+            ]
+        )
+        deliveryAddressVerified = (try? flexibleContainer.decodeFirstPresentBoolOrNested(
+            keys: ["address_verified", "delivery_address_verified", "delivery", "shipping", "fulfillment"],
+            nestedKeys: ["address_verified", "delivery_address_verified", "verified"]
+        )) ?? false
+        pickupTime = try flexibleContainer.decodeFirstPresentStringOrNested(
+            keys: [
+                "pickup_time",
+                "pickup_at",
+                "scheduled_for",
+                "scheduled_at",
+                "pickupTime",
+                "pickupAt",
+                "fulfillment"
+            ],
+            nestedKeys: [
+                "pickup_time",
+                "pickup_at",
+                "scheduled_for",
+                "scheduled_at",
+                "time",
+                "ready_at"
+            ]
+        )
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt)
+        elapsedMinutes = try container.decode(Int.self, forKey: .elapsedMinutes)
+        customer = try container.decode(KitchenCustomer.self, forKey: .customer)
+        notes = try container.decodeIfPresent(String.self, forKey: .notes)
+        items = try container.decode([KitchenOnlineOrderItem].self, forKey: .items)
+        totals = try container.decode(KitchenOnlineTotals.self, forKey: .totals)
+    }
+
     var customerDisplay: String {
         customer.name?.isEmpty == false ? customer.name! : "Guest order"
+    }
+
+    var contactName: String {
+        if isDelivery, let name = deliveryRecipientName?.nilIfBlank {
+            return name
+        }
+
+        return customerDisplay
+    }
+
+    var contactPhone: String? {
+        if isDelivery, let phone = deliveryPhone?.nilIfBlank {
+            return phone
+        }
+
+        return customer.phone?.nilIfBlank
+    }
+
+    var cardContactText: String {
+        [contactName.nilIfBlank, contactPhone]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+            .nilIfBlank ?? "Guest order"
     }
 
     var elapsedText: String {
@@ -7463,6 +13205,71 @@ struct KitchenOnlineOrder: Identifiable, Decodable, Equatable {
 
     var itemCount: Int {
         items.reduce(0) { $0 + $1.quantity }
+    }
+
+    var isDelivery: Bool {
+        let value = fulfillmentMethod?.lowercased() ?? ""
+        return value.contains("deliver")
+            || value.contains("ship")
+            || deliveryAddress?.nilIfBlank != nil
+            || totals.deliveryFee > 0
+    }
+
+    var typeText: String {
+        isDelivery ? "Online Delivery" : "Online Pick Up"
+    }
+
+    var fulfillmentIcon: String {
+        isDelivery ? "scooter" : "takeoutbag.and.cup.and.straw"
+    }
+
+    var destinationText: String {
+        if isDelivery {
+            return deliveryAddress?.nilIfBlank ?? "Address not provided"
+        }
+
+        return pickupTime?.nilIfBlank ?? "Pickup time not provided"
+    }
+
+    var paymentSummaryText: String {
+        [paymentMethod?.humanized, paymentStatus?.humanized]
+            .compactMap { $0?.nilIfBlank }
+            .joined(separator: " · ")
+            .nilIfBlank ?? "Not provided"
+    }
+
+    var requiresConfirmedPaymentBeforeKitchen: Bool {
+        paymentMethod?.lowercased() == "bank_qr"
+    }
+
+    var isPaymentConfirmedForKitchen: Bool {
+        !requiresConfirmedPaymentBeforeKitchen || paymentStatus?.lowercased() == "paid"
+    }
+
+    var canMarkPaid: Bool {
+        status == .accepted
+            && requiresConfirmedPaymentBeforeKitchen
+            && paymentStatus?.lowercased() != "paid"
+    }
+
+    var canSendToKitchen: Bool {
+        status == .accepted && isPaymentConfirmedForKitchen
+    }
+
+    var acceptedStateText: String {
+        if canSendToKitchen {
+            return "Paid. Ready for kitchen."
+        }
+
+        if requiresConfirmedPaymentBeforeKitchen {
+            return "Accepted. Waiting for QR payment."
+        }
+
+        return "Accepted. Ready for kitchen."
+    }
+
+    var needsAddressVerification: Bool {
+        isDelivery && !deliveryAddressVerified
     }
 }
 
@@ -7480,12 +13287,21 @@ struct KitchenOnlineOrderItem: Identifiable, Decodable, Equatable {
         case notes
         case toppings
     }
+
+    var toppingText: String {
+        toppings.map(\.displayName).joined(separator: ", ")
+    }
 }
 
 struct KitchenOnlineOrderTopping: Identifiable, Decodable, Equatable {
     let id: Int
     let name: String?
     let quantity: Int
+
+    var displayName: String {
+        guard let name, !name.isEmpty else { return "Topping" }
+        return name
+    }
 }
 
 struct KitchenOnlineTotals: Decodable, Equatable {
@@ -7507,6 +13323,158 @@ enum KitchenOnlineOrderStatus: String, Decodable {
     case cancelled
 }
 
+struct CompletedKitchenTicket: Identifiable, Codable, Equatable {
+    let id: Int
+    let orderNumber: String
+    let source: String
+    let customerName: String
+    let customerPhone: String?
+    let fulfillmentMethod: String?
+    let deliveryAddress: String?
+    let pickupTime: String?
+    let paymentMethod: String?
+    let notes: String?
+    let total: Double?
+    let items: [CompletedKitchenTicketItem]
+    let archivedAt: Date
+
+    init(order: KitchenOrder, onlineDetails: KitchenOnlineOrder?, archivedAt: Date) {
+        id = order.id
+        orderNumber = order.orderNumber
+        source = order.source.shortLabel
+        customerName = order.customerDisplay
+        customerPhone = onlineDetails?.customer.phone ?? order.customer.phone
+        fulfillmentMethod = onlineDetails?.fulfillmentMethod
+        deliveryAddress = onlineDetails?.deliveryAddress
+        pickupTime = onlineDetails?.pickupTime
+        paymentMethod = order.paymentMethod ?? onlineDetails?.paymentMethod
+        notes = onlineDetails?.notes ?? order.notes
+        total = order.totals?.total ?? onlineDetails?.totals.total
+        items = order.items.map { CompletedKitchenTicketItem(item: $0) }
+        self.archivedAt = archivedAt
+    }
+
+    var isDelivery: Bool {
+        let value = fulfillmentMethod?.lowercased() ?? ""
+        return value.contains("deliver") || value.contains("ship") || deliveryAddress?.nilIfBlank != nil
+    }
+
+    var typeText: String {
+        source == "STORE" ? "Store" : (isDelivery ? "Online Delivery" : "Online Pick Up")
+    }
+
+    var fulfillmentIcon: String {
+        source == "STORE" ? "storefront" : (isDelivery ? "scooter" : "takeoutbag.and.cup.and.straw")
+    }
+
+    var destinationText: String {
+        if isDelivery {
+            return deliveryAddress?.nilIfBlank ?? "Address not provided"
+        }
+
+        return pickupTime?.nilIfBlank ?? "Pickup time not provided"
+    }
+
+    var totalText: String {
+        guard let total else { return "-" }
+        return "\(Int(total).formatted()) VND"
+    }
+
+    var paymentText: String {
+        paymentMethod?.paymentDisplayText ?? "Not recorded"
+    }
+
+    var completedText: String {
+        archivedAt.formatted(date: .omitted, time: .shortened)
+    }
+
+    var completedDateText: String {
+        completedFormatter("dd MMM yyyy").string(from: archivedAt)
+    }
+
+    var completedTimeText: String {
+        completedFormatter("HH:mm").string(from: archivedAt)
+    }
+
+    private func completedFormatter(_ format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.dateFormat = format
+        formatter.timeZone = TimeZone(identifier: "Asia/Ho_Chi_Minh") ?? .current
+        return formatter
+    }
+}
+
+struct CompletedKitchenTicketItem: Identifiable, Codable, Equatable {
+    let id: Int
+    let productName: String
+    let quantity: Int
+    let lineTotal: Double?
+    let toppings: [CompletedKitchenTicketTopping]
+    let notes: String?
+
+    init(item: KitchenItem) {
+        id = item.id
+        productName = item.productName
+        quantity = item.quantity
+        lineTotal = item.lineTotal
+        toppings = item.toppings.map { CompletedKitchenTicketTopping(topping: $0) }
+        notes = item.notes
+    }
+
+    var priceText: String {
+        guard let lineTotal else { return "-" }
+        return "\(Int(lineTotal).formatted()) VND"
+    }
+
+    var toppingText: String {
+        toppings
+            .map { topping in
+                topping.quantity > 1 ? "\(topping.quantity)x \(topping.name)" : topping.name
+            }
+            .joined(separator: ", ")
+    }
+}
+
+struct CompletedKitchenTicketTopping: Identifiable, Codable, Equatable {
+    let id: Int
+    let name: String
+    let quantity: Int
+
+    init(topping: KitchenTopping) {
+        id = topping.id
+        name = topping.displayName
+        quantity = topping.quantity
+    }
+}
+
+private enum CompletedKitchenTicketStore {
+    private static let key = "CompletedKitchenTickets"
+
+    static func load() -> [CompletedKitchenTicket] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let tickets = try? JSONDecoder().decode([CompletedKitchenTicket].self, from: data) else {
+            return []
+        }
+
+        let cutoff = vietnamStartOfToday()
+        return tickets
+            .filter { $0.archivedAt >= cutoff }
+            .sorted { $0.archivedAt > $1.archivedAt }
+    }
+
+    static func vietnamStartOfToday(now: Date = Date()) -> Date {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Asia/Ho_Chi_Minh") ?? .current
+
+        return calendar.startOfDay(for: now)
+    }
+
+    static func save(_ tickets: [CompletedKitchenTicket]) {
+        guard let data = try? JSONEncoder().encode(tickets) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
 struct KitchenOrder: Identifiable, Decodable, Equatable {
     let id: Int
     let orderNumber: String
@@ -7517,6 +13485,7 @@ struct KitchenOrder: Identifiable, Decodable, Equatable {
     let customer: KitchenCustomer
     let items: [KitchenItem]
     let totals: KitchenTotals?
+    let paymentMethod: String?
     let notes: String?
     let updatedAt: Date?
 
@@ -7530,6 +13499,7 @@ struct KitchenOrder: Identifiable, Decodable, Equatable {
         case customer
         case items
         case totals
+        case paymentMethod = "payment_method"
         case notes
         case updatedAt = "updated_at"
     }
@@ -7549,6 +13519,10 @@ struct KitchenOrder: Identifiable, Decodable, Equatable {
     var totalText: String {
         guard let total = totals?.total else { return "-" }
         return "\(Int(total).formatted()) VND"
+    }
+
+    var paymentText: String {
+        paymentMethod?.paymentDisplayText ?? "Not recorded"
     }
 
     var nextActions: [KitchenStatus] {
@@ -7588,6 +13562,7 @@ struct KitchenItem: Identifiable, Decodable, Equatable {
     let id: Int
     let productName: String
     let quantity: Int
+    let lineTotal: Double?
     let toppings: [KitchenTopping]
     let notes: String?
     let kitchenStatus: KitchenStatus
@@ -7596,6 +13571,7 @@ struct KitchenItem: Identifiable, Decodable, Equatable {
         case id
         case productName = "product_name"
         case quantity
+        case lineTotal = "line_total"
         case toppings
         case notes
         case kitchenStatus = "kitchen_status"
@@ -7767,11 +13743,122 @@ enum KitchenAPIError: LocalizedError {
     }
 }
 
-private extension JSONDecoder {
+extension JSONDecoder {
     static var kitchen: JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return decoder
+    }
+}
+
+private extension KeyedDecodingContainer {
+    func decodeFirstPresentString(for keys: [Key]) throws -> String? {
+        for key in keys {
+            if let value = try decodeIfPresent(String.self, forKey: key)?.nilIfBlank {
+                return value
+            }
+        }
+
+        return nil
+    }
+}
+
+private struct FlexibleCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int?
+
+    init?(stringValue: String) {
+        self.stringValue = stringValue
+        intValue = nil
+    }
+
+    init?(intValue: Int) {
+        stringValue = "\(intValue)"
+        self.intValue = intValue
+    }
+}
+
+private extension KeyedDecodingContainer where Key == FlexibleCodingKey {
+    func decodeFirstPresentStringOrNested(keys: [String], nestedKeys: [String]) throws -> String? {
+        for key in keys {
+            guard let codingKey = FlexibleCodingKey(stringValue: key), contains(codingKey) else {
+                continue
+            }
+
+            if let value = (try? decodeIfPresent(String.self, forKey: codingKey))?.nilIfBlank {
+                return value
+            }
+
+            if let nested = try? nestedContainer(keyedBy: FlexibleCodingKey.self, forKey: codingKey) {
+                if let value = try nested.decodeFirstPresentString(keys: nestedKeys) {
+                    return value
+                }
+
+                if let value = try nested.decodeAddressParts() {
+                    return value
+                }
+            }
+        }
+
+        return nil
+    }
+
+    func decodeFirstPresentBoolOrNested(keys: [String], nestedKeys: [String]) throws -> Bool? {
+        for key in keys {
+            guard let codingKey = FlexibleCodingKey(stringValue: key), contains(codingKey) else {
+                continue
+            }
+
+            if let value = try? decodeIfPresent(Bool.self, forKey: codingKey) {
+                return value
+            }
+
+            if let nested = try? nestedContainer(keyedBy: FlexibleCodingKey.self, forKey: codingKey),
+               let value = try nested.decodeFirstPresentBool(keys: nestedKeys) {
+                return value
+            }
+        }
+
+        return nil
+    }
+
+    func decodeFirstPresentString(keys: [String]) throws -> String? {
+        for key in keys {
+            guard let codingKey = FlexibleCodingKey(stringValue: key),
+                  let value = (try? decodeIfPresent(String.self, forKey: codingKey))?.nilIfBlank else {
+                continue
+            }
+
+            return value
+        }
+
+        return nil
+    }
+
+    func decodeFirstPresentBool(keys: [String]) throws -> Bool? {
+        for key in keys {
+            guard let codingKey = FlexibleCodingKey(stringValue: key),
+                  let value = try? decodeIfPresent(Bool.self, forKey: codingKey) else {
+                continue
+            }
+
+            return value
+        }
+
+        return nil
+    }
+
+    func decodeAddressParts() throws -> String? {
+        let parts = try [
+            decodeFirstPresentString(keys: ["line1", "line_1", "address_line_1", "street"]),
+            decodeFirstPresentString(keys: ["line2", "line_2", "address_line_2"]),
+            decodeFirstPresentString(keys: ["ward"]),
+            decodeFirstPresentString(keys: ["district"]),
+            decodeFirstPresentString(keys: ["city", "province"])
+        ]
+            .compactMap { $0 }
+
+        return parts.joined(separator: ", ").nilIfBlank
     }
 }
 
@@ -7782,6 +13869,11 @@ private extension Double {
 }
 
 private extension String {
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     var humanized: String {
         replacingOccurrences(of: "_", with: " ")
             .split(separator: " ")
@@ -7789,6 +13881,21 @@ private extension String {
                 word.prefix(1).uppercased() + word.dropFirst().lowercased()
             }
             .joined(separator: " ")
+    }
+
+    var paymentDisplayText: String {
+        switch trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "cash":
+            return "Cash"
+        case "bank":
+            return "Bank"
+        case "qr", "bank_qr":
+            return "QR"
+        case "card":
+            return "Card"
+        default:
+            return humanized.nilIfBlank ?? "Not recorded"
+        }
     }
 }
 
@@ -7812,7 +13919,7 @@ private enum Haptics {
     }
 }
 
-private enum AppPalette {
+enum AppPalette {
     static let background = Color.white
     static let card = Color(red: 0.975, green: 0.975, blue: 0.970)
     static let line = Color(red: 0.90, green: 0.88, blue: 0.85)
@@ -7825,5 +13932,15 @@ private enum AppPalette {
 }
 
 #Preview("Kitchen Dashboard") {
-    ContentView(startsPolling: false)
+    ContentView(startsPolling: false, showsSplash: false)
+}
+
+#Preview("iPhone Shell") {
+    ContentView(startsPolling: false, showsSplash: false)
+        .environment(\.horizontalSizeClass, .compact)
+        .frame(width: 393, height: 852)
+}
+
+#Preview("Launch Splash") {
+    LaunchSplashView(wallpaperAssetName: "POSLightWallpaper", accentColor: AppPalette.orange) {}
 }
