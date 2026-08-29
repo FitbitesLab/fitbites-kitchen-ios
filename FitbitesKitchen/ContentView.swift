@@ -252,7 +252,11 @@ struct ContentView: View {
 
     private func confirmKitchenCancelOrder(_ order: KitchenOrder) {
         pendingKitchenCancelOrder = nil
-        Task { await store.update(order: order, status: .cancelled) }
+        Task {
+            await store.update(order: order, status: .cancelled)
+            await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken)
+            await posStore.refreshRecap(baseURL: store.baseURL, token: store.kitchenToken)
+        }
     }
 
     private var posCategorySwipeGesture: some Gesture {
