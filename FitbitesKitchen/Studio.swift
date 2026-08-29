@@ -215,6 +215,10 @@ struct StudioAPIClient {
         try await request(path: "/api/studio/inventory/items/\(id)", method: "DELETE")
     }
 
+    fileprivate func generateRecipeInsights(_ payload: StudioRecipeInsightRequest) async throws -> StudioRecipeInsightResponse {
+        try await request(path: "/api/studio/recipe-insights", method: "POST", body: payload)
+    }
+
     private func request<Response: Decodable>(path: String, method: String = "GET") async throws -> Response {
         try await request(path: path, method: method, bodyData: nil)
     }
@@ -481,6 +485,78 @@ struct StudioInventoryItemRequest: Encodable {
 struct StudioInventoryStockRequest: Encodable {
     let direction: String
     let amount: Double
+}
+
+fileprivate struct StudioRecipeInsightRequest: Encodable {
+    let recipeName: String
+    let category: String
+    let servingSize: String
+    let recipeYield: Double
+    let version: String
+    let sellingPrice: Double
+    let ingredients: [StudioRecipeInsightIngredientRequest]
+
+    enum CodingKeys: String, CodingKey {
+        case recipeName = "recipe_name"
+        case category
+        case servingSize = "serving_size"
+        case recipeYield = "yield"
+        case version
+        case sellingPrice = "selling_price"
+        case ingredients
+    }
+}
+
+fileprivate struct StudioRecipeInsightIngredientRequest: Encodable {
+    let name: String
+    let quantity: Double
+    let unit: String
+    let unitCost: Double
+    let lineCost: Double
+
+    init(ingredient: StudioLabIngredient) {
+        name = ingredient.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        quantity = ingredient.quantityValue
+        unit = ingredient.unit.trimmingCharacters(in: .whitespacesAndNewlines)
+        unitCost = ingredient.unitCostValue
+        lineCost = ingredient.lineCost
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case quantity
+        case unit
+        case unitCost = "unit_cost"
+        case lineCost = "line_cost"
+    }
+}
+
+fileprivate struct StudioRecipeInsightResponse: Decodable {
+    let insights: [StudioRecipeAIInsight]
+    let alternatives: [StudioRecipeAIAlternative]
+}
+
+fileprivate struct StudioRecipeAIInsight: Decodable, Identifiable {
+    var id: String { "\(tone)-\(title)-\(body)" }
+    let tone: String
+    let icon: String?
+    let title: String
+    let body: String
+}
+
+fileprivate struct StudioRecipeAIAlternative: Decodable, Identifiable {
+    var id: String { "\(title)-\(lines.joined(separator: "|"))" }
+    let title: String
+    let lines: [String]
+    let estimatedMargin: Double?
+    let estimatedProfit: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case lines
+        case estimatedMargin = "estimated_margin"
+        case estimatedProfit = "estimated_profit"
+    }
 }
 
 struct StudioPeriod: Decodable {
@@ -768,6 +844,8 @@ struct StudioRootView: View {
                         StudioInventoryContent(
                             payload: inventoryPayload,
                             selectedTab: store.selectedInventoryTab,
+                            baseURL: baseURL,
+                            studioToken: studioToken,
                             accentColor: accentColor,
                             onCreateCategory: { request in
                                 await store.updateInventory(baseURL: baseURL, token: studioToken) { client in
@@ -1136,6 +1214,8 @@ private struct StudioContent: View {
 private struct StudioInventoryContent: View {
     let payload: StudioInventoryPayload
     let selectedTab: StudioInventoryTab
+    let baseURL: String
+    let studioToken: String
     let accentColor: Color
     let onCreateCategory: (StudioInventoryCategoryRequest) async -> Void
     let onCreateItem: (StudioInventoryItemRequest) async -> Void
@@ -1153,7 +1233,7 @@ private struct StudioInventoryContent: View {
             case .ingredients:
                 StudioInventoryItemsPanel(title: "Ingredients", mode: .ingredients, kicker: "\(payload.ingredients.count) items", items: payload.ingredients, valueMode: .cost, accentColor: accentColor, onCreateCategory: onCreateCategory, onCreateItem: onCreateItem, onUpdateItem: onUpdateItem, onAdjustStock: onAdjustStock, onDeleteItem: onDeleteItem)
             case .recipeLab:
-                StudioRecipeLabPanel(accentColor: accentColor)
+                StudioRecipeLabPanel(baseURL: baseURL, studioToken: studioToken, accentColor: accentColor)
             case .planning:
                 StudioInventoryPlanningPanel(rows: payload.planning, movements: payload.movements, accentColor: accentColor)
             }
@@ -2117,6 +2197,8 @@ private struct StudioInventoryItemInspector: View {
 }
 
 private struct StudioRecipeLabPanel: View {
+    let baseURL: String
+    let studioToken: String
     let accentColor: Color
     @State private var recipeName = "PROTEIN OATS - DAILY GO"
     @State private var category = "PROTEIN OATS"
@@ -2125,13 +2207,69 @@ private struct StudioRecipeLabPanel: View {
     @State private var version = "1.0 TEST"
     @State private var sellingPrice = "65000"
     @State private var ingredients: [StudioLabIngredient] = StudioLabIngredient.sample
+    @State private var aiResponse: StudioRecipeInsightResponse?
+    @State private var aiErrorMessage: String?
+    @State private var isLoadingAIInsights = false
+    @State private var aiInsightTask: Task<Void, Never>?
+    private let isRemoteAIEnabled = false
 
     private var metrics: StudioLabMetrics {
         StudioLabMetrics(ingredients: ingredients, sellingPrice: parseDouble(sellingPrice))
     }
 
+    private var activeIngredients: [StudioLabIngredient] {
+        ingredients.filter { $0.name.nilIfBlank != nil && $0.lineCost > 0 }
+    }
+
     private var sortedIngredients: [StudioLabIngredient] {
-        ingredients.sorted { $0.lineCost > $1.lineCost }
+        activeIngredients.sorted { $0.lineCost > $1.lineCost }
+    }
+
+    private var primaryCostIngredient: StudioLabIngredient? {
+        sortedIngredients.first
+    }
+
+    private var secondaryCostIngredient: StudioLabIngredient? {
+        sortedIngredients.dropFirst().first
+    }
+
+    private var lowestCostIngredient: StudioLabIngredient? {
+        activeIngredients.sorted { $0.unitCostValue < $1.unitCostValue }.first
+    }
+
+    private var localInsights: [StudioLabInsight] {
+        StudioLabInsight.make(from: metrics, ingredients: sortedIngredients)
+    }
+
+    @MainActor private var displayedInsights: [StudioLabInsight] {
+        guard let aiResponse, !aiResponse.insights.isEmpty else {
+            return localInsights
+        }
+
+        return aiResponse.insights.map(StudioLabInsight.init(aiInsight:))
+    }
+
+    private var aiAlternatives: [StudioRecipeAIAlternative] {
+        aiResponse?.alternatives.filter { !$0.lines.isEmpty } ?? []
+    }
+
+    @MainActor private var recipeInsightRequest: StudioRecipeInsightRequest {
+        StudioRecipeInsightRequest(
+            recipeName: recipeName,
+            category: category,
+            servingSize: servingSize,
+            recipeYield: parseDouble(recipeYield),
+            version: version,
+            sellingPrice: parseDouble(sellingPrice),
+            ingredients: activeIngredients.map(StudioRecipeInsightIngredientRequest.init(ingredient:))
+        )
+    }
+
+    private var recipeInsightSignature: String {
+        let ingredientSignature = ingredients
+            .map { "\($0.name)|\($0.quantity)|\($0.unit)|\($0.unitCost)" }
+            .joined(separator: "||")
+        return [recipeName, category, servingSize, recipeYield, version, sellingPrice, ingredientSignature].joined(separator: "~~")
     }
 
     var body: some View {
@@ -2180,6 +2318,17 @@ private struct StudioRecipeLabPanel: View {
                 .font(GlacialFont.custom(9.5, .regular))
                 .tracking(2.0)
                 .foregroundStyle(AppPalette.muted)
+        }
+        .onAppear {
+            scheduleAIInsightRefresh()
+        }
+        .onChange(of: recipeInsightSignature) { _, _ in
+            aiResponse = nil
+            aiErrorMessage = nil
+            scheduleAIInsightRefresh()
+        }
+        .onDisappear {
+            aiInsightTask?.cancel()
         }
     }
 
@@ -2238,9 +2387,16 @@ private struct StudioRecipeLabPanel: View {
     }
 
     private var insightsPanel: some View {
-        StudioPanel(title: "AI Insights", kicker: "3. Signals") {
-            VStack(spacing: 9) {
-                ForEach(StudioLabInsight.make(from: metrics, ingredients: sortedIngredients)) { insight in
+        StudioPanel(title: "AI Insights", kicker: isLoadingAIInsights ? "AI syncing" : (aiResponse == nil ? "Local fallback" : "OpenAI")) {
+            VStack(alignment: .leading, spacing: 9) {
+                if let aiErrorMessage {
+                    Text(aiErrorMessage)
+                        .font(GlacialFont.custom(9.5, .medium))
+                        .tracking(1.6)
+                        .foregroundStyle(AppPalette.orange)
+                }
+
+                ForEach(displayedInsights) { insight in
                     StudioRecipeInsightCard(insight: insight, accentColor: accentColor)
                 }
             }
@@ -2251,36 +2407,53 @@ private struct StudioRecipeLabPanel: View {
     private var alternativesPanel: some View {
         StudioPanel(title: "Recipe Alternatives", kicker: "Sandbox ideas") {
             HStack(alignment: .top, spacing: 12) {
-                StudioRecipeAlternativeCard(
-                    title: "Alternative 1",
-                    lines: ["REDUCE HONEY BY 3G", "REDUCE GRANOLA BY 5G"],
-                    margin: alternativeMargin(cost: max(0, metrics.recipeCost - 1900), price: metrics.sellingPrice),
-                    profit: metrics.sellingPrice - max(0, metrics.recipeCost - 1900),
-                    accentColor: accentColor
-                ) {
-                    applyIngredientDelta(nameContains: "HONEY", amount: -3)
-                    applyIngredientDelta(nameContains: "GRANOLA", amount: -5)
-                }
+                if !aiAlternatives.isEmpty {
+                    ForEach(Array(aiAlternatives.prefix(3).enumerated()), id: \.element.id) { index, alternative in
+                        StudioRecipeAlternativeCard(
+                            title: alternative.title.nilIfBlank ?? "Alternative \(index + 1)",
+                            lines: alternative.lines,
+                            margin: alternative.estimatedMargin ?? metrics.grossMargin,
+                            profit: alternative.estimatedProfit ?? metrics.grossProfit,
+                            accentColor: accentColor
+                        ) {}
+                    }
+                } else {
+                    StudioRecipeAlternativeCard(
+                        title: "Alternative 1",
+                        lines: firstAlternativeLines,
+                        margin: alternativeMargin(cost: firstAlternativeCost, price: metrics.sellingPrice),
+                        profit: metrics.sellingPrice - firstAlternativeCost,
+                        accentColor: accentColor
+                    ) {
+                        if let ingredient = primaryCostIngredient {
+                            applyIngredientDelta(id: ingredient.id, amount: -min(3, ingredient.quantityValue))
+                        }
+                    }
 
-                StudioRecipeAlternativeCard(
-                    title: "Alternative 2",
-                    lines: ["INCREASE PRICE TO 68,000 VND", "KEEP RECIPE UNCHANGED"],
-                    margin: alternativeMargin(cost: metrics.recipeCost, price: max(metrics.sellingPrice, 68000)),
-                    profit: max(metrics.sellingPrice, 68000) - metrics.recipeCost,
-                    accentColor: accentColor
-                ) {
-                    sellingPrice = cleanNumber(max(metrics.sellingPrice, 68000))
-                }
+                    StudioRecipeAlternativeCard(
+                        title: "Alternative 2",
+                        lines: priceAlternativeLines,
+                        margin: alternativeMargin(cost: metrics.recipeCost, price: targetPrice),
+                        profit: targetPrice - metrics.recipeCost,
+                        accentColor: accentColor
+                    ) {
+                        sellingPrice = cleanNumber(targetPrice)
+                    }
 
-                StudioRecipeAlternativeCard(
-                    title: "Alternative 3",
-                    lines: ["REDUCE BLUEBERRIES BY 10G", "INCREASE YOGURT BY 10G"],
-                    margin: alternativeMargin(cost: max(0, metrics.recipeCost - 600), price: metrics.sellingPrice),
-                    profit: metrics.sellingPrice - max(0, metrics.recipeCost - 600),
-                    accentColor: accentColor
-                ) {
-                    applyIngredientDelta(nameContains: "BLUEBERR", amount: -10)
-                    applyIngredientDelta(nameContains: "YOGURT", amount: 10)
+                    StudioRecipeAlternativeCard(
+                        title: "Alternative 3",
+                        lines: balanceAlternativeLines,
+                        margin: alternativeMargin(cost: balanceAlternativeCost, price: metrics.sellingPrice),
+                        profit: metrics.sellingPrice - balanceAlternativeCost,
+                        accentColor: accentColor
+                    ) {
+                        if let expensive = primaryCostIngredient {
+                            applyIngredientDelta(id: expensive.id, amount: -min(5, expensive.quantityValue))
+                        }
+                        if let lowerCost = lowerCostBalanceIngredient {
+                            applyIngredientDelta(id: lowerCost.id, amount: 5)
+                        }
+                    }
                 }
             }
         }
@@ -2308,15 +2481,115 @@ private struct StudioRecipeLabPanel: View {
         price > 0 ? ((price - cost) / price) * 100 : 0
     }
 
-    private func applyIngredientDelta(nameContains needle: String, amount: Double) {
+    private var targetPrice: Double {
+        guard metrics.recipeCost > 0 else { return max(metrics.sellingPrice, 0) }
+        return max(metrics.sellingPrice, ceil((metrics.recipeCost / 0.48) / 1000) * 1000)
+    }
+
+    private var lowerCostBalanceIngredient: StudioLabIngredient? {
+        guard let primaryCostIngredient else { return nil }
+        return activeIngredients
+            .filter { $0.id != primaryCostIngredient.id && $0.unitCostValue < primaryCostIngredient.unitCostValue }
+            .sorted { $0.unitCostValue < $1.unitCostValue }
+            .first
+    }
+
+    private var firstAlternativeCost: Double {
+        guard let ingredient = primaryCostIngredient else { return metrics.recipeCost }
+        return max(0, metrics.recipeCost - min(3, ingredient.quantityValue) * ingredient.unitCostValue)
+    }
+
+    private var balanceAlternativeCost: Double {
+        guard let expensive = primaryCostIngredient else { return metrics.recipeCost }
+        let reduction = min(5, expensive.quantityValue) * expensive.unitCostValue
+        let increase = (lowerCostBalanceIngredient?.unitCostValue ?? 0) * 5
+        return max(0, metrics.recipeCost - reduction + increase)
+    }
+
+    private var firstAlternativeLines: [String] {
+        guard let ingredient = primaryCostIngredient else {
+            return ["ADD INGREDIENT COSTS", "INSIGHTS UPDATE LIVE"]
+        }
+
+        return [
+            "REDUCE \(ingredient.name.uppercased()) BY \(cleanNumber(min(3, ingredient.quantityValue)))\(ingredient.unit.uppercased())",
+            secondaryCostIngredient.map { "WATCH \($0.name.uppercased()) NEXT" } ?? "RECHECK PORTION SIZE"
+        ]
+    }
+
+    private var priceAlternativeLines: [String] {
+        guard targetPrice > metrics.sellingPrice else {
+            return ["CURRENT PRICE CLEARS TARGET", "KEEP RECIPE UNCHANGED"]
+        }
+
+        return [
+            "INCREASE PRICE TO \(money(targetPrice).uppercased())",
+            "AIM FOR 52% MARGIN"
+        ]
+    }
+
+    private var balanceAlternativeLines: [String] {
+        guard let expensive = primaryCostIngredient else {
+            return ["ADD INGREDIENTS FIRST", "NO COST SIGNAL YET"]
+        }
+
+        guard let lowerCost = lowerCostBalanceIngredient else {
+            return [
+                "REDUCE \(expensive.name.uppercased()) BY \(cleanNumber(min(5, expensive.quantityValue)))\(expensive.unit.uppercased())",
+                "NO LOWER COST SWAP FOUND"
+            ]
+        }
+
+        return [
+            "REDUCE \(expensive.name.uppercased()) BY \(cleanNumber(min(5, expensive.quantityValue)))\(expensive.unit.uppercased())",
+            "INCREASE \(lowerCost.name.uppercased()) BY 5\(lowerCost.unit.uppercased())"
+        ]
+    }
+
+    private func applyIngredientDelta(id: UUID, amount: Double) {
         ingredients = ingredients.map { ingredient in
-            guard ingredient.name.uppercased().contains(needle) else {
+            guard ingredient.id == id else {
                 return ingredient
             }
 
             var copy = ingredient
             copy.quantity = cleanNumber(max(0, ingredient.quantityValue + amount))
             return copy
+        }
+    }
+
+    private func scheduleAIInsightRefresh() {
+        aiInsightTask?.cancel()
+
+        let request = recipeInsightRequest
+        guard isRemoteAIEnabled,
+              !studioToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !request.ingredients.isEmpty else {
+            isLoadingAIInsights = false
+            return
+        }
+
+        aiInsightTask = Task {
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            guard !Task.isCancelled else { return }
+
+            await MainActor.run {
+                isLoadingAIInsights = true
+            }
+
+            do {
+                let response = try await StudioAPIClient(baseURL: baseURL, token: studioToken).generateRecipeInsights(request)
+                await MainActor.run {
+                    aiResponse = response
+                    aiErrorMessage = nil
+                    isLoadingAIInsights = false
+                }
+            } catch {
+                await MainActor.run {
+                    aiErrorMessage = "AI unavailable. Showing local signals."
+                    isLoadingAIInsights = false
+                }
+            }
         }
     }
 }
@@ -2333,7 +2606,7 @@ private struct StudioLabIngredient: Identifiable {
     var lineCost: Double { quantityValue * unitCostValue }
 
     static var blank: StudioLabIngredient {
-        StudioLabIngredient(id: UUID(), name: "NEW INGREDIENT", quantity: "10", unit: "G", unitCost: "100")
+        StudioLabIngredient(id: UUID(), name: "", quantity: "0", unit: "G", unitCost: "0")
     }
 
     static var sample: [StudioLabIngredient] {
@@ -2380,23 +2653,78 @@ private struct StudioLabInsight: Identifiable {
     let title: String
     let body: String
 
+    init(tone: StudioLabInsightTone, icon: String, title: String, body: String) {
+        self.tone = tone
+        self.icon = icon
+        self.title = title
+        self.body = body
+    }
+
+    init(aiInsight: StudioRecipeAIInsight) {
+        let normalizedTone = aiInsight.tone.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalizedTone {
+        case "good", "positive", "success":
+            tone = .good
+        case "poor", "bad", "risk", "warning":
+            tone = .poor
+        default:
+            tone = .medium
+        }
+
+        icon = aiInsight.icon?.nilIfBlank ?? "sparkles"
+        title = aiInsight.title
+        body = aiInsight.body
+    }
+
     static func make(from metrics: StudioLabMetrics, ingredients: [StudioLabIngredient]) -> [StudioLabInsight] {
+        guard !ingredients.isEmpty, metrics.recipeCost > 0 else {
+            return [
+                StudioLabInsight(tone: .medium, icon: "plus", title: "ADD COSTED INGREDIENTS", body: "ENTER QUANTITY AND UNIT COST TO GENERATE RECIPE SIGNALS."),
+                StudioLabInsight(tone: .medium, icon: "tag", title: "SET SELLING PRICE", body: "PRICE IS USED TO CHECK FOOD COST, MARGIN AND PROFIT."),
+                StudioLabInsight(tone: .good, icon: "sparkles", title: "LOCAL INSIGHTS READY", body: "THIS FALLBACK WORKS WITHOUT OPENAI CREDITS."),
+            ]
+        }
+
         let top = ingredients.first
-        let topShare = metrics.recipeCost > 0 ? (top?.lineCost ?? 0) / metrics.recipeCost * 100 : 0
+        let topShare = (top?.lineCost ?? 0) / metrics.recipeCost * 100
         let marginTone: StudioLabInsightTone = metrics.grossMargin >= 50 ? .good : (metrics.grossMargin >= 35 ? .medium : .poor)
         let marginTitle = metrics.grossMargin >= 50
             ? "CURRENT GROSS MARGIN IS HEALTHY"
             : (metrics.grossMargin >= 35 ? "CURRENT MARGIN CAN IMPROVE" : "CURRENT PRICE LOOKS LOW")
         let targetPrice = metrics.recipeCost > 0 ? ceil((metrics.recipeCost / 0.48) / 1000) * 1000 : 0
-        let saver = ingredients.first { $0.quantityValue >= 10 && $0.unitCostValue > 0 }
-        let saving = (saver?.unitCostValue ?? 0) * min(3, saver?.quantityValue ?? 0)
+        let highUnitCost = ingredients.max { $0.unitCostValue < $1.unitCostValue }
+        let cheapestUnitCost = ingredients.min { $0.unitCostValue < $1.unitCostValue }
+        let saver = ingredients.first { $0.quantityValue >= 5 && $0.unitCostValue > 0 }
+        let saverAmount = min(max(saver?.quantityValue ?? 0, 0), saver?.unit.uppercased() == "G" ? 5 : 1)
+        let saving = (saver?.unitCostValue ?? 0) * saverAmount
+        let swapSuggestion = replacementSuggestion(expensive: highUnitCost, cheaper: cheapestUnitCost)
+        let concentrationTone: StudioLabInsightTone = topShare >= 45 ? .poor : (topShare >= 30 ? .medium : .good)
 
         return [
             StudioLabInsight(tone: marginTone, icon: "activity", title: marginTitle, body: "MARGIN \(String(format: "%.1f", metrics.grossMargin))% · FOOD COST \(String(format: "%.1f", metrics.foodCost))%"),
-            StudioLabInsight(tone: .medium, icon: "chart.bar", title: "\(top?.name.uppercased() ?? "INGREDIENT") IS THE LARGEST COST", body: "IT REPRESENTS \(String(format: "%.1f", topShare))% OF TOTAL RECIPE COST."),
+            StudioLabInsight(tone: concentrationTone, icon: "chart.bar", title: "\(top?.name.uppercased() ?? "INGREDIENT") DRIVES COST", body: "IT REPRESENTS \(String(format: "%.1f", topShare))% OF TOTAL RECIPE COST."),
+            StudioLabInsight(tone: swapSuggestion == nil ? .good : .medium, icon: "arrow.left.arrow.right", title: swapSuggestion?.title ?? "NO LOWER COST SWAP FOUND", body: swapSuggestion?.body ?? "COST IS ALREADY EVENLY DISTRIBUTED ACROSS CURRENT INGREDIENTS."),
             StudioLabInsight(tone: targetPrice > metrics.sellingPrice ? .medium : .good, icon: "arrow.up.right", title: "TARGET MARGIN CHECK", body: targetPrice > metrics.sellingPrice ? "TRY AROUND \(money(targetPrice).uppercased()) FOR 52% MARGIN." : "CURRENT PRICE IS ABOVE THE 52% TARGET ESTIMATE."),
-            StudioLabInsight(tone: .good, icon: "minus", title: saver.map { "SMALL REDUCTION: \($0.name.uppercased())" } ?? "NO REDUCTION SIGNAL YET", body: saver.map { "REDUCE UP TO 3 \($0.unit.uppercased()) TO SAVE ABOUT \(money(saving).uppercased())." } ?? "ADD MORE INGREDIENT QUANTITIES TO GENERATE IDEAS."),
+            StudioLabInsight(tone: .good, icon: "minus", title: saver.map { "SMALL REDUCTION: \($0.name.uppercased())" } ?? "NO REDUCTION SIGNAL YET", body: saver.map { "REDUCE \(cleanNumber(saverAmount)) \($0.unit.uppercased()) TO SAVE ABOUT \(money(saving).uppercased())." } ?? "ADD MORE INGREDIENT QUANTITIES TO GENERATE IDEAS."),
         ]
+    }
+
+    private static func replacementSuggestion(expensive: StudioLabIngredient?, cheaper: StudioLabIngredient?) -> (title: String, body: String)? {
+        guard let expensive,
+              let cheaper,
+              expensive.id != cheaper.id,
+              expensive.unitCostValue > cheaper.unitCostValue * 1.35 else {
+            return nil
+        }
+
+        let unit = expensive.unit.nilIfBlank ?? cheaper.unit
+        let amount = expensive.unit.uppercased() == "G" ? "5G" : "1 \(unit.uppercased())"
+        let estimatedSaving = (expensive.unitCostValue - cheaper.unitCostValue) * (expensive.unit.uppercased() == "G" ? 5 : 1)
+
+        return (
+            "CHECK SWAP: \(expensive.name.uppercased())",
+            "REPLACE ABOUT \(amount) WITH \(cheaper.name.uppercased()) TO SAVE ABOUT \(money(max(0, estimatedSaving)).uppercased())."
+        )
     }
 }
 
@@ -4221,6 +4549,13 @@ private func cleanNumber(_ value: Double) -> String {
 
 private func parseDouble(_ value: String) -> Double {
     Double(value.replacingOccurrences(of: ",", with: "").trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+}
+
+private extension String {
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 }
 
 private func compactMoney(_ value: Double) -> String {

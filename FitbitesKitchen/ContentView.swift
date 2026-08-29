@@ -13,6 +13,7 @@ import CoreText
 import UniformTypeIdentifiers
 import PhotosUI
 import Network
+import CryptoKit
 
 private enum AppSection {
     case kitchen
@@ -49,6 +50,99 @@ private extension View {
     }
 }
 
+private enum POSLocalAuthStore {
+    private static let pinHashKey = "POSLocalPINHash"
+    private static let operatorIDKey = "POSLocalOperatorID"
+    private static let operatorNameKey = "POSLocalOperatorName"
+    private static let operatorRoleKey = "POSLocalOperatorRole"
+
+    static func cachedOperator(for pin: String) -> POSOperator? {
+        let trimmed = pin.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (4...6).contains(trimmed.count),
+              UserDefaults.standard.string(forKey: pinHashKey) == hash(trimmed) else {
+            return nil
+        }
+
+        let id = UserDefaults.standard.integer(forKey: operatorIDKey)
+        guard id > 0,
+              let name = UserDefaults.standard.string(forKey: operatorNameKey),
+              let role = UserDefaults.standard.string(forKey: operatorRoleKey) else {
+            return nil
+        }
+
+        return POSOperator(id: id, name: name, role: role)
+    }
+
+    static var hasCachedPIN: Bool {
+        UserDefaults.standard.string(forKey: pinHashKey)?.isEmpty == false
+    }
+
+    static func save(pin: String, posOperator: POSOperator) {
+        UserDefaults.standard.set(hash(pin), forKey: pinHashKey)
+        UserDefaults.standard.set(posOperator.id, forKey: operatorIDKey)
+        UserDefaults.standard.set(posOperator.name, forKey: operatorNameKey)
+        UserDefaults.standard.set(posOperator.role, forKey: operatorRoleKey)
+    }
+
+    static func clear() {
+        UserDefaults.standard.removeObject(forKey: pinHashKey)
+        UserDefaults.standard.removeObject(forKey: operatorIDKey)
+        UserDefaults.standard.removeObject(forKey: operatorNameKey)
+        UserDefaults.standard.removeObject(forKey: operatorRoleKey)
+    }
+
+    private static func hash(_ pin: String) -> String {
+        let salt = Bundle.main.bundleIdentifier ?? "FitbitesKitchen"
+        let digest = SHA256.hash(data: Data("\(salt)|\(pin)".utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private enum POSBootstrapCache {
+    private static let key = "POSBootstrapCache"
+
+    static func load() -> POSBootstrapResponse? {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder.kitchen.decode(POSBootstrapResponse.self, from: data)
+    }
+
+    static func save(_ bootstrap: POSBootstrapResponse) {
+        guard let data = try? JSONEncoder.kitchen.encode(bootstrap) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+
+    static func clear() {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+}
+
+private enum POSLocalShiftStateStore {
+    private static let key = "POSLocalShiftIsOpen"
+    private static let openedFromAuthKey = "POSLocalShiftOpenedFromAuth"
+
+    static var hasLocalDecision: Bool {
+        UserDefaults.standard.object(forKey: key) != nil
+    }
+
+    static var isOpen: Bool {
+        UserDefaults.standard.bool(forKey: key)
+    }
+
+    static var isOpenedFromAuth: Bool {
+        UserDefaults.standard.bool(forKey: openedFromAuthKey)
+    }
+
+    static func markOpen() {
+        UserDefaults.standard.set(true, forKey: key)
+        UserDefaults.standard.set(true, forKey: openedFromAuthKey)
+    }
+
+    static func markClosed() {
+        UserDefaults.standard.set(false, forKey: key)
+        UserDefaults.standard.set(false, forKey: openedFromAuthKey)
+    }
+}
+
 private struct NoHighlightButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -75,7 +169,7 @@ struct ContentView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     private let startsPolling: Bool
     private let showsSplash: Bool
-    @State private var selectedSection: AppSection = .pos
+    @State private var selectedSection: AppSection = .kitchen
     @State private var selectedStatus: KitchenStatus? = nil
     @State private var selectedSource: KitchenSource? = nil
     @State private var selectedOrder: KitchenOrder?
@@ -90,18 +184,20 @@ struct ContentView: View {
     @State private var isPOSEndShiftOpen = false
     @State private var isPOSCheckoutOpen = false
     @State private var isPOSRecapOpen = false
+    @State private var isPOSKeySetupOpen = false
     @State private var isSplashVisible: Bool
     @State private var isPOSArrangeMode = false
     @State private var saleCompletion: POSSaleCompletion?
     @State private var posPinEntry = ""
     @State private var posOpeningCashText = ""
-    @State private var posPendingPINForCash: String?
+    @State private var currentPOSSessionPIN = ""
     @State private var posPinWelcome: POSPinWelcome?
     @State private var posCategorySwipeCommand = POSCategorySwipeCommand(offset: 0)
     @State private var selectedCompactTab: CompactShellTab = .pos
     @State private var didApplyInitialLaunchSection = false
     @State private var posStaffSessionSkipped = false
-    @State private var posStaffSessionToken = ""
+    @State private var isPOSUnlocked = false
+    @AppStorage("POSStaffSessionToken") private var posStaffSessionToken = ""
     @AppStorage("POSProductDisplayStyle") private var posProductDisplayStyleRaw = POSProductDisplayStyle.productCard.rawValue
     @AppStorage("POSAccentColor") private var posAccentColorRaw = POSAccentColor.ember.rawValue
     @AppStorage("POSToppingCategoryOrder") private var posToppingCategoryOrderRaw = ""
@@ -143,7 +239,7 @@ struct ContentView: View {
     }
 
     private var canAccessAdminFeatures: Bool {
-        hasPOSStaffSession && (posStore.bootstrap?.operator.canAccessAdminFeatures ?? false)
+        isPOSUnlocked && (posStore.bootstrap?.operator.canAccessAdminFeatures ?? false)
     }
 
     private var hasPOSStaffSession: Bool {
@@ -151,23 +247,23 @@ struct ContentView: View {
     }
 
     private var canAccessPOS: Bool {
-        hasPOSStaffSession
+        isPOSUnlocked
     }
 
     private var canAccessRecap: Bool {
-        hasPOSStaffSession
+        isPOSUnlocked
+    }
+
+    private var canInputPOSSales: Bool {
+        posStore.hasOpenShiftForCurrentOperator
     }
 
     private var shouldShowPOSPinGate: Bool {
-        !isSplashVisible && !hasPOSStaffSession && !posStaffSessionSkipped && posPendingPINForCash == nil
-    }
-
-    private var shouldShowPOSCashDeclaration: Bool {
-        !isSplashVisible && !hasPOSStaffSession && !posStaffSessionSkipped && posPendingPINForCash != nil
+        !isSplashVisible && !isPOSUnlocked && !posStaffSessionSkipped
     }
 
     private var isPOSAuthOverlayVisible: Bool {
-        shouldShowPOSPinGate || shouldShowPOSCashDeclaration
+        shouldShowPOSPinGate
     }
 
     private var isCompactShell: Bool {
@@ -294,6 +390,27 @@ struct ContentView: View {
         }
     }
 
+    @MainActor
+    private func handleSyncedPOSSale(_ response: POSCreateSaleResponse, queuedSale: POSQueuedSale) async {
+        guard response.saleID > 0 else { return }
+
+        printStore.setPrintIntent(saleID: response.saleID, shouldPrint: queuedSale.shouldPrintReceipt)
+        var printResult = PrintReceiptResult.skipped
+        if queuedSale.shouldPrintReceipt {
+            printResult = await printStore.printSaleReceiptNow(saleID: response.saleID)
+        }
+
+        guard queuedSale.shouldPrintReceipt else { return }
+        showSaleCompletion(saleID: response.saleID, total: queuedSale.completionTotal, printResult: printResult)
+    }
+
+    private func syncQueuedPOSSales() {
+        posStore.syncQueuedSales(baseURL: store.baseURL, token: store.kitchenToken) { response, queuedSale in
+            await handleSyncedPOSSale(response, queuedSale: queuedSale)
+        }
+        posStore.syncQueuedShiftMutations(baseURL: store.baseURL, token: store.kitchenToken)
+    }
+
     private func selectSection(_ section: AppSection) {
         guard section != .studio || canAccessAdminFeatures else {
             Haptics.impact(.light)
@@ -310,6 +427,29 @@ struct ContentView: View {
         }
 
         closeCompactPanels()
+
+        if section == .pos, !canInputPOSSales {
+            selectedSection = .kitchen
+            selectedCompactTab = .kitchen
+            isPOSShiftMenuOpen = true
+            Task {
+                await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken)
+                await MainActor.run {
+                    if posStore.hasOpenShiftForCurrentOperator {
+                        selectedSection = .pos
+                        selectedCompactTab = .pos
+                        isPOSShiftMenuOpen = false
+                    } else {
+                        selectedSection = .kitchen
+                        selectedCompactTab = .kitchen
+                        isPOSShiftMenuOpen = true
+                    }
+                }
+            }
+            Haptics.impact(.light)
+            return
+        }
+
         selectedSection = section
         selectedCompactTab = section == .pos ? .pos : .kitchen
 
@@ -384,12 +524,50 @@ struct ContentView: View {
         selectedCompactTab = selectedSection == .pos ? .pos : .kitchen
     }
 
+    private func presentPOSStartShiftForm() {
+        if isCompactShell {
+            closeCompactPanelToCurrentSection()
+        } else {
+            isPOSShiftMenuOpen = false
+        }
+
+        Task { @MainActor in
+            await Task.yield()
+            isPOSStartShiftOpen = true
+        }
+    }
+
+    private func presentPOSEndShiftForm() {
+        if isCompactShell {
+            closeCompactPanelToCurrentSection()
+        } else {
+            isPOSShiftMenuOpen = false
+        }
+
+        Task { @MainActor in
+            await Task.yield()
+            isPOSEndShiftOpen = true
+        }
+    }
+
+    private func presentPOSCashMovementForm(_ type: POSCashMovementType) {
+        if isCompactShell {
+            closeCompactPanelToCurrentSection()
+        } else {
+            isPOSShiftMenuOpen = false
+        }
+
+        Task { @MainActor in
+            await Task.yield()
+            posCashMovementType = type
+        }
+    }
+
     private func signInLater() {
         withAnimation(.easeInOut(duration: 0.28)) {
             posStaffSessionSkipped = true
             posPinEntry = ""
             posOpeningCashText = ""
-            posPendingPINForCash = nil
             selectedSection = .kitchen
             selectedCompactTab = .kitchen
             closeCompactPanels()
@@ -401,22 +579,19 @@ struct ContentView: View {
     private func submitPOSPin(_ pin: String) {
         guard pin.count >= 4, pin.count <= 6 else { return }
 
-        withAnimation(.easeInOut(duration: 0.38)) {
-            posPendingPINForCash = pin
-            posOpeningCashText = ""
-            posStore.pinErrorMessage = nil
+        if let cachedOperator = POSLocalAuthStore.cachedOperator(for: pin) {
+            posStore.preparePINOnlyLocalShiftState()
+            unlockPOS(posOperator: cachedOperator, pin: pin, openingCash: nil)
+            renewPOSSessionInBackground(pin: pin)
+            return
         }
-    }
-
-    private func confirmPOSOpeningCash(_ openingCash: Double) {
-        guard let pin = posPendingPINForCash else { return }
 
         Task {
             guard let response = await posStore.authenticateStaffPIN(
                 baseURL: store.baseURL,
                 token: store.kitchenToken,
                 pin: pin,
-                openingCash: openingCash
+                openingCash: nil
             ) else {
                 await MainActor.run {
                     posPinEntry = ""
@@ -429,40 +604,68 @@ struct ContentView: View {
                 posStaffSessionSkipped = false
                 posPinEntry = ""
                 posOpeningCashText = ""
-                posPendingPINForCash = nil
-                selectedSection = .pos
-                selectedCompactTab = .pos
-                posPinWelcome = POSPinWelcome(operatorName: response.operator.name, openingCash: response.openingCash)
+                posStore.preparePINOnlyLocalShiftState()
+                unlockPOS(posOperator: response.operator, pin: pin, openingCash: nil)
                 posStore.setStaffSessionToken(response.sessionToken)
+                syncQueuedPOSSales()
             }
 
-            await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken)
+            Task { await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken) }
+        }
+    }
 
-            try? await Task.sleep(nanoseconds: 3_400_000_000)
-            await MainActor.run {
-                withAnimation(.easeInOut(duration: 0.72)) {
-                    posPinWelcome = nil
-                }
+    private func unlockPOS(posOperator: POSOperator, pin: String, openingCash: Double?) {
+        POSLocalAuthStore.save(pin: pin, posOperator: posOperator)
+        posStore.loadCachedBootstrapIfAvailable()
+        posStore.applyLocalOperator(posOperator)
+        currentPOSSessionPIN = pin
+        withAnimation(.easeOut(duration: 0.16)) {
+            isPOSUnlocked = true
+            posStaffSessionSkipped = false
+            posPinEntry = ""
+            posOpeningCashText = ""
+            selectedSection = .kitchen
+            selectedCompactTab = .kitchen
+            if let openingCash {
+                posPinWelcome = POSPinWelcome(operatorName: posOperator.name, openingCash: openingCash)
             }
         }
     }
 
-    private func returnToPOSPinEntry() {
-        withAnimation(.easeInOut(duration: 0.28)) {
-            posPendingPINForCash = nil
-            posOpeningCashText = ""
+    private func renewPOSSessionInBackground(pin: String) {
+        Task {
+            guard let response = await posStore.authenticateStaffPIN(
+                baseURL: store.baseURL,
+                token: store.kitchenToken,
+                pin: pin,
+                openingCash: nil,
+                showsProgress: false
+            ) else {
+                await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken)
+                return
+            }
+
+            await MainActor.run {
+                posStore.setStaffSessionToken(response.sessionToken)
+                posStaffSessionToken = response.sessionToken
+                POSLocalAuthStore.save(pin: pin, posOperator: response.operator)
+            }
+
+            await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken)
+            posStore.syncQueuedSales(baseURL: store.baseURL, token: store.kitchenToken) { response, queuedSale in
+                await handleSyncedPOSSale(response, queuedSale: queuedSale)
+            }
+            posStore.syncQueuedShiftMutations(baseURL: store.baseURL, token: store.kitchenToken)
         }
     }
 
     private func resetPOSStaffSessionToPIN() {
-        UserDefaults.standard.removeObject(forKey: "POSStaffSessionToken")
-
         withAnimation(.easeInOut(duration: 0.42)) {
-            posStaffSessionToken = ""
+            isPOSUnlocked = false
             posStaffSessionSkipped = false
             posPinEntry = ""
             posOpeningCashText = ""
-            posPendingPINForCash = nil
+            currentPOSSessionPIN = ""
             posPinWelcome = nil
             selectedSection = .pos
             selectedCompactTab = .pos
@@ -476,10 +679,41 @@ struct ContentView: View {
             settingsOpen = false
             isPOSRecapOpen = false
         }
-
-        posStore.setStaffSessionToken("")
-        posStore.clearStaffSession()
         Haptics.notification(.success)
+    }
+
+    private func ensurePOSStaffSession() async -> Bool {
+        let storedSessionToken = posStaffSessionToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !storedSessionToken.isEmpty {
+            posStore.setStaffSessionToken(storedSessionToken)
+            return true
+        }
+
+        let pin = currentPOSSessionPIN.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pin.isEmpty else {
+            posStore.errorMessage = "Sign in with your PIN again before opening a shift."
+            Haptics.notification(.error)
+            return false
+        }
+
+        guard let response = await posStore.authenticateStaffPIN(
+            baseURL: store.baseURL,
+            token: store.kitchenToken,
+            pin: pin,
+            openingCash: nil,
+            showsProgress: false
+        ) else {
+            if posStore.errorMessage == nil {
+                posStore.errorMessage = posStore.pinErrorMessage ?? "Could not connect to emberOS. Try again."
+            }
+            Haptics.notification(.error)
+            return false
+        }
+
+        posStaffSessionToken = response.sessionToken
+        posStore.setStaffSessionToken(response.sessionToken)
+        POSLocalAuthStore.save(pin: pin, posOperator: response.operator)
+        return true
     }
 
     private func applyInitialLaunchSectionIfNeeded() {
@@ -490,8 +724,8 @@ struct ContentView: View {
             selectedSection = .kitchen
             selectedCompactTab = .kitchen
         } else {
-            selectedSection = .pos
-            selectedCompactTab = .pos
+            selectedSection = .kitchen
+            selectedCompactTab = .kitchen
         }
 
         closeCompactPanels()
@@ -535,11 +769,7 @@ struct ContentView: View {
                 if selectedSection == .pos {
                     POSProductAreaWallpaper(assetName: selectedPOSAccentColor.wallpaperAssetName)
                         .ignoresSafeArea()
-                        .transition(.opacity)
-                        .animation(.easeInOut(duration: 0.28), value: selectedPOSAccentColor.wallpaperAssetName)
                         .opacity(isSplashVisible ? 0 : 1)
-                        .blur(radius: isPOSAuthOverlayVisible ? 3.2 : 0)
-                        .animation(.easeInOut(duration: 0.24), value: isPOSAuthOverlayVisible)
                 }
 
                 ScrollView {
@@ -556,13 +786,20 @@ struct ContentView: View {
                             cartItemCount: posStore.cartItemCount,
                             openTicketCount: posStore.openTicketCount,
                             cartTotal: posStore.cartTotal,
+                            pendingSyncCount: posStore.pendingSaleSyncCount + posStore.pendingShiftSyncCount,
                             posAccentColor: selectedPOSAccentColor.color,
                             isPOSArrangeMode: isPOSArrangeMode,
                             isCompact: isCompactShell,
                             studioPeriod: studioStore.selectedPeriod,
                             onHome: { selectSection(.pos) },
                             onFinishPOSArrange: { finishPOSArrangeMode() },
-                            onCart: { isPOSCheckoutOpen = true },
+                            onCart: {
+                                guard canInputPOSSales else {
+                                    selectSection(.pos)
+                                    return
+                                }
+                                isPOSCheckoutOpen = true
+                            },
                             onStudioPeriodSelect: { period in
                                 withAnimation(.easeInOut(duration: 0.18)) {
                                     studioStore.selectedPeriod = period
@@ -671,8 +908,6 @@ struct ContentView: View {
                 }
                 .opacity(isSplashVisible ? 0 : 1)
                 .animation(.easeInOut(duration: 0.42), value: isSplashVisible)
-                .blur(radius: isPOSAuthOverlayVisible ? 3.2 : 0)
-                .animation(.easeInOut(duration: 0.24), value: isPOSAuthOverlayVisible)
                 .allowsHitTesting(!isPOSAuthOverlayVisible)
 
                 if let message = store.notificationMessage {
@@ -713,7 +948,7 @@ struct ContentView: View {
                 }
 
                 if !isCompactShell {
-                    HStack(spacing: 14) {
+                    HStack(spacing: 20) {
                         if selectedSection == .pos, canAccessPOS, let bootstrap = posStore.bootstrap {
                             POSOperatorButton(
                                 operator: bootstrap.operator,
@@ -770,8 +1005,8 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain)
                     }
-                    .padding(.top, 18)
-                    .padding(.trailing, 22)
+                    .padding(.top, 10)
+                    .padding(.trailing, 28)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                     .opacity(isSplashVisible ? 0 : 1)
                     .animation(.easeInOut(duration: 0.42), value: isSplashVisible)
@@ -796,20 +1031,16 @@ struct ContentView: View {
                                 isSubmitting: posStore.isShiftSubmitting,
                                 accentColor: selectedPOSAccentColor.color,
                                 onOpenShift: {
-                                    closeCompactPanelToCurrentSection()
-                                    isPOSStartShiftOpen = true
+                                    presentPOSStartShiftForm()
                                 },
                                 onCashIn: {
-                                    closeCompactPanelToCurrentSection()
-                                    posCashMovementType = .deposit
+                                    presentPOSCashMovementForm(.deposit)
                                 },
                                 onCashOut: {
-                                    closeCompactPanelToCurrentSection()
-                                    posCashMovementType = .withdrawal
+                                    presentPOSCashMovementForm(.withdrawal)
                                 },
                                 onCloseShift: {
-                                    closeCompactPanelToCurrentSection()
-                                    isPOSEndShiftOpen = true
+                                    presentPOSEndShiftForm()
                                 },
                                 onSignOff: {
                                     resetPOSStaffSessionToPIN()
@@ -896,23 +1127,13 @@ struct ContentView: View {
                         isSubmitting: posStore.isPinAuthenticating,
                         errorMessage: posStore.pinErrorMessage,
                         accentColor: selectedPOSAccentColor.color,
+                        needsEmberKey: store.kitchenToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                         onSubmit: submitPOSPin,
+                        onSetupKey: {
+                            isPOSKeySetupOpen = true
+                        },
                         onSignInLater: signInLater
                     )
-                    .zIndex(24)
-                }
-
-                if shouldShowPOSCashDeclaration {
-                    POSOpeningCashDeclarationOverlay(
-                        openingCashText: $posOpeningCashText,
-                        isSubmitting: posStore.isPinAuthenticating,
-                        errorMessage: posStore.pinErrorMessage,
-                        accentColor: selectedPOSAccentColor.color,
-                        onConfirm: confirmPOSOpeningCash,
-                        onBack: returnToPOSPinEntry,
-                        onSignInLater: signInLater
-                    )
-                    .transition(.opacity)
                     .zIndex(24)
                 }
 
@@ -947,21 +1168,29 @@ struct ContentView: View {
                 }
             }
             .onAppear {
-                UserDefaults.standard.removeObject(forKey: "POSStaffSessionToken")
                 UserDefaults.standard.removeObject(forKey: "POSStaffSessionSkipped")
+                if POSLocalAuthStore.hasCachedPIN {
+                    isSplashVisible = false
+                }
+                posStore.loadCachedBootstrapIfAvailable()
                 posStore.setStaffSessionToken(posStaffSessionToken)
                 applyInitialLaunchSectionIfNeeded()
                 printStore.receiptLogoURL = posStore.brandLogoOverrideURL
+                printStore.receiptLogoScale = posBrandLogoScale
                 if startsPolling {
                     store.start()
                     printStore.start()
                 }
                 if hasPOSStaffSession {
+                    syncQueuedPOSSales()
                     Task { await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken) }
                 }
             }
             .onChange(of: posStore.brandLogoOverrideURL) { _, logoURL in
                 printStore.receiptLogoURL = logoURL
+            }
+            .onChange(of: posBrandLogoScale) { _, scale in
+                printStore.receiptLogoScale = scale
             }
             .onChange(of: posStore.bootstrap?.operator.role) { _, _ in
                 enforceOperatorAccess()
@@ -979,8 +1208,10 @@ struct ContentView: View {
                     if selectedSection == .studio, canAccessAdminFeatures {
                         Task { await studioStore.refresh(baseURL: store.baseURL, token: studioToken) }
                     } else if selectedSection == .pos, hasPOSStaffSession {
+                        syncQueuedPOSSales()
                         Task { await posStore.refresh(baseURL: store.baseURL, token: store.kitchenToken) }
                     } else if hasPOSStaffSession {
+                        syncQueuedPOSSales()
                         posStore.preloadForSmoothness(baseURL: store.baseURL, token: store.kitchenToken)
                     }
                 } else if phase == .background {
@@ -1063,6 +1294,14 @@ struct ContentView: View {
                     .presentationDetents([.large])
                     .emberSheetChrome()
             }
+            .sheet(isPresented: $isPOSKeySetupOpen) {
+                SettingsView(store: store, posStore: posStore, printStore: printStore, isConnectionOnly: true) {
+                    isPOSKeySetupOpen = false
+                    posStore.pinErrorMessage = nil
+                }
+                .presentationDetents([.large])
+                .emberSheetChrome()
+            }
             .sheet(isPresented: $isPOSCheckoutOpen) {
                 POSCheckoutSheet(
                     lines: posStore.cartLines,
@@ -1099,13 +1338,37 @@ struct ContentView: View {
                     defaultPrintReceipt: { source in
                         printStore.enabledSources.allows(source.receiptSourceKey)
                     },
+                    activeRewardRedemption: posStore.activeRewardRedemption,
+                    activeRewardQuote: posStore.activeRewardQuote,
                     onMarketplacePriceChange: { line, price in
                         posStore.setMarketplaceUnitPrice(line: line, price: price)
                     },
                     onToppingsChange: { line, toppings in
                         posStore.updateToppings(line: line, toppings: toppings)
                     },
-                    submit: { paymentMethod, source, reference, customer, discountPercent, notes, completionTotal, shouldPrintReceipt in
+                    scanRewardToken: { token in
+                        try await posStore.scanRewardToken(baseURL: store.baseURL, token: store.kitchenToken, rawToken: token)
+                    },
+                    quoteRewardSale: { paymentMethod, source, reference, customer, discountPercent, notes, rewardLineKey in
+                        try await posStore.quoteRewardSale(
+                            baseURL: store.baseURL,
+                            token: store.kitchenToken,
+                            paymentMethod: paymentMethod,
+                            orderSource: source,
+                            externalReference: reference,
+                            customer: customer,
+                            discountPercent: discountPercent,
+                            notes: notes,
+                            rewardLineKey: rewardLineKey
+                        )
+                    },
+                    clearRewardRedemption: {
+                        posStore.clearRewardRedemption()
+                    },
+                    clearRewardQuote: {
+                        posStore.clearRewardQuote()
+                    },
+                    submit: { paymentMethod, source, reference, customer, discountPercent, notes, completionTotal, shouldPrintReceipt, rewardRedemptionSessionID, rewardLineKey in
                         guard let response = await posStore.submitSale(
                             baseURL: store.baseURL,
                             token: store.kitchenToken,
@@ -1114,9 +1377,20 @@ struct ContentView: View {
                             externalReference: reference,
                             customer: customer,
                             discountPercent: discountPercent,
-                            notes: notes
+                            notes: notes,
+                            completionTotal: completionTotal,
+                            shouldPrintReceipt: shouldPrintReceipt,
+                            rewardRedemptionSessionID: rewardRedemptionSessionID,
+                            rewardLineKey: rewardLineKey,
+                            onSyncedSale: { response, queuedSale in
+                                await handleSyncedPOSSale(response, queuedSale: queuedSale)
+                            }
                         ) else {
                             return false
+                        }
+
+                        guard response.saleID > 0 else {
+                            return true
                         }
 
                         printStore.setPrintIntent(saleID: response.saleID, shouldPrint: shouldPrintReceipt)
@@ -1125,7 +1399,7 @@ struct ContentView: View {
                             printResult = await printStore.printSaleReceiptNow(saleID: response.saleID)
                         }
 
-                        showSaleCompletion(saleID: response.saleID, total: completionTotal, printResult: printResult)
+                        showSaleCompletion(saleID: response.saleID, total: response.total ?? completionTotal, printResult: printResult)
                         return true
                     }
                 )
@@ -1151,20 +1425,16 @@ struct ContentView: View {
                         isSubmitting: posStore.isShiftSubmitting,
                         accentColor: selectedPOSAccentColor.color,
                         onOpenShift: {
-                            isPOSShiftMenuOpen = false
-                            isPOSStartShiftOpen = true
+                            presentPOSStartShiftForm()
                         },
                         onCashIn: {
-                            isPOSShiftMenuOpen = false
-                            posCashMovementType = .deposit
+                            presentPOSCashMovementForm(.deposit)
                         },
                         onCashOut: {
-                            isPOSShiftMenuOpen = false
-                            posCashMovementType = .withdrawal
+                            presentPOSCashMovementForm(.withdrawal)
                         },
                         onCloseShift: {
-                            isPOSShiftMenuOpen = false
-                            isPOSEndShiftOpen = true
+                            presentPOSEndShiftForm()
                         },
                         onSignOff: {
                             resetPOSStaffSessionToPIN()
@@ -1179,23 +1449,42 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $isPOSStartShiftOpen) {
-                POSStartShiftSheet(isSubmitting: posStore.isShiftSubmitting, accentColor: selectedPOSAccentColor.color) { openingCash, notes in
-                    await posStore.startShift(baseURL: store.baseURL, token: store.kitchenToken, openingCash: openingCash, notes: notes)
+                POSStartShiftSheet(
+                    isSubmitting: posStore.isShiftSubmitting,
+                    errorMessage: posStore.errorMessage,
+                    accentColor: selectedPOSAccentColor.color
+                ) { openingCash, notes in
+                    guard await ensurePOSStaffSession() else { return false }
+                    let didOpen = await posStore.startShift(baseURL: store.baseURL, token: store.kitchenToken, openingCash: openingCash, notes: notes)
+                    if didOpen {
+                        selectedSection = .pos
+                        selectedCompactTab = .pos
+                        isPOSShiftMenuOpen = false
+                    }
+                    return didOpen
                 }
                 .emberSheetChrome()
             }
             .sheet(item: $posCashMovementType) { type in
-                POSCashMovementSheet(type: type, isSubmitting: posStore.isShiftSubmitting, accentColor: selectedPOSAccentColor.color) { amount, reason in
-                    await posStore.recordCashMovement(baseURL: store.baseURL, token: store.kitchenToken, type: type, amount: amount, reason: reason)
+                POSCashMovementSheet(
+                    type: type,
+                    isSubmitting: posStore.isShiftSubmitting,
+                    errorMessage: posStore.errorMessage,
+                    accentColor: selectedPOSAccentColor.color
+                ) { amount, reason in
+                    guard await ensurePOSStaffSession() else { return false }
+                    return await posStore.recordCashMovement(baseURL: store.baseURL, token: store.kitchenToken, type: type, amount: amount, reason: reason)
                 }
                 .emberSheetChrome()
             }
             .sheet(isPresented: $isPOSEndShiftOpen) {
                 POSEndShiftSheet(
-                    expectedCash: posStore.bootstrap?.shift.recap?.expectedCash,
+                    shift: posStore.bootstrap?.shift,
                     isSubmitting: posStore.isShiftSubmitting,
+                    errorMessage: posStore.errorMessage,
                     accentColor: selectedPOSAccentColor.color
                 ) { closingCash, notes in
+                    guard await ensurePOSStaffSession() else { return false }
                     let didClose = await posStore.endShift(baseURL: store.baseURL, token: store.kitchenToken, closingCash: closingCash, notes: notes)
                     if didClose {
                         resetPOSStaffSessionToPIN()
@@ -1320,6 +1609,7 @@ final class PrintBridgeStore: ObservableObject {
     @Published var isPrinting = false
     @Published var statusMessage = "Printer not checked yet."
     var receiptLogoURL: URL?
+    var receiptLogoScale = 1.0
 
     private var pollTimer: Timer?
     private var isPollInFlight = false
@@ -1395,7 +1685,7 @@ final class PrintBridgeStore: ObservableObject {
 
         do {
             let receipt = PrintReceiptFormatter.testReceipt()
-            let data = PrintReceiptFormatter.format(receipt, paperWidth: paperWidth, logoURL: receiptLogoURL)
+            let data = PrintReceiptFormatter.format(receipt, paperWidth: paperWidth, logoURL: receiptLogoURL, logoScale: receiptLogoScale)
             try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
             isConnected = true
             statusMessage = "Test receipt sent."
@@ -1440,7 +1730,7 @@ final class PrintBridgeStore: ObservableObject {
             }
 
             let claimed = try await client.claim(jobID: job.id, bridgeName: "emberos-ipad-manual")
-            let data = PrintReceiptFormatter.format(claimed.job.payload, paperWidth: paperWidth, logoURL: receiptLogoURL)
+            let data = PrintReceiptFormatter.format(claimed.job.payload, paperWidth: paperWidth, logoURL: receiptLogoURL, logoScale: receiptLogoScale)
             try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
             _ = try await client.markPrinted(jobID: job.id)
             allowedSaleIDs.remove(saleID)
@@ -1503,7 +1793,7 @@ final class PrintBridgeStore: ObservableObject {
             }
 
             let claimed = try await client.claim(jobID: job.id, bridgeName: "emberos-ipad")
-            let data = PrintReceiptFormatter.format(claimed.job.payload, paperWidth: paperWidth, logoURL: receiptLogoURL)
+            let data = PrintReceiptFormatter.format(claimed.job.payload, paperWidth: paperWidth, logoURL: receiptLogoURL, logoScale: receiptLogoScale)
             try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
             _ = try await client.markPrinted(jobID: job.id)
             if let saleID = job.saleID {
@@ -1665,16 +1955,14 @@ enum PrintReceiptFormatter {
     private static let gs = UInt8(0x1d)
     private static let lf = UInt8(0x0a)
 
-    static func format(_ payload: PrintReceiptPayload, paperWidth: Int, logoURL: URL? = nil) -> Data {
+    static func format(_ payload: PrintReceiptPayload, paperWidth: Int, logoURL: URL? = nil, logoScale: Double = 1) -> Data {
         let columns = paperWidth == 58 ? 32 : 48
         var data = Data()
 
         append(&data, [esc, 0x40])
         alignCenter(&data)
 
-        if appendLogoIfAvailable(&data, logoURL: logoURL, paperWidth: paperWidth) {
-            blank(&data)
-        } else {
+        if !appendLogoIfAvailable(&data, logoURL: logoURL, paperWidth: paperWidth, logoScale: logoScale) {
             bold(&data, true)
             appendLine(&data, payload.store.name.uppercased())
             bold(&data, false)
@@ -1693,7 +1981,7 @@ enum PrintReceiptFormatter {
         blank(&data)
 
         for item in payload.items {
-            wrappedAmountLines("\(item.quantity) x \(item.name)", amount: money(item.lineTotal), columns: columns).forEach {
+            wrappedAmountLines("\(item.quantity) x \(item.name)", amount: money(item.baseLineTotal), columns: columns).forEach {
                 appendLine(&data, $0)
             }
 
@@ -1814,7 +2102,7 @@ enum PrintReceiptFormatter {
         data.append(contentsOf: bytes)
     }
 
-    private static func appendLogoIfAvailable(_ data: inout Data, logoURL: URL?, paperWidth: Int) -> Bool {
+    private static func appendLogoIfAvailable(_ data: inout Data, logoURL: URL?, paperWidth: Int, logoScale: Double) -> Bool {
         let image: UIImage?
         if let logoURL, logoURL.isFileURL {
             image = UIImage(contentsOfFile: logoURL.path)
@@ -1826,8 +2114,12 @@ enum PrintReceiptFormatter {
             return false
         }
 
-        let maxPixelWidth = paperWidth == 58 ? 144 : 220
-        guard let raster = escposRasterImageData(for: image, maxPixelWidth: maxPixelWidth) else {
+        let printableImage = image.croppedToVisiblePixels(whiteThreshold: 236) ?? image
+        let basePixelWidth = paperWidth == 58 ? 185 : 315
+        let printablePixelWidth = paperWidth == 58 ? 252 : 364
+        let clampedScale = min(max(logoScale, 0.6), 1.15)
+        let maxPixelWidth = min(printablePixelWidth, Int(Double(basePixelWidth) * clampedScale))
+        guard let raster = escposRasterImageData(for: printableImage, maxPixelWidth: maxPixelWidth) else {
             return false
         }
 
@@ -1879,7 +2171,7 @@ enum PrintReceiptFormatter {
         let sourceSize = image.size
         guard sourceSize.width > 0, sourceSize.height > 0 else { return nil }
 
-        let maxPixelHeight: CGFloat = maxPixelWidth <= 144 ? 52 : 72
+        let maxPixelHeight: CGFloat = maxPixelWidth <= 252 ? 68 : 88
         let scale = min(CGFloat(maxPixelWidth) / sourceSize.width, maxPixelHeight / sourceSize.height)
         let canvasSize = CGSize(width: ceil(sourceSize.width * scale), height: ceil(sourceSize.height * scale))
 
@@ -2025,6 +2317,28 @@ struct PrintSourceSelection: Equatable {
     }
 }
 
+private enum KitchenConnectionDefaults {
+    static let productionBaseURL = "https://app.fitbites.com.vn"
+
+    static func savedBaseURL() -> String {
+        normalizedBaseURL(UserDefaults.standard.string(forKey: "KitchenBaseURL") ?? productionBaseURL)
+    }
+
+    static func normalizedBaseURL(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return productionBaseURL }
+        guard !isLocalDevelopmentURL(trimmed) else { return productionBaseURL }
+        return trimmed
+    }
+
+    private static func isLocalDevelopmentURL(_ value: String) -> Bool {
+        let lowercased = value.lowercased()
+        return lowercased.contains("127.0.0.1")
+            || lowercased.contains("localhost")
+            || lowercased.contains("0.0.0.0")
+    }
+}
+
 @MainActor
 final class KitchenStore: ObservableObject {
     @Published var onlineOrders: [KitchenOnlineOrder] = []
@@ -2037,7 +2351,7 @@ final class KitchenStore: ObservableObject {
     @Published var isConnected = false
     @Published var errorMessage: String?
     @Published var notificationMessage: String?
-    @Published var baseURL = UserDefaults.standard.string(forKey: "KitchenBaseURL") ?? "http://127.0.0.1:8000"
+    @Published var baseURL = KitchenConnectionDefaults.savedBaseURL()
     @Published var kitchenToken = UserDefaults.standard.string(forKey: "KitchenToken") ?? ""
     @Published var chimeTone = KitchenChimeTone(
         rawValue: UserDefaults.standard.string(forKey: "KitchenChimeTone") ?? ""
@@ -2095,7 +2409,7 @@ final class KitchenStore: ObservableObject {
     }
 
     func saveSettings(baseURL: String, token: String) {
-        self.baseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.baseURL = KitchenConnectionDefaults.normalizedBaseURL(baseURL)
         self.kitchenToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         UserDefaults.standard.set(self.baseURL, forKey: "KitchenBaseURL")
         UserDefaults.standard.set(self.kitchenToken, forKey: "KitchenToken")
@@ -2397,21 +2711,42 @@ final class POSStore: ObservableObject {
     @Published var productImageOverrideURLs: [Int: URL] = [:]
     @Published var brandLogoOverrideURL: URL?
     @Published var isPinAuthenticating = false
+    @Published var pendingSaleSyncCount = 0
+    @Published var pendingShiftSyncCount = 0
+    @Published var activeRewardRedemption: POSRewardRedemption?
+    @Published var activeRewardQuote: POSRewardQuote?
+    @Published private(set) var productQuantities: [Int: Int] = [:]
 
     private var refreshTask: Task<Void, Never>?
     private var preloadTask: Task<Void, Never>?
     private var saleMessageClearTask: Task<Void, Never>?
+    private var saleSyncTask: Task<Void, Never>?
+    private var shiftSyncTask: Task<Void, Never>?
     private var staffSessionToken = ""
+    private var rewardCheckoutToken: String?
     private let imageOverridesDirectoryName = "POSProductImageOverrides"
     private let brandLogoFileName = "pos-brand-logo.png"
     private var nextTicketNumber = 1
 
     init() {
-        let firstTicket = POSDraftTicket(number: 1)
-        tickets = [firstTicket]
-        activeTicketID = firstTicket.id
+        if let snapshot = POSDraftTicketStore.load(), !snapshot.tickets.isEmpty {
+            tickets = snapshot.tickets
+            activeTicketID = snapshot.tickets.contains(where: { $0.id == snapshot.activeTicketID })
+                ? snapshot.activeTicketID
+                : snapshot.tickets[0].id
+            cartLines = snapshot.tickets.first(where: { $0.id == activeTicketID })?.lines ?? []
+            nextTicketNumber = max(snapshot.nextTicketNumber, snapshot.tickets.map(\.number).max() ?? 1)
+        } else {
+            let firstTicket = POSDraftTicket(number: 1)
+            tickets = [firstTicket]
+            activeTicketID = firstTicket.id
+        }
         loadProductImageOverrides()
         loadBrandLogoOverride()
+        loadCachedBootstrapIfAvailable()
+        pendingSaleSyncCount = POSQueuedSaleStore.load().count
+        pendingShiftSyncCount = POSQueuedShiftMutationStore.load().count
+        rebuildProductQuantities()
     }
 
     var productCount: Int {
@@ -2434,13 +2769,32 @@ final class POSStore: ObservableObject {
         cartLines.reduce(0) { $0 + $1.lineTotal }
     }
 
+    var hasOpenShiftForCurrentOperator: Bool {
+        guard let bootstrap,
+              bootstrap.shift.isOpen,
+              let shiftOperator = bootstrap.shift.activeOperator else {
+            return bootstrap?.shift.isOpen == true
+        }
+
+        return shiftOperator.id == bootstrap.operator.id
+    }
+
+    var activeDrawerOperatorName: String? {
+        guard let bootstrap,
+              let activeOperator = bootstrap.shift.activeOperator,
+              activeOperator.id != bootstrap.operator.id else {
+            return nil
+        }
+
+        return activeOperator.name
+    }
+
     func setStaffSessionToken(_ token: String) {
         staffSessionToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func clearStaffSession() {
         staffSessionToken = ""
-        bootstrap = nil
         recap = nil
         recapErrorMessage = nil
         saleMessage = nil
@@ -2449,7 +2803,38 @@ final class POSStore: ObservableObject {
         isSubmitting = false
     }
 
-    func authenticateStaffPIN(baseURL: String, token: String, pin: String, openingCash: Double) async -> POSPinSessionResponse? {
+    func loadCachedBootstrapIfAvailable() {
+        guard bootstrap == nil, let cached = POSBootstrapCache.load() else { return }
+        bootstrap = cached
+        isConnected = false
+    }
+
+    func applyLocalOperator(_ posOperator: POSOperator) {
+        if let current = bootstrap {
+            bootstrap = POSBootstrapResponse(operator: posOperator, catalog: current.catalog, shift: current.shift)
+        } else {
+            bootstrap = POSBootstrapResponse(operator: posOperator, catalog: .empty, shift: .offline)
+        }
+    }
+
+    func preparePINOnlyLocalShiftState() {
+        loadCachedBootstrapIfAvailable()
+
+        guard !(POSLocalShiftStateStore.isOpen && POSLocalShiftStateStore.isOpenedFromAuth) else { return }
+
+        POSLocalShiftStateStore.markClosed()
+
+        guard let current = bootstrap else { return }
+        let nextBootstrap = POSBootstrapResponse(
+            operator: current.operator,
+            catalog: current.catalog,
+            shift: .offline
+        )
+        bootstrap = nextBootstrap
+        POSBootstrapCache.save(nextBootstrap)
+    }
+
+    func authenticateStaffPIN(baseURL: String, token: String, pin: String, openingCash: Double?, showsProgress: Bool = true) async -> POSPinSessionResponse? {
         guard !isPinAuthenticating else { return nil }
 
         let trimmedPIN = pin.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2465,7 +2850,9 @@ final class POSStore: ObservableObject {
             return nil
         }
 
-        isPinAuthenticating = true
+        if showsProgress {
+            isPinAuthenticating = true
+        }
         pinErrorMessage = nil
         errorMessage = nil
 
@@ -2480,29 +2867,38 @@ final class POSStore: ObservableObject {
             staffSessionToken = response.sessionToken
             pinErrorMessage = nil
             bootstrap = bootstrap.map {
-                POSBootstrapResponse(operator: response.operator, catalog: $0.catalog, shift: response.shift)
+                POSBootstrapResponse(operator: response.operator, catalog: $0.catalog, shift: $0.shift)
             }
             isConnected = true
-            isPinAuthenticating = false
-            Haptics.notification(.success)
+            if showsProgress {
+                isPinAuthenticating = false
+                Haptics.notification(.success)
+            }
             return response
         } catch {
-            pinErrorMessage = error.localizedDescription
+            if showsProgress {
+                pinErrorMessage = error.localizedDescription
+            }
             isConnected = false
-            isPinAuthenticating = false
-            Haptics.notification(.error)
+            if showsProgress {
+                isPinAuthenticating = false
+                Haptics.notification(.error)
+            }
             return nil
         }
     }
 
     func quantityInCart(for product: POSProduct) -> Int {
-        cartLines
-            .filter { $0.product.id == product.id }
-            .reduce(0) { $0 + $1.quantity }
+        productQuantities[product.id] ?? 0
     }
 
     func imageURL(for product: POSProduct) -> URL? {
-        productImageOverrideURLs[product.id] ?? product.imageURL
+        if let override = productImageOverrideURLs[product.id] {
+            return override
+        }
+
+        guard let remote = product.imageURL else { return nil }
+        return POSProductImageCache.shared.cachedFileURL(for: remote) ?? remote
     }
 
     func setProductImageOverride(productID: Int, data: Data) async {
@@ -2564,6 +2960,7 @@ final class POSStore: ObservableObject {
     }
 
     func add(product: POSProduct, toppings: [POSTopping]) {
+        invalidateRewardQuote()
         let lineID = POSCartLine.makeID(product: product, toppings: toppings)
 
         if let index = cartLines.firstIndex(where: { $0.id == lineID }) {
@@ -2578,6 +2975,7 @@ final class POSStore: ObservableObject {
 
     func increment(line: POSCartLine) {
         guard let index = cartLines.firstIndex(where: { $0.id == line.id }) else { return }
+        invalidateRewardQuote()
         cartLines[index].quantity += 1
         syncActiveTicket()
         Haptics.impact(.light)
@@ -2585,6 +2983,7 @@ final class POSStore: ObservableObject {
 
     func decrement(line: POSCartLine) {
         guard let index = cartLines.firstIndex(where: { $0.id == line.id }) else { return }
+        invalidateRewardQuote()
 
         if cartLines[index].quantity <= 1 {
             cartLines.remove(at: index)
@@ -2597,6 +2996,7 @@ final class POSStore: ObservableObject {
     }
 
     func remove(line: POSCartLine) {
+        invalidateRewardQuote()
         cartLines.removeAll { $0.id == line.id }
         syncActiveTicket()
         Haptics.impact(.medium)
@@ -2604,6 +3004,7 @@ final class POSStore: ObservableObject {
 
     func setMarketplaceUnitPrice(line: POSCartLine, price: Double?) {
         guard let index = cartLines.firstIndex(where: { $0.id == line.id }) else { return }
+        invalidateRewardQuote()
         var updatedLines = cartLines
         updatedLines[index].adjustedUnitPrice = price.map { max(0, $0) }
         cartLines = updatedLines
@@ -2612,6 +3013,7 @@ final class POSStore: ObservableObject {
 
     func updateToppings(line: POSCartLine, toppings: [POSTopping]) {
         guard let currentIndex = cartLines.firstIndex(where: { $0.id == line.id }) else { return }
+        invalidateRewardQuote()
 
         let updatedLine = POSCartLine(
             product: cartLines[currentIndex].product,
@@ -2639,12 +3041,14 @@ final class POSStore: ObservableObject {
     }
 
     func clearCart() {
+        invalidateRewardQuote(clearRedemption: true)
         cartLines.removeAll()
         syncActiveTicket()
         Haptics.notification(.success)
     }
 
     func createNewTicket() {
+        invalidateRewardQuote(clearRedemption: true)
         syncActiveTicket()
 
         if cartLines.isEmpty, tickets.contains(where: { $0.id == activeTicketID && $0.lines.isEmpty }) {
@@ -2657,19 +3061,24 @@ final class POSStore: ObservableObject {
         tickets.append(ticket)
         activeTicketID = ticket.id
         cartLines = []
+        rebuildProductQuantities()
+        persistDraftTickets()
         Haptics.notification(.success)
     }
 
     func switchTicket(_ ticket: POSDraftTicket) {
         guard ticket.id != activeTicketID else { return }
+        invalidateRewardQuote(clearRedemption: true)
 
         syncActiveTicket()
         activeTicketID = ticket.id
         cartLines = ticket.lines
+        rebuildProductQuantities()
+        persistDraftTickets()
         Haptics.selectionChanged()
     }
 
-    func submitSale(
+    fileprivate func submitSale(
         baseURL: String,
         token: String,
         paymentMethod: POSPaymentMethod,
@@ -2677,10 +3086,32 @@ final class POSStore: ObservableObject {
         externalReference: String,
         customer: POSCustomer?,
         discountPercent: Double,
-        notes: String
+        notes: String,
+        completionTotal: Double,
+        shouldPrintReceipt: Bool,
+        rewardRedemptionSessionID: String? = nil,
+        rewardLineKey: String? = nil,
+        onSyncedSale: (@MainActor (POSCreateSaleResponse, POSQueuedSale) async -> Void)? = nil
     ) async -> POSCreateSaleResponse? {
         guard !cartLines.isEmpty else {
             errorMessage = "Add at least one product before checkout."
+            return nil
+        }
+
+        guard hasOpenShiftForCurrentOperator else {
+            if let activeDrawerOperatorName {
+                errorMessage = "\(activeDrawerOperatorName) is currently serving. Close that shift before opening POS."
+            } else {
+                errorMessage = "Open a shift and declare the cash drawer before completing sales."
+            }
+            Haptics.notification(.error)
+            return nil
+        }
+
+        let cleanedExternalReference = externalReference.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        guard !orderSource.isMarketplace || cleanedExternalReference != nil else {
+            errorMessage = "Enter the \(orderSource.label) reference before completing."
+            Haptics.notification(.error)
             return nil
         }
 
@@ -2688,40 +3119,247 @@ final class POSStore: ObservableObject {
         errorMessage = nil
         clearSaleMessage()
 
-        do {
-            let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).submitPOSSale(
-                POSCreateSaleRequest(
-                    cart: cartLines.map(POSSaleCartItem.init(line:)),
-                    paymentMethod: paymentMethod.rawValue,
-                    orderSource: orderSource.rawValue,
-                    externalOrderReference: externalReference.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? nil
-                        : externalReference.trimmingCharacters(in: .whitespacesAndNewlines),
-                    customerID: customer?.id,
-                    discountPercent: max(0, min(discountPercent, 100)),
-                    notes: notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? nil
-                        : notes.trimmingCharacters(in: .whitespacesAndNewlines),
-                    checkoutToken: "native-pos-\(UUID().uuidString)"
-                )
-            )
+        let request = POSCreateSaleRequest(
+            cart: cartLines.map(POSSaleCartItem.init(line:)),
+            paymentMethod: paymentMethod.rawValue,
+            orderSource: orderSource.rawValue,
+            externalOrderReference: cleanedExternalReference,
+            customerID: customer?.id ?? (rewardRedemptionSessionID == nil ? nil : activeRewardRedemption?.customerID),
+            discountPercent: max(0, min(discountPercent, 100)),
+            notes: notes.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+            rewardRedemptionSessionID: rewardRedemptionSessionID,
+            rewardQuoteID: rewardRedemptionSessionID == nil ? nil : activeRewardQuote?.id,
+            rewardLineKey: rewardRedemptionSessionID == nil ? nil : rewardLineKey,
+            checkoutToken: rewardRedemptionSessionID == nil ? "native-pos-\(UUID().uuidString)" : currentRewardCheckoutToken()
+        )
 
-            showSaleMessage(response.message)
-            removeActiveTicketAfterSale()
-            await refresh(baseURL: baseURL, token: token)
-            if recap != nil {
-                await refreshRecap(baseURL: baseURL, token: token)
+        if rewardRedemptionSessionID != nil {
+            do {
+                let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).submitPOSSale(request)
+                let serverTotal = response.total ?? completionTotal
+                removeActiveTicketAfterSale()
+                applyLocalSaleToShift(paymentMethod: paymentMethod, total: serverTotal)
+                activeRewardRedemption = nil
+                activeRewardQuote = nil
+                rewardCheckoutToken = nil
+                isConnected = true
+                showSaleMessage(response.message)
+                Haptics.notification(.success)
+                isSubmitting = false
+                Task { await refreshRecap(baseURL: baseURL, token: token) }
+                return response
+            } catch {
+                isConnected = false
+                errorMessage = error.localizedDescription
+                Haptics.notification(.error)
+                isSubmitting = false
+                return nil
             }
-            Haptics.notification(.success)
-            isSubmitting = false
-            return response
-        } catch {
-            errorMessage = error.localizedDescription
-            isConnected = false
-            Haptics.notification(.error)
-            isSubmitting = false
-            return nil
         }
+
+        removeActiveTicketAfterSale()
+        applyLocalSaleToShift(paymentMethod: paymentMethod, total: completionTotal)
+        enqueueSaleSync(
+            request,
+            completionTotal: completionTotal,
+            shouldPrintReceipt: shouldPrintReceipt,
+            baseURL: baseURL,
+            token: token,
+            onSyncedSale: onSyncedSale
+        )
+        showSaleMessage("Sale saved. Syncing...")
+        Haptics.notification(.success)
+        isSubmitting = false
+        return POSCreateSaleResponse(message: "Sale saved. Syncing...", saleID: -Int(Date().timeIntervalSince1970), alreadyProcessed: false, total: completionTotal, discount: nil)
+    }
+
+    fileprivate func scanRewardToken(baseURL: String, token: String, rawToken: String) async throws {
+        clearSaleMessage()
+        let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken)
+            .scanRewardToken(POSRewardScanRequest(token: rawToken))
+        activeRewardRedemption = POSRewardRedemption(response: response)
+        activeRewardQuote = nil
+        rewardCheckoutToken = "native-pos-reward-\(UUID().uuidString)"
+        isConnected = true
+        showSaleMessage("Free Reward reserved for this checkout.")
+    }
+
+    fileprivate func quoteRewardSale(
+        baseURL: String,
+        token: String,
+        paymentMethod: POSPaymentMethod,
+        orderSource: POSOrderSource,
+        externalReference: String,
+        customer: POSCustomer?,
+        discountPercent: Double,
+        notes: String,
+        rewardLineKey: String?
+    ) async throws -> POSRewardQuote {
+        guard let activeRewardRedemption else {
+            throw KitchenAPIError.serverMessage(422, "/api/pos/reward-redemptions/quote", "Scan a reward QR before previewing.")
+        }
+
+        let mappedOrderSource = orderSource.rawValue
+        let request = POSRewardQuoteRequest(
+            cart: cartLines.map(POSSaleCartItem.init(line:)),
+            paymentMethod: paymentMethod.rawValue,
+            orderSource: mappedOrderSource,
+            externalOrderReference: externalReference.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+            customerID: customer?.id ?? activeRewardRedemption.customerID,
+            discountPercent: max(0, min(discountPercent, 100)),
+            notes: notes.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+            rewardRedemptionSessionID: activeRewardRedemption.sessionID,
+            rewardLineKey: rewardLineKey,
+            checkoutToken: currentRewardCheckoutToken()
+        )
+
+        let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken)
+            .quoteRewardSale(request)
+        activeRewardQuote = response.rewardQuote
+        isConnected = true
+        showSaleMessage("Reward total previewed by Laravel.")
+
+        return response.rewardQuote
+    }
+
+    fileprivate func clearRewardRedemption() {
+        invalidateRewardQuote(clearRedemption: true)
+        Haptics.selectionChanged()
+    }
+
+    fileprivate func clearRewardQuote() {
+        invalidateRewardQuote()
+    }
+
+    private func invalidateRewardQuote(clearRedemption: Bool = false) {
+        activeRewardQuote = nil
+
+        if clearRedemption {
+            activeRewardRedemption = nil
+            rewardCheckoutToken = nil
+        }
+    }
+
+    private func currentRewardCheckoutToken() -> String {
+        if let rewardCheckoutToken {
+            return rewardCheckoutToken
+        }
+
+        let token = "native-pos-reward-\(UUID().uuidString)"
+        rewardCheckoutToken = token
+        return token
+    }
+
+    private func applyLocalSaleToShift(paymentMethod: POSPaymentMethod, total: Double) {
+        guard let currentShiftEnvelope = bootstrap?.shift,
+              currentShiftEnvelope.isOpen,
+              let currentShift = currentShiftEnvelope.shift else {
+            return
+        }
+
+        let currentRecap = currentShiftEnvelope.recap
+        let nextOrders = (currentRecap?.orders ?? 0) + 1
+        let nextRevenue = (currentRecap?.revenue ?? 0) + total
+        let cashDelta = paymentMethod == .cash ? total : 0
+        let nextRecap = POSShiftRecap(
+            orders: nextOrders,
+            revenue: nextRevenue,
+            averageTicket: nextOrders > 0 ? nextRevenue / Double(nextOrders) : 0,
+            expectedCash: (currentRecap?.expectedCash ?? currentShift.openingCash) + cashDelta,
+            cashSales: (currentRecap?.cashSales ?? 0) + cashDelta,
+            cashDeposited: currentRecap?.cashDeposited ?? 0,
+            cashWithdrawn: currentRecap?.cashWithdrawn ?? 0
+        )
+
+        applyLocalShift(POSShiftEnvelope(isOpen: true, shift: currentShift, recap: nextRecap))
+    }
+
+    private func enqueueSaleSync(
+        _ request: POSCreateSaleRequest,
+        completionTotal: Double,
+        shouldPrintReceipt: Bool,
+        baseURL: String,
+        token: String,
+        onSyncedSale: (@MainActor (POSCreateSaleResponse, POSQueuedSale) async -> Void)?
+    ) {
+        var queue = POSQueuedSaleStore.load()
+        queue.append(POSQueuedSale(request: request, createdAt: Date(), completionTotal: completionTotal, shouldPrintReceipt: shouldPrintReceipt))
+        POSQueuedSaleStore.save(queue)
+        pendingSaleSyncCount = queue.count
+        syncQueuedSales(baseURL: baseURL, token: token, onSyncedSale: onSyncedSale)
+    }
+
+    fileprivate func syncQueuedSales(
+        baseURL: String,
+        token: String,
+        onSyncedSale: (@MainActor (POSCreateSaleResponse, POSQueuedSale) async -> Void)? = nil
+    ) {
+        guard saleSyncTask == nil else { return }
+
+        saleSyncTask = Task { [weak self] in
+            guard let self else { return }
+            var queue = POSQueuedSaleStore.load()
+            var syncedAny = false
+
+            while let sale = queue.first {
+                do {
+                    let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: self.staffSessionToken).submitPOSSale(sale.request)
+                    queue.removeFirst()
+                    POSQueuedSaleStore.save(queue)
+                    syncedAny = true
+                    if let onSyncedSale {
+                        await onSyncedSale(response, sale)
+                    }
+                    await MainActor.run {
+                        self.pendingSaleSyncCount = queue.count
+                        self.isConnected = true
+                        self.showSaleMessage(response.message)
+                    }
+                } catch {
+                    if error.isValidationFailure {
+                        let reviewReason = error.posReviewReason
+                        let reviewMessage = self.queuedSaleReviewMessage(for: sale, reason: reviewReason)
+                        queue.removeFirst()
+                        POSQueuedSaleStore.save(queue)
+                        POSFailedQueuedSaleStore.append(sale, reason: reviewReason)
+                        await MainActor.run {
+                            self.pendingSaleSyncCount = queue.count
+                            self.isConnected = true
+                            self.errorMessage = reviewMessage
+                            Task { await self.refresh(baseURL: baseURL, token: token) }
+                        }
+                        continue
+                    }
+
+                    await MainActor.run {
+                        self.pendingSaleSyncCount = queue.count
+                        self.isConnected = false
+                        self.errorMessage = "Sale sync pending. \(error.localizedDescription)"
+                    }
+                    break
+                }
+            }
+
+            await MainActor.run {
+                if syncedAny {
+                    Task { await self.refreshRecap(baseURL: baseURL, token: token) }
+                }
+                self.saleSyncTask = nil
+            }
+        }
+    }
+
+    private func queuedSaleReviewMessage(for sale: POSQueuedSale, reason: String) -> String {
+        let source = POSOrderSource(rawValue: sale.request.orderSource)?.label ?? "Sale"
+        let reference = sale.request.externalOrderReference?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+
+        if let reference {
+            return "\(source) \(reference) needs review: \(reason)"
+        }
+
+        return "\(source) sale needs review: \(reason)"
     }
 
     private func syncActiveTicket() {
@@ -2729,10 +3367,14 @@ final class POSStore: ObservableObject {
             let ticket = POSDraftTicket(number: nextTicketNumber, lines: cartLines)
             tickets.append(ticket)
             activeTicketID = ticket.id
+            rebuildProductQuantities()
+            persistDraftTickets()
             return
         }
 
         tickets[index].lines = cartLines
+        rebuildProductQuantities()
+        persistDraftTickets()
     }
 
     private func removeActiveTicketAfterSale() {
@@ -2741,6 +3383,8 @@ final class POSStore: ObservableObject {
         if let nextTicket = tickets.first(where: { !$0.lines.isEmpty }) ?? tickets.first {
             activeTicketID = nextTicket.id
             cartLines = nextTicket.lines
+            rebuildProductQuantities()
+            persistDraftTickets()
             return
         }
 
@@ -2749,64 +3393,197 @@ final class POSStore: ObservableObject {
         tickets = [ticket]
         activeTicketID = ticket.id
         cartLines = []
+        rebuildProductQuantities()
+        persistDraftTickets()
+    }
+
+    private func rebuildProductQuantities() {
+        productQuantities = cartLines.reduce(into: [:]) { totals, line in
+            totals[line.product.id, default: 0] += line.quantity
+        }
+    }
+
+    private func persistDraftTickets() {
+        POSDraftTicketStore.save(
+            tickets: tickets,
+            activeTicketID: activeTicketID,
+            nextTicketNumber: nextTicketNumber
+        )
     }
 
     func startShift(baseURL: String, token: String, openingCash: Double, notes: String) async -> Bool {
-        await mutateShift(baseURL: baseURL, token: token) {
-            try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).startPOSShift(
-                POSStartShiftRequest(
-                    openingCash: openingCash,
-                    notes: notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : notes.trimmingCharacters(in: .whitespacesAndNewlines)
-                )
-            )
-        }
-    }
-
-    func recordCashMovement(baseURL: String, token: String, type: POSCashMovementType, amount: Double, reason: String) async -> Bool {
-        await mutateShift(baseURL: baseURL, token: token) {
-            try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).recordPOSCashMovement(
-                POSCashMovementRequest(
-                    type: type.rawValue,
-                    amount: amount,
-                    reason: reason.trimmingCharacters(in: .whitespacesAndNewlines)
-                )
-            )
-        }
-    }
-
-    func endShift(baseURL: String, token: String, closingCash: Double?, notes: String) async -> Bool {
-        await mutateShift(baseURL: baseURL, token: token) {
-            try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).endPOSShift(
-                POSEndShiftRequest(
-                    closingCash: closingCash,
-                    notes: notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : notes.trimmingCharacters(in: .whitespacesAndNewlines)
-                )
-            )
-        }
-    }
-
-    private func mutateShift(baseURL: String, token: String, action: () async throws -> POSShiftResponse) async -> Bool {
         guard !isShiftSubmitting else { return false }
+        if let activeDrawerOperatorName {
+            errorMessage = "\(activeDrawerOperatorName) is currently serving. Close that shift before opening a new one."
+            Haptics.notification(.error)
+            return false
+        }
+
+        let cleanedNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
 
         isShiftSubmitting = true
         errorMessage = nil
         clearSaleMessage()
 
+        let request = POSStartShiftRequest(openingCash: openingCash, notes: cleanedNotes)
         do {
-            let response = try await action()
-            bootstrap = bootstrap.map {
-                POSBootstrapResponse(operator: $0.operator, catalog: $0.catalog, shift: response.shift)
-            }
+            let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).startPOSShift(request)
+            POSLocalShiftStateStore.markOpen()
+            applyLocalShift(response.shift)
+            showSaleMessage("Shift opened.")
             isConnected = true
-            Haptics.notification(.success)
             isShiftSubmitting = false
-            return true
+            Haptics.notification(.success)
         } catch {
             errorMessage = error.localizedDescription
             isConnected = false
-            Haptics.notification(.error)
             isShiftSubmitting = false
+            Haptics.notification(.error)
             return false
+        }
+
+        return true
+    }
+
+    func recordCashMovement(baseURL: String, token: String, type: POSCashMovementType, amount: Double, reason: String) async -> Bool {
+        guard !isShiftSubmitting else { return false }
+        guard let currentShift = bootstrap?.shift.shift else {
+            errorMessage = "Open a shift before moving cash."
+            Haptics.notification(.error)
+            return false
+        }
+
+        let currentRecap = bootstrap?.shift.recap
+        let isDeposit = type == .deposit
+        let signedAmount = isDeposit ? amount : -amount
+        let localRecap = POSShiftRecap(
+            orders: currentRecap?.orders ?? 0,
+            revenue: currentRecap?.revenue ?? 0,
+            averageTicket: currentRecap?.averageTicket ?? 0,
+            expectedCash: (currentRecap?.expectedCash ?? currentShift.openingCash) + signedAmount,
+            cashSales: currentRecap?.cashSales ?? 0,
+            cashDeposited: (currentRecap?.cashDeposited ?? 0) + (isDeposit ? amount : 0),
+            cashWithdrawn: (currentRecap?.cashWithdrawn ?? 0) + (isDeposit ? 0 : amount)
+        )
+
+        isShiftSubmitting = true
+        errorMessage = nil
+        clearSaleMessage()
+        applyLocalShift(POSShiftEnvelope(isOpen: true, shift: currentShift, recap: localRecap))
+        showSaleMessage("Cash updated. Syncing...")
+        Haptics.notification(.success)
+        isShiftSubmitting = false
+
+        let request = POSCashMovementRequest(
+            type: type.rawValue,
+            amount: amount,
+            reason: reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        enqueueShiftMutation(.cashMovement(request), baseURL: baseURL, token: token)
+
+        return true
+    }
+
+    func endShift(baseURL: String, token: String, closingCash: Double?, notes: String) async -> Bool {
+        guard !isShiftSubmitting else { return false }
+        guard bootstrap?.shift.shift != nil else {
+            errorMessage = "No open shift to close."
+            Haptics.notification(.error)
+            return false
+        }
+
+        let cleanedNotes = notes.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        isShiftSubmitting = true
+        errorMessage = nil
+        clearSaleMessage()
+
+        let request = POSEndShiftRequest(closingCash: closingCash, notes: cleanedNotes)
+        do {
+            let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).endPOSShift(request)
+            POSLocalShiftStateStore.markClosed()
+            applyLocalShift(response.shift)
+            showSaleMessage("Shift closed.")
+            isConnected = true
+            isShiftSubmitting = false
+            Haptics.notification(.success)
+        } catch {
+            errorMessage = error.localizedDescription
+            isConnected = false
+            isShiftSubmitting = false
+            Haptics.notification(.error)
+            return false
+        }
+
+        return true
+    }
+
+    private func applyLocalShift(_ shift: POSShiftEnvelope) {
+        guard let currentBootstrap = bootstrap else { return }
+
+        let nextBootstrap = POSBootstrapResponse(
+            operator: currentBootstrap.operator,
+            catalog: currentBootstrap.catalog,
+            shift: shift
+        )
+        bootstrap = nextBootstrap
+        POSBootstrapCache.save(nextBootstrap)
+    }
+
+    private func enqueueShiftMutation(_ mutation: POSQueuedShiftMutation, baseURL: String, token: String) {
+        var queue = POSQueuedShiftMutationStore.load()
+        queue.append(mutation)
+        POSQueuedShiftMutationStore.save(queue)
+        pendingShiftSyncCount = queue.count
+        syncQueuedShiftMutations(baseURL: baseURL, token: token)
+    }
+
+    func syncQueuedShiftMutations(baseURL: String, token: String) {
+        guard shiftSyncTask == nil else { return }
+
+        shiftSyncTask = Task { [weak self] in
+            guard let self else { return }
+            var queue = POSQueuedShiftMutationStore.load()
+
+            while let mutation = queue.first {
+                do {
+                    let response = try await self.performShiftMutation(mutation, baseURL: baseURL, token: token)
+                    queue.removeFirst()
+                    POSQueuedShiftMutationStore.save(queue)
+
+                    await MainActor.run {
+                        self.pendingShiftSyncCount = queue.count
+                        self.applyLocalShift(response.shift)
+                        self.isConnected = true
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.pendingShiftSyncCount = queue.count
+                        self.errorMessage = "Shift sync pending. \(error.localizedDescription)"
+                        self.isConnected = false
+                    }
+                    break
+                }
+            }
+
+            await MainActor.run {
+                self.shiftSyncTask = nil
+            }
+        }
+    }
+
+    private func performShiftMutation(_ mutation: POSQueuedShiftMutation, baseURL: String, token: String) async throws -> POSShiftResponse {
+        let client = KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken)
+
+        switch mutation.kind {
+        case .start:
+            guard let request = mutation.startRequest else { throw KitchenAPIError.invalidResponse }
+            return try await client.startPOSShift(request)
+        case .cashMovement:
+            guard let request = mutation.cashMovementRequest else { throw KitchenAPIError.invalidResponse }
+            return try await client.recordPOSCashMovement(request)
+        case .end:
+            guard let request = mutation.endRequest else { throw KitchenAPIError.invalidResponse }
+            return try await client.endPOSShift(request)
         }
     }
 
@@ -2860,7 +3637,30 @@ final class POSStore: ObservableObject {
         }
 
         do {
-            bootstrap = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).fetchPOSBootstrap()
+            let serverBootstrap = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).fetchPOSBootstrap()
+            let localShift = bootstrap?.shift
+            let nextBootstrap: POSBootstrapResponse
+
+            if POSLocalShiftStateStore.hasLocalDecision, let localShift {
+                let resolvedShift = localShift.isOpen
+                    ? localShift
+                    : POSShiftEnvelope(
+                        isOpen: false,
+                        shift: nil,
+                        recap: nil,
+                        activeOperator: serverBootstrap.shift.activeOperator
+                    )
+                nextBootstrap = POSBootstrapResponse(
+                    operator: serverBootstrap.operator,
+                    catalog: serverBootstrap.catalog,
+                    shift: resolvedShift
+                )
+            } else {
+                nextBootstrap = serverBootstrap
+            }
+
+            bootstrap = nextBootstrap
+            POSBootstrapCache.save(nextBootstrap)
             errorMessage = nil
             isConnected = true
             preloadForSmoothness(baseURL: baseURL, token: token)
@@ -2981,6 +3781,14 @@ struct KitchenAPIClient {
 
     func submitPOSSale(_ sale: POSCreateSaleRequest) async throws -> POSCreateSaleResponse {
         try await request(path: "/api/pos/sales", method: "POST", body: sale)
+    }
+
+    func scanRewardToken(_ scan: POSRewardScanRequest) async throws -> POSRewardScanResponse {
+        try await request(path: "/api/pos/reward-redemptions/scan", method: "POST", body: scan)
+    }
+
+    func quoteRewardSale(_ quote: POSRewardQuoteRequest) async throws -> POSRewardQuoteResponse {
+        try await request(path: "/api/pos/reward-redemptions/quote", method: "POST", body: quote)
     }
 
     func searchPOSCustomers(search: String) async throws -> POSCustomersResponse {
@@ -3315,7 +4123,7 @@ private struct LaunchSplashView: View {
         }
 
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 2_250_000_000)
+            try? await Task.sleep(nanoseconds: 650_000_000)
             onFinished()
         }
     }
@@ -3333,6 +4141,7 @@ private struct HeaderView: View {
     let cartItemCount: Int
     let openTicketCount: Int
     let cartTotal: Double
+    let pendingSyncCount: Int
     let posAccentColor: Color
     let isPOSArrangeMode: Bool
     let isCompact: Bool
@@ -3349,6 +4158,7 @@ private struct HeaderView: View {
             }
             .buttonStyle(NoHighlightButtonStyle())
             .accessibilityLabel("Go to POS home")
+            .layoutPriority(0)
 
             Spacer()
 
@@ -3383,11 +4193,14 @@ private struct HeaderView: View {
                         ticketCount: openTicketCount,
                         total: cartTotal,
                         isConnected: isConnected,
+                        pendingSyncCount: pendingSyncCount,
                         accentColor: posAccentColor,
                         isCompact: isCompact,
                         onCart: onCart
                     )
                 }
+                .padding(.top, isCompact ? 18 : 0)
+                .layoutPriority(2)
             case .studio:
                 VStack(alignment: .trailing, spacing: 7) {
                     Text("EMBEROS STUDIO")
@@ -3478,34 +4291,81 @@ private struct BrandLogoHeader: View {
     let isHidden: Bool
     let scale: Double
     let isCompact: Bool
+    @State private var preparedLogo: UIImage?
+    @State private var preparedLogoURL: URL?
 
     private var clampedScale: CGFloat {
-        min(max(CGFloat(scale), 0.6), 1.3)
+        min(max(CGFloat(scale), 0.6), 1.8)
     }
 
     private var baseSize: CGSize {
-        isCompact ? CGSize(width: 148, height: 48) : CGSize(width: 265, height: 82)
+        isCompact ? CGSize(width: 190, height: 84) : CGSize(width: 340, height: 112)
+    }
+
+    private var frameWidth: CGFloat {
+        min(baseSize.width * clampedScale, isCompact ? 214 : 430)
+    }
+
+    private var frameHeight: CGFloat {
+        min(baseSize.height * clampedScale, isCompact ? 112 : 150)
+    }
+
+    private var leadingInset: CGFloat {
+        isCompact ? 18 : 24
     }
 
     var body: some View {
-        Group {
+        HStack(spacing: 0) {
             if isHidden {
                 Color.clear
-            } else if let url, url.isFileURL, let image = UIImage(contentsOfFile: url.path) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
+            } else if let url, url.isFileURL, preparedLogoURL == url, let displayImage = preparedLogo {
+                logoImage(Image(uiImage: displayImage), aspectRatio: displayImage.logoAspectRatio)
             } else {
-                Image("EmberOSLogo")
-                    .resizable()
-                    .scaledToFit()
+                logoImage(Image("EmberOSLogo"), aspectRatio: 2.8)
             }
+
+            Spacer(minLength: 0)
         }
-        .frame(width: baseSize.width * clampedScale, height: baseSize.height * clampedScale)
-        .padding(.horizontal, isCompact ? 8 : 12)
-        .padding(.vertical, isCompact ? 6 : 8)
-        .background(isHidden ? Color.clear : .white, in: RoundedRectangle(cornerRadius: 8))
+        .frame(width: frameWidth, height: frameHeight, alignment: .leading)
+        .padding(.leading, isHidden ? 0 : leadingInset)
+        .contentShape(Rectangle())
         .accessibilityLabel(isHidden ? "Brand logo hidden" : "Brand logo")
+        .task(id: url) {
+            await prepareImportedLogo()
+        }
+    }
+
+    private func logoImage(_ image: Image, aspectRatio: CGFloat) -> some View {
+        let targetHeight = min((isCompact ? CGFloat(68) : CGFloat(86)) * clampedScale, frameHeight)
+        let maxWidth = frameWidth
+        let targetWidth = min(maxWidth, max(1, targetHeight * aspectRatio))
+
+        return image
+            .resizable()
+            .interpolation(.high)
+            .scaledToFit()
+            .frame(width: targetWidth, height: targetHeight, alignment: .leading)
+    }
+
+    @MainActor
+    private func prepareImportedLogo() async {
+        guard let url, url.isFileURL, !isHidden else {
+            preparedLogo = nil
+            preparedLogoURL = nil
+            return
+        }
+
+        if preparedLogoURL == url, preparedLogo != nil {
+            return
+        }
+
+        let image = await Task.detached(priority: .utility) { () -> UIImage? in
+            UIImage(contentsOfFile: url.path)
+        }.value
+        let displayImage = image.flatMap { $0.croppedToVisiblePixels() ?? $0 }
+
+        preparedLogo = displayImage
+        preparedLogoURL = displayImage == nil ? nil : url
     }
 }
 
@@ -3739,9 +4599,10 @@ private struct POSStaffPinGateView: View {
     let isSubmitting: Bool
     let errorMessage: String?
     let accentColor: Color
+    let needsEmberKey: Bool
     let onSubmit: (String) -> Void
+    let onSetupKey: () -> Void
     let onSignInLater: () -> Void
-    @State private var isPanelPresented = false
     @State private var localErrorMessage: String?
     private let panelCornerRadius: CGFloat = 8
 
@@ -3756,46 +4617,27 @@ private struct POSStaffPinGateView: View {
         localErrorMessage ?? errorMessage
     }
 
-    private var keyGlassFill: AnyShapeStyle {
-        UIAccessibility.isReduceTransparencyEnabled ? AnyShapeStyle(Color.white) : AnyShapeStyle(.thinMaterial)
-    }
-
     var body: some View {
-        ZStack {
-            Rectangle()
-                .fill(.white.opacity(0.10))
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture {}
-
-            Color.black.opacity(0.03)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture {}
-
+        GeometryReader { proxy in
             ZStack {
+                Color.white
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture {}
+
                 VStack(spacing: 18) {
                     Image("EmberOSLogo")
                         .resizable()
                         .scaledToFit()
-                        .frame(width: 166)
-                        .opacity(0.92)
+                        .frame(width: min(proxy.size.width * 0.36, 210))
+                        .opacity(0.94)
 
                     pinPanel
                 }
+                .frame(width: min(proxy.size.width - 36, 390))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, 18)
-                .offset(y: -56)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .opacity(isPanelPresented ? 1 : 0)
-            .scaleEffect(isPanelPresented ? 1 : 0.965)
-        }
-        .animation(.easeInOut(duration: 0.22), value: errorMessage)
-        .animation(.easeInOut(duration: 0.22), value: localErrorMessage)
-        .onAppear {
-            isPanelPresented = false
-            withAnimation(.easeOut(duration: 1.05).delay(0.50)) {
-                isPanelPresented = true
+                .offset(y: -28)
             }
         }
     }
@@ -3818,7 +4660,6 @@ private struct POSStaffPinGateView: View {
                     Circle()
                         .fill(index < pin.count ? accentColor : AppPalette.ink.opacity(0.12))
                         .frame(width: index < pin.count ? 12 : 9, height: index < pin.count ? 12 : 9)
-                        .animation(.spring(response: 0.28, dampingFraction: 0.78), value: pin.count)
                 }
             }
             .frame(height: 16)
@@ -3829,7 +4670,6 @@ private struct POSStaffPinGateView: View {
                     .foregroundStyle(Color(red: 0.68, green: 0.20, blue: 0.18))
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 260)
-                    .transition(.opacity)
             }
 
             VStack(spacing: 10) {
@@ -3848,7 +4688,18 @@ private struct POSStaffPinGateView: View {
             if isSubmitting {
                 ProgressView()
                     .tint(accentColor)
-                    .transition(.opacity)
+            }
+
+            if needsEmberKey {
+                Button(action: onSetupKey) {
+                    POSRectActionLabel(
+                        title: "SET EMBEROS KEY",
+                        tint: accentColor,
+                        isPrimary: true,
+                        fillsWidth: true
+                    )
+                }
+                .buttonStyle(.plain)
             }
 
             Button(action: onSignInLater) {
@@ -3864,45 +4715,12 @@ private struct POSStaffPinGateView: View {
         }
         .padding(.horizontal, 28)
         .padding(.vertical, 30)
-        .frame(width: min(UIScreen.main.bounds.width - 44, 390))
-        .lightGlassBackground(.thinMaterial, in: RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous))
-        .background(.white.opacity(0.78), in: RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous))
-        .background(
-            LinearGradient(
-                colors: [
-                    .white.opacity(0.92),
-                    .white.opacity(0.74),
-                    accentColor.opacity(0.08)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            ),
-            in: RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
-        )
-        .overlay(alignment: .topLeading) {
-            RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [.white.opacity(0.68), .white.opacity(0.18), .clear],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .allowsHitTesting(false)
-        }
+        .frame(maxWidth: .infinity)
+        .background(Color.white, in: RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
-                .stroke(
-                    LinearGradient(
-                        colors: [.white.opacity(0.92), .white.opacity(0.34), .white.opacity(0.66)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
-                )
+                .stroke(AppPalette.line.opacity(0.82), lineWidth: 1)
         )
-        .shadow(color: accentColor.opacity(0.08), radius: 18, y: 10)
-        .shadow(color: .black.opacity(0.07), radius: 30, y: 16)
     }
 
     private func pinKey(_ key: String) -> some View {
@@ -3911,43 +4729,11 @@ private struct POSStaffPinGateView: View {
         } label: {
             ZStack {
                 Circle()
-                    .fill(keyGlassFill)
-                    .background(.white.opacity(key == "arrow.right" ? 0.84 : 0.78), in: Circle())
+                    .fill(key == "arrow.right" && pin.count >= 4 ? accentColor.opacity(0.12) : AppPalette.card)
                     .overlay(
                         Circle()
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        .white.opacity(key == "arrow.right" ? 0.92 : 0.86),
-                                        .white.opacity(0.50),
-                                        accentColor.opacity(key == "arrow.right" ? 0.10 : 0.03)
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
+                            .stroke(key == "arrow.right" && pin.count >= 4 ? accentColor.opacity(0.46) : AppPalette.line.opacity(0.78), lineWidth: 1)
                     )
-                    .overlay(
-                        Circle()
-                            .stroke(
-                                LinearGradient(
-                                    colors: [.white.opacity(0.94), .white.opacity(0.30), .white.opacity(0.58)],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                ),
-                                lineWidth: 0.9
-                            )
-                    )
-                    .overlay(alignment: .topLeading) {
-                        Capsule()
-                            .fill(.white.opacity(0.46))
-                            .frame(width: 18, height: 7)
-                            .blur(radius: 4)
-                            .rotationEffect(.degrees(-24))
-                            .offset(x: 17, y: 14)
-                    }
-                    .shadow(color: .white.opacity(0.28), radius: 5, x: -1, y: -1)
-                    .shadow(color: .black.opacity(0.08), radius: 9, x: 1, y: 6)
 
                 if key == "delete.left" || key == "arrow.right" {
                     Image(systemName: key)
@@ -3962,8 +4748,6 @@ private struct POSStaffPinGateView: View {
             .frame(width: 72, height: 72)
         }
         .buttonStyle(.plain)
-        .scaleEffect(key == "arrow.right" && pin.count >= 4 ? 1.03 : 1)
-        .animation(.spring(response: 0.28, dampingFraction: 0.74), value: pin.count)
     }
 
     private func handleKey(_ key: String) {
@@ -4198,7 +4982,7 @@ private struct POSOpeningCashDeclarationOverlay: View {
         .animation(.easeInOut(duration: 0.22), value: localErrorMessage)
         .onAppear {
             isPanelPresented = false
-            withAnimation(.easeOut(duration: 0.92).delay(0.18)) {
+            withAnimation(.easeOut(duration: 0.18)) {
                 isPanelPresented = true
             }
         }
@@ -4330,7 +5114,7 @@ private struct POSPinWelcomeOverlay: View {
         }
         .onAppear {
             isPresented = false
-            withAnimation(.easeOut(duration: 0.95).delay(0.12)) {
+            withAnimation(.easeOut(duration: 0.18)) {
                 isPresented = true
             }
         }
@@ -4565,6 +5349,7 @@ private struct POSHeaderCartSummary: View {
     let ticketCount: Int
     let total: Double
     let isConnected: Bool
+    let pendingSyncCount: Int
     let accentColor: Color
     let isCompact: Bool
     let onCart: () -> Void
@@ -4587,6 +5372,12 @@ private struct POSHeaderCartSummary: View {
 
                 ConnectionDot(isConnected: isConnected)
                     .scaleEffect(0.82)
+
+                if pendingSyncCount > 0 {
+                    Text("\(pendingSyncCount)")
+                        .font(GlacialFont.caption2(.bold))
+                        .foregroundStyle(accentColor)
+                }
             }
             .frame(width: 76, height: 64)
             .contentShape(RoundedRectangle(cornerRadius: 8))
@@ -4599,12 +5390,12 @@ private struct POSHeaderCartSummary: View {
 
     private var regularSummary: some View {
         Button(action: onCart) {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 ZStack(alignment: .topTrailing) {
                     Image(systemName: "bag")
-                        .font(.system(size: 27, weight: .light))
+                        .font(.system(size: 24, weight: .light))
                         .foregroundStyle(accentColor)
-                        .frame(width: 45, height: 42)
+                        .frame(width: 40, height: 36)
 
                     Text("\(itemCount)")
                         .font(GlacialFont.caption2(.bold))
@@ -4613,11 +5404,11 @@ private struct POSHeaderCartSummary: View {
                         .background(accentColor, in: Circle())
                         .offset(x: 4, y: -1)
                 }
-                .frame(width: 55, height: 48)
+                .frame(width: 48, height: 42)
 
-                Spacer(minLength: 16)
+                Spacer(minLength: 10)
 
-                VStack(alignment: .trailing, spacing: 5) {
+                VStack(alignment: .trailing, spacing: 3) {
                     Text(cartLabel)
                         .font(GlacialFont.caption(.bold))
                         .tracking(1.7)
@@ -4625,12 +5416,19 @@ private struct POSHeaderCartSummary: View {
                     Text("\(Int(total).formatted()) VND")
                         .font(GlacialFont.caption(.bold))
                         .foregroundStyle(accentColor)
-                    ConnectionDot(isConnected: isConnected)
+                    if pendingSyncCount > 0 {
+                        Text("SYNC \(pendingSyncCount)")
+                            .font(GlacialFont.caption2(.bold))
+                            .tracking(1.1)
+                            .foregroundStyle(accentColor)
+                    } else {
+                        ConnectionDot(isConnected: isConnected)
+                    }
                 }
             }
-            .frame(width: 220, alignment: .leading)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            .frame(width: 196, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
             .background(.white, in: RoundedRectangle(cornerRadius: 8))
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
@@ -5713,7 +6511,16 @@ private struct POSSwipeCategoryPager<Content: View>: View {
     let onSwipeActivity: () -> Void
     @ViewBuilder let content: (Int, CGFloat) -> Content
 
+    private enum DragAxis {
+        case horizontal
+    }
+
+    private let intentThreshold: CGFloat = 18
+    private let directionBias: CGFloat = 1.25
+
     @State private var dragOffset: CGFloat = 0
+    @State private var lockedDragAxis: DragAxis?
+    @State private var didReportHorizontalDrag = false
 
     private var visiblePageIndices: [Int] {
         guard pageCount > 0 else { return [] }
@@ -5725,22 +6532,36 @@ private struct POSSwipeCategoryPager<Content: View>: View {
     var body: some View {
         GeometryReader { geo in
             let width = geo.size.width
+            let height = geo.size.height
 
             ZStack(alignment: .topLeading) {
                 ForEach(visiblePageIndices, id: \.self) { index in
-                    pageView(at: index, width: width)
+                    pageView(at: index, width: width, height: height)
                         .offset(x: CGFloat(index - currentIndex) * width)
                 }
             }
-            .frame(width: width, height: geo.size.height, alignment: .topLeading)
+            .frame(width: width, height: height, alignment: .topLeading)
             .offset(x: dragOffset)
             .contentShape(Rectangle())
             .simultaneousGesture(
-                DragGesture(minimumDistance: 30)
+                DragGesture(minimumDistance: intentThreshold)
                     .onChanged { value in
                         let horizontal = value.translation.width
                         let vertical = value.translation.height
-                        guard abs(horizontal) > 34, abs(horizontal) > abs(vertical) * 2.35 else { return }
+                        let absHorizontal = abs(horizontal)
+                        let absVertical = abs(vertical)
+
+                        if lockedDragAxis == nil {
+                            guard absHorizontal >= intentThreshold || absVertical >= intentThreshold else { return }
+
+                            if absHorizontal > absVertical * directionBias {
+                                lockedDragAxis = .horizontal
+                            } else {
+                                return
+                            }
+                        }
+
+                        guard lockedDragAxis == .horizontal else { return }
 
                         var translation = horizontal
                         if (currentIndex == 0 && translation > 0) || (currentIndex == pageCount - 1 && translation < 0) {
@@ -5751,12 +6572,19 @@ private struct POSSwipeCategoryPager<Content: View>: View {
                         withTransaction(transaction) {
                             dragOffset = translation
                         }
-                        onSwipeActivity()
+                        if !didReportHorizontalDrag {
+                            didReportHorizontalDrag = true
+                            onSwipeActivity()
+                        }
                     }
                     .onEnded { value in
                         let horizontal = value.translation.width
                         let vertical = value.translation.height
-                        guard abs(horizontal) > abs(vertical) * 1.9 else {
+                        let wasHorizontalDrag = lockedDragAxis == .horizontal
+                        lockedDragAxis = nil
+
+                        guard wasHorizontalDrag else {
+                            didReportHorizontalDrag = false
                             withAnimation(.interactiveSpring(response: 0.28, dampingFraction: 0.88, blendDuration: 0.08)) {
                                 dragOffset = 0
                             }
@@ -5797,9 +6625,10 @@ private struct POSSwipeCategoryPager<Content: View>: View {
                         if next != oldIndex {
                             Haptics.selectionChanged()
                         }
-                        if abs(horizontal) > 18 {
+                        if !didReportHorizontalDrag, abs(horizontal) > intentThreshold, abs(horizontal) > abs(vertical) * directionBias {
                             onSwipeActivity()
                         }
+                        didReportHorizontalDrag = false
                     }
             , including: .gesture)
         }
@@ -5807,19 +6636,20 @@ private struct POSSwipeCategoryPager<Content: View>: View {
     }
 
     @ViewBuilder
-    private func pageView(at index: Int, width: CGFloat) -> some View {
+    private func pageView(at index: Int, width: CGFloat, height: CGFloat) -> some View {
         let horizontalInset: CGFloat = 7
         let contentWidth = max(1, width - (horizontalInset * 2))
 
-        Group {
+        ZStack(alignment: .topLeading) {
+            Color.white.opacity(0.001)
+
             if index >= 0, index < pageCount {
                 content(index, contentWidth)
-            } else {
-                Color.clear
             }
         }
         .padding(.horizontal, horizontalInset)
-        .frame(width: width)
+        .frame(width: width, height: height, alignment: .topLeading)
+        .contentShape(Rectangle())
     }
 }
 
@@ -5858,6 +6688,10 @@ private struct POSDashboardView: View {
 
     private var compactPagerMinimumHeight: CGFloat {
         max(520, UIScreen.main.bounds.height - 360)
+    }
+
+    private var regularPagerMinimumHeight: CGFloat {
+        560
     }
 
     private var productCardSizes: [Int: POSCardSize] {
@@ -5971,14 +6805,28 @@ private struct POSDashboardView: View {
     }
 
     private var compactPagerHeight: CGFloat {
-        let categoryHeights = categories.map { productGridHeight(for: $0.name) }
+        let currentIndex = categoryIndex(selectedCategory) ?? 0
+        let visibleNames = categories.enumerated().compactMap { index, category in
+            abs(index - currentIndex) <= 1 ? category.name : nil
+        }
+        let categoryHeights = visibleNames.map { productGridHeight(for: $0) }
         return max(categoryHeights.max() ?? 1, compactPagerMinimumHeight)
     }
 
     private var productPagerHeight: CGFloat {
         guard !isCompact else { return compactPagerHeight }
-        let categoryHeights = categories.map { productGridHeight(for: $0.name) }
-        return max(categoryHeights.max() ?? 1, 1)
+        guard let selectedCategory else { return 1 }
+        return max(productGridHeight(for: selectedCategory), regularPagerMinimumHeight)
+    }
+
+    private func updateProductGridWidth(_ width: CGFloat) {
+        let nextWidth = max(1, width - 14)
+        guard abs(productGridWidth - nextWidth) > 0.5 else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            productGridWidth = nextWidth
+        }
     }
 
     private func columnSpan(for cardSize: POSCardSize) -> Int {
@@ -6183,10 +7031,10 @@ private struct POSDashboardView: View {
                         GeometryReader { proxy in
                             Color.clear
                                 .onAppear {
-                                    productGridWidth = max(1, proxy.size.width - 14)
+                                    updateProductGridWidth(proxy.size.width)
                                 }
                                 .onChange(of: proxy.size.width) { _, width in
-                                    productGridWidth = max(1, width - 14)
+                                    updateProductGridWidth(width)
                                 }
                         }
                     )
@@ -6774,6 +7622,15 @@ private struct POSShiftControlSheet: View {
         horizontalSizeClass == .compact
     }
 
+    private var drawerOwnerName: String? {
+        guard let activeOperator = shift.activeOperator,
+              activeOperator.id != `operator`.id else {
+            return nil
+        }
+
+        return activeOperator.name
+    }
+
     var body: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 14) {
@@ -6819,7 +7676,7 @@ private struct POSShiftControlSheet: View {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(shift.isOpen ? "SHIFT OPEN" : "SHIFT CLOSED")
+                            Text(drawerOwnerName == nil ? (shift.isOpen ? "SHIFT OPEN" : "SHIFT CLOSED") : "DRAWER BUSY")
                                 .font(GlacialFont.subheadline(.medium))
                                 .tracking(1.8)
                                 .foregroundStyle(AppPalette.ink)
@@ -6827,17 +7684,21 @@ private struct POSShiftControlSheet: View {
                                 Text("#\(activeShift.id)")
                                     .font(GlacialFont.caption())
                                     .foregroundStyle(AppPalette.muted)
+                            } else if let drawerOwnerName {
+                                Text("\(drawerOwnerName) is currently serving.")
+                                    .font(GlacialFont.caption(.semibold))
+                                    .foregroundStyle(AppPalette.orange)
                             }
                         }
 
                         Spacer()
 
-                        Text(shift.isOpen ? "ready" : "closed")
+                        Text(drawerOwnerName == nil ? (shift.isOpen ? "ready" : "closed") : "busy")
                             .font(GlacialFont.caption(.bold))
                             .textCase(.uppercase)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 7)
-                            .foregroundStyle(shift.isOpen ? AppPalette.green : accentColor)
+                            .foregroundStyle(drawerOwnerName == nil ? (shift.isOpen ? AppPalette.green : accentColor) : AppPalette.orange)
                             .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
                     }
 
@@ -6857,7 +7718,15 @@ private struct POSShiftControlSheet: View {
                 )
 
                 VStack(spacing: 10) {
-                    if shift.isOpen {
+                    if drawerOwnerName != nil {
+                        Text("\(drawerOwnerName ?? "Another operator") is currently serving. Close that shift before opening a new cash drawer.")
+                            .font(GlacialFont.subheadline(.semibold))
+                            .foregroundStyle(AppPalette.orange)
+                            .multilineTextAlignment(.center)
+                            .padding(14)
+                            .frame(maxWidth: .infinity)
+                            .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                    } else if shift.isOpen {
                         POSShiftMenuButton(title: "CASH IN", icon: "plus", isSubmitting: isSubmitting, accentColor: accentColor, action: onCashIn)
                         POSShiftMenuButton(title: "CASH OUT", icon: "minus", isSubmitting: isSubmitting, accentColor: accentColor, action: onCashOut)
                         POSShiftMenuButton(title: "CLOSE SHIFT", icon: "lock", isSubmitting: isSubmitting, accentColor: accentColor, tone: .danger, action: onCloseShift)
@@ -7194,6 +8063,7 @@ private struct POSMiniButton: View {
 
 private struct POSStartShiftSheet: View {
     let isSubmitting: Bool
+    let errorMessage: String?
     let accentColor: Color
     let submit: (Double, String) async -> Bool
     @Environment(\.dismiss) private var dismiss
@@ -7205,6 +8075,7 @@ private struct POSStartShiftSheet: View {
             title: "OPEN SHIFT",
             isSubmitting: isSubmitting,
             canSubmit: parsedOpeningCash != nil,
+            errorMessage: errorMessage,
             accentColor: accentColor,
             submit: {
                 guard let amount = parsedOpeningCash else { return false }
@@ -7224,6 +8095,7 @@ private struct POSStartShiftSheet: View {
 private struct POSCashMovementSheet: View {
     let type: POSCashMovementType
     let isSubmitting: Bool
+    let errorMessage: String?
     let accentColor: Color
     let submit: (Double, String) async -> Bool
     @Environment(\.dismiss) private var dismiss
@@ -7235,6 +8107,7 @@ private struct POSCashMovementSheet: View {
             title: type.title.uppercased(),
             isSubmitting: isSubmitting,
             canSubmit: parsedAmount != nil && !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            errorMessage: errorMessage,
             accentColor: accentColor,
             submit: {
                 guard let parsedAmount else { return false }
@@ -7256,8 +8129,9 @@ private struct POSCashMovementSheet: View {
 }
 
 private struct POSEndShiftSheet: View {
-    let expectedCash: Double?
+    let shift: POSShiftEnvelope?
     let isSubmitting: Bool
+    let errorMessage: String?
     let accentColor: Color
     let submit: (Double?, String) async -> Bool
     @Environment(\.dismiss) private var dismiss
@@ -7269,21 +8143,20 @@ private struct POSEndShiftSheet: View {
             title: "CLOSE SHIFT",
             isSubmitting: isSubmitting,
             canSubmit: closingCash.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || parsedClosingCash != nil,
+            errorMessage: errorMessage,
             accentColor: accentColor,
             submit: {
                 await submit(parsedClosingCash, notes)
             }
         ) {
-            if let expectedCash {
-                HStack {
-                    Text("expected cash")
-                        .font(GlacialFont.caption(.bold))
-                        .tracking(1.5)
-                        .foregroundStyle(AppPalette.muted)
-                    Spacer()
-                    Text("\(Int(expectedCash).formatted()) VND")
-                        .font(GlacialFont.subheadline(.semibold))
-                        .foregroundStyle(AppPalette.ink)
+            if let drawerSummary {
+                VStack(spacing: 8) {
+                    POSDrawerSummaryRow(title: "opening cash", amount: drawerSummary.openingCash)
+                    POSDrawerSummaryRow(title: "cash sales", amount: drawerSummary.cashSales)
+                    POSDrawerSummaryRow(title: "cash in", amount: drawerSummary.cashDeposited)
+                    POSDrawerSummaryRow(title: "cash out", amount: -drawerSummary.cashWithdrawn)
+                    Divider()
+                    POSDrawerSummaryRow(title: "expected cash", amount: drawerSummary.expectedCash, isTotal: true)
                 }
                 .padding(14)
                 .background(AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
@@ -7294,8 +8167,55 @@ private struct POSEndShiftSheet: View {
         }
     }
 
+    private var drawerSummary: POSDrawerSummary? {
+        guard let shift else { return nil }
+
+        let openingCash = shift.shift?.openingCash ?? 0
+        let cashSales = shift.recap?.cashSales ?? 0
+        let cashDeposited = shift.recap?.cashDeposited ?? 0
+        let cashWithdrawn = shift.recap?.cashWithdrawn ?? 0
+        let expectedCash = shift.recap?.expectedCash ?? (openingCash + cashSales + cashDeposited - cashWithdrawn)
+
+        return POSDrawerSummary(
+            openingCash: openingCash,
+            cashSales: cashSales,
+            cashDeposited: cashDeposited,
+            cashWithdrawn: cashWithdrawn,
+            expectedCash: expectedCash
+        )
+    }
+
     private var parsedClosingCash: Double? {
         POSMoneyParser.value(closingCash)
+    }
+}
+
+private struct POSDrawerSummary: Equatable {
+    let openingCash: Double
+    let cashSales: Double
+    let cashDeposited: Double
+    let cashWithdrawn: Double
+    let expectedCash: Double
+}
+
+private struct POSDrawerSummaryRow: View {
+    let title: String
+    let amount: Double
+    var isTotal = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(title.uppercased())
+                .font(GlacialFont.caption(isTotal ? .bold : .regular))
+                .tracking(1.3)
+                .foregroundStyle(isTotal ? AppPalette.ink : AppPalette.muted)
+            Spacer()
+            Text("\(Int(amount).formatted()) VND")
+                .font(GlacialFont.subheadline(isTotal ? .semibold : .regular))
+                .foregroundStyle(isTotal ? AppPalette.ink : AppPalette.muted)
+                .lineLimit(1)
+                .minimumScaleFactor(0.74)
+        }
     }
 }
 
@@ -7303,6 +8223,7 @@ private struct POSShiftFormShell<Content: View>: View {
     let title: String
     let isSubmitting: Bool
     let canSubmit: Bool
+    let errorMessage: String?
     let accentColor: Color
     let submit: () async -> Bool
     @ViewBuilder let content: Content
@@ -7318,6 +8239,15 @@ private struct POSShiftFormShell<Content: View>: View {
             VStack(spacing: 0) {
                 VStack(alignment: .leading, spacing: 14) {
                     content
+                    if let errorMessage, !errorMessage.isEmpty {
+                        Text(errorMessage)
+                            .font(GlacialFont.caption(.semibold))
+                            .foregroundStyle(AppPalette.red)
+                            .multilineTextAlignment(.leading)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(AppPalette.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                    }
                     Spacer(minLength: 0)
                 }
                 .padding(20)
@@ -7340,6 +8270,7 @@ private struct POSShiftFormShell<Content: View>: View {
                         )
                     }
                     .buttonStyle(.plain)
+                    .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .disabled(isSubmitting || !canSubmit)
                     .opacity(isSubmitting || !canSubmit ? 0.55 : 1)
                 }
@@ -7374,10 +8305,6 @@ private struct POSShiftFormShell<Content: View>: View {
                     }
                 }
             }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            dismiss()
         }
         .padding(.horizontal, 20)
         .padding(.top, 14)
@@ -7495,6 +8422,10 @@ private extension Array where Element == String {
 }
 
 private extension UIImage {
+    var logoAspectRatio: CGFloat {
+        size.height > 0 ? max(0.1, size.width / size.height) : 2.8
+    }
+
     func normalizedForPOSCard() -> UIImage {
         let maxSide: CGFloat = 1600
         let largestSide = max(size.width, size.height)
@@ -7508,10 +8439,11 @@ private extension UIImage {
     }
 
     func normalizedForPOSLogo() -> UIImage {
+        let image = croppedToVisiblePixels() ?? self
         let maxSide: CGFloat = 1200
-        let largestSide = max(size.width, size.height)
+        let largestSide = max(image.size.width, image.size.height)
         let scale = largestSide > maxSide ? maxSide / largestSide : 1
-        let targetSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let targetSize = CGSize(width: image.size.width * scale, height: image.size.height * scale)
 
         let format = UIGraphicsImageRendererFormat()
         format.opaque = false
@@ -7519,8 +8451,65 @@ private extension UIImage {
 
         let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
         return renderer.image { _ in
-            draw(in: CGRect(origin: .zero, size: targetSize))
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
         }
+    }
+
+    func croppedToVisiblePixels(alphaThreshold: UInt8 = 8, whiteThreshold: UInt8 = 244) -> UIImage? {
+        guard let cgImage else { return nil }
+
+        let width = cgImage.width
+        let height = cgImage.height
+        guard width > 0, height > 0 else { return nil }
+
+        let bytesPerPixel = 4
+        let bytesPerRow = width * bytesPerPixel
+        var pixels = [UInt8](repeating: 0, count: height * bytesPerRow)
+
+        guard let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        var minX = width
+        var minY = height
+        var maxX = 0
+        var maxY = 0
+
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * bytesPerRow + x * bytesPerPixel
+                let red = pixels[offset]
+                let green = pixels[offset + 1]
+                let blue = pixels[offset + 2]
+                let alpha = pixels[offset + 3]
+                let isOpaqueWhiteCanvas = alpha > alphaThreshold && red >= whiteThreshold && green >= whiteThreshold && blue >= whiteThreshold
+                guard alpha > alphaThreshold, !isOpaqueWhiteCanvas else { continue }
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
+            }
+        }
+
+        guard minX <= maxX, minY <= maxY else { return nil }
+
+        let cropRect = CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+        guard cropRect.width < CGFloat(width) || cropRect.height < CGFloat(height),
+              let cropped = cgImage.cropping(to: cropRect) else {
+            return self
+        }
+
+        return UIImage(cgImage: cropped, scale: scale, orientation: imageOrientation)
     }
 }
 
@@ -7654,7 +8643,7 @@ private struct POSProductCard: View {
             action()
         }
         .simultaneousGesture(
-            LongPressGesture(minimumDuration: arrangeLongPressDuration)
+            LongPressGesture(minimumDuration: arrangeLongPressDuration, maximumDistance: 6)
                 .onEnded { _ in
                     ignoresNextTap = true
                     onArrange()
@@ -7786,7 +8775,7 @@ private struct POSCompactProductCard: View {
         }
         .buttonStyle(NoHighlightButtonStyle())
         .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.36)
+            LongPressGesture(minimumDuration: 0.36, maximumDistance: 6)
                 .onEnded { _ in
                     ignoresNextTap = true
                     onArrange()
@@ -7864,7 +8853,7 @@ private struct POSProductListRow: View {
         }
         .buttonStyle(NoHighlightButtonStyle())
         .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.36)
+            LongPressGesture(minimumDuration: 0.36, maximumDistance: 6)
                 .onEnded { _ in
                     ignoresNextTap = true
                     onArrange()
@@ -7877,6 +8866,7 @@ private final class POSProductImageCache {
     static let shared = POSProductImageCache()
 
     private let cache = NSCache<NSURL, UIImage>()
+    private let directoryName = "POSProductImageCache"
 
     private init() {}
 
@@ -7888,6 +8878,16 @@ private final class POSProductImageCache {
         cache.setObject(image, forKey: url as NSURL)
     }
 
+    func cachedFileURL(for url: URL) -> URL? {
+        guard !url.isFileURL,
+              let fileURL = fileURL(for: url),
+              FileManager.default.fileExists(atPath: fileURL.path) else {
+            return nil
+        }
+
+        return fileURL
+    }
+
     func prewarm(urls: [URL], limit: Int = 18) async {
         let uniqueURLs = Array(Set(urls)).prefix(limit)
 
@@ -7897,8 +8897,13 @@ private final class POSProductImageCache {
                     let image: UIImage?
                     if url.isFileURL {
                         image = UIImage(contentsOfFile: url.path)
+                    } else if let cachedFile = await self.cachedFileURL(for: url) {
+                        image = UIImage(contentsOfFile: cachedFile.path)
                     } else if let data = try? Data(contentsOf: url) {
                         image = UIImage(data: data)
+                        if image != nil {
+                            await self.storeDownloadedData(data, for: url)
+                        }
                     } else {
                         image = nil
                     }
@@ -7913,6 +8918,22 @@ private final class POSProductImageCache {
             }
         }
     }
+
+    func storeDownloadedData(_ data: Data, for url: URL) {
+        guard let fileURL = fileURL(for: url) else { return }
+        try? FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: fileURL, options: [.atomic])
+    }
+
+    private func fileURL(for url: URL) -> URL? {
+        guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+
+        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+        let name = digest.map { String(format: "%02x", $0) }.joined() + ".img"
+        return caches.appendingPathComponent(directoryName, isDirectory: true).appendingPathComponent(name)
+    }
 }
 
 private struct POSProductImage: View {
@@ -7922,18 +8943,7 @@ private struct POSProductImage: View {
 
     private var cachedImage: UIImage? {
         guard let url else { return nil }
-
-        if let image = POSProductImageCache.shared.image(for: url) {
-            return image
-        }
-
-        guard url.isFileURL,
-              let image = UIImage(contentsOfFile: url.path) else {
-            return nil
-        }
-
-        POSProductImageCache.shared.store(image, for: url)
-        return image
+        return POSProductImageCache.shared.image(for: url)
     }
 
     private var currentImage: UIImage? {
@@ -7945,6 +8955,7 @@ private struct POSProductImage: View {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFill()
+                .allowsHitTesting(false)
         } else {
             ZStack {
                 POSProductImageFallback()
@@ -7957,6 +8968,7 @@ private struct POSProductImage: View {
             .task(id: url) {
                 await loadImage()
             }
+            .allowsHitTesting(false)
         }
     }
 
@@ -7978,9 +8990,14 @@ private struct POSProductImage: View {
                 return UIImage(contentsOfFile: url.path)
             }
 
+            if let cachedFile = await POSProductImageCache.shared.cachedFileURL(for: url) {
+                return UIImage(contentsOfFile: cachedFile.path)
+            }
+
             guard let data = try? Data(contentsOf: url) else {
                 return nil
             }
+            await POSProductImageCache.shared.storeDownloadedData(data, for: url)
             return UIImage(data: data)
         }.value
 
@@ -8445,9 +9462,15 @@ private struct POSCheckoutSheet: View {
     let onNewTicket: () -> Void
     let onSwitchTicket: (POSDraftTicket) -> Void
     let defaultPrintReceipt: (POSOrderSource) -> Bool
+    let activeRewardRedemption: POSRewardRedemption?
+    let activeRewardQuote: POSRewardQuote?
     let onMarketplacePriceChange: (POSCartLine, Double?) -> Void
     let onToppingsChange: (POSCartLine, [POSTopping]) -> Void
-    let submit: (POSPaymentMethod, POSOrderSource, String, POSCustomer?, Double, String, Double, Bool) async -> Bool
+    let scanRewardToken: (String) async throws -> Void
+    let quoteRewardSale: (POSPaymentMethod, POSOrderSource, String, POSCustomer?, Double, String, String?) async throws -> POSRewardQuote
+    let clearRewardRedemption: () -> Void
+    let clearRewardQuote: () -> Void
+    let submit: (POSPaymentMethod, POSOrderSource, String, POSCustomer?, Double, String, Double, Bool, String?, String?) async -> Bool
     @Environment(\.dismiss) private var dismiss
     @State private var paymentMethod: POSPaymentMethod = .cash
     @State private var orderSource: POSOrderSource = .inStore
@@ -8469,6 +9492,12 @@ private struct POSCheckoutSheet: View {
     @State private var pendingCartReset: POSCartResetAction?
     @State private var editingToppingsLine: POSCartLine?
     @State private var isToppingLinePickerOpen = false
+    @State private var isRewardScannerOpen = false
+    @State private var isScanningReward = false
+    @State private var isQuotingReward = false
+    @State private var rewardRedemptionError: String?
+    @State private var selectedRewardLineID: String?
+    @State private var checkoutValidationMessage: String?
     @State private var customerSearchTask: Task<Void, Never>?
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -8492,6 +9521,14 @@ private struct POSCheckoutSheet: View {
         orderSource.isMarketplace
     }
 
+    private var trimmedExternalReference: String {
+        externalReference.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canCompleteCheckout: Bool {
+        !isMarketplaceOrder || !trimmedExternalReference.isEmpty
+    }
+
     private var checkoutSubtotal: Double {
         lines.reduce(0) { $0 + $1.lineTotal(for: orderSource) }
     }
@@ -8512,13 +9549,25 @@ private struct POSCheckoutSheet: View {
         isMarketplaceOrder ? POSMarketplaceFees.actualReceived(grossTotal) : grossTotal
     }
 
+    private var payableTotal: Double {
+        activeRewardQuote?.finalPayableTotal ?? finalTotal
+    }
+
+    private var eligibleRewardLines: [POSCartLine] {
+        lines.filter { $0.product.freeRewardEligibility != nil }
+    }
+
+    private var selectedRewardLineKeyForSubmission: String? {
+        activeRewardQuote?.eligibleProduct?.lineKey ?? selectedRewardLineID
+    }
+
     private var parsedCashReceived: Double? {
         POSMoneyParser.value(cashReceived)
     }
 
     private var cashChange: Double? {
         guard paymentMethod == .cash, let parsedCashReceived else { return nil }
-        return parsedCashReceived - finalTotal
+        return parsedCashReceived - payableTotal
     }
 
     var body: some View {
@@ -8535,6 +9584,7 @@ private struct POSCheckoutSheet: View {
                         ticketSwitcher
                         recapSection
                         customerSection
+                        rewardRedemptionSection
                         printReceiptSection
 
                         paymentSelector
@@ -8562,24 +9612,39 @@ private struct POSCheckoutSheet: View {
                                 .tracking(2)
                                 .foregroundStyle(AppPalette.muted)
                             Spacer()
-                            Text("\(Int(finalTotal).formatted()) VND")
+                            Text("\(Int(payableTotal).formatted()) VND")
                                 .font(GlacialFont.custom(24, .semibold))
                                 .foregroundStyle(AppPalette.ink)
                         }
                     }
 
                     Button {
+                        guard canCompleteCheckout else {
+                            checkoutValidationMessage = "Enter the \(orderSource.label) reference before completing."
+                            Haptics.notification(.error)
+                            return
+                        }
+
+                        guard activeRewardRedemption == nil || activeRewardQuote != nil else {
+                            rewardRedemptionError = "Preview the reward total before completing."
+                            Haptics.notification(.error)
+                            return
+                        }
+
+                        checkoutValidationMessage = nil
                         Task {
                             let attachedCustomer = checkoutCustomerForSubmission
                             let didSubmit = await submit(
                                 paymentMethod,
                                 orderSource,
-                                externalReference,
+                                trimmedExternalReference,
                                 attachedCustomer,
                                 parsedDiscountPercent,
                                 notes,
-                                finalTotal,
-                                shouldPrintReceipt
+                                payableTotal,
+                                shouldPrintReceipt,
+                                activeRewardRedemption?.sessionID,
+                                selectedRewardLineKeyForSubmission
                             )
                             if didSubmit {
                                 dismiss()
@@ -8649,6 +9714,8 @@ private struct POSCheckoutSheet: View {
                 Text("Choose the item to customize.")
             }
             .onChange(of: orderSource) { _, newSource in
+                checkoutValidationMessage = nil
+
                 if newSource != .inStore {
                     paymentMethod = .bank
                     cashReceived = ""
@@ -8656,6 +9723,7 @@ private struct POSCheckoutSheet: View {
                     paymentMethod = .cash
                 }
 
+                selectedRewardLineID = nil
                 shouldPrintReceipt = defaultPrintReceipt(newSource)
             }
             .onAppear {
@@ -8674,6 +9742,11 @@ private struct POSCheckoutSheet: View {
                     editingToppingsLine = nil
                 }
                 .emberSheetChrome()
+            }
+            .sheet(isPresented: $isRewardScannerOpen) {
+                POSRewardScannerSheet(accentColor: accentColor) { token in
+                    await redeemScannedRewardToken(token)
+                }
             }
         }
     }
@@ -8873,12 +9946,22 @@ private struct POSCheckoutSheet: View {
                 .foregroundColor(AppPalette.ink)
                 .tint(accentColor)
                 .textInputAutocapitalization(.characters)
+                .onChange(of: externalReference) { _, _ in
+                    clearRewardQuote()
+                    checkoutValidationMessage = nil
+                }
                 .padding(12)
                 .background(.white, in: RoundedRectangle(cornerRadius: 8))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
                 )
+
+            if let checkoutValidationMessage, isMarketplaceOrder {
+                Text(checkoutValidationMessage)
+                    .font(GlacialFont.caption(.semibold))
+                    .foregroundStyle(AppPalette.red)
+            }
         }
         .transition(.move(edge: .top).combined(with: .opacity))
     }
@@ -8937,6 +10020,190 @@ private struct POSCheckoutSheet: View {
         .buttonStyle(.plain)
     }
 
+    private var rewardRedemptionSection: some View {
+        POSCheckoutChoiceGroup(title: "free fitbites") {
+            VStack(alignment: .leading, spacing: 12) {
+                if let activeRewardRedemption {
+                    HStack(alignment: .top, spacing: 12) {
+                        Image(systemName: "gift.fill")
+                            .font(.headline.weight(.semibold))
+                            .foregroundStyle(accentColor)
+                            .frame(width: 36, height: 36)
+                            .background(accentColor.opacity(0.14), in: RoundedRectangle(cornerRadius: 8))
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(activeRewardRedemption.rewardName)
+                                .font(GlacialFont.subheadline(.semibold))
+                                .foregroundStyle(AppPalette.ink)
+                            Text(activeRewardRedemption.customerName ?? "Customer reward reserved")
+                                .font(GlacialFont.caption())
+                                .foregroundStyle(AppPalette.muted)
+                            if let policyDescription = activeRewardRedemption.policyDescription {
+                                Text(policyDescription)
+                                    .font(GlacialFont.caption())
+                                    .foregroundStyle(AppPalette.muted)
+                            }
+                            if let expiresAt = activeRewardRedemption.reservationExpiresAt {
+                                Text("Reserved until \(expiresAt)")
+                                    .font(GlacialFont.caption2(.semibold))
+                                    .foregroundStyle(AppPalette.muted)
+                            }
+                        }
+
+                        Spacer()
+
+                        Button("clear") {
+                            selectedRewardLineID = nil
+                            clearRewardRedemption()
+                        }
+                        .font(GlacialFont.caption(.bold))
+                        .foregroundStyle(accentColor)
+                    }
+                    .padding(12)
+                    .background(accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("1 FREE REWARD")
+                            .font(GlacialFont.caption(.bold))
+                            .tracking(1.6)
+                            .foregroundStyle(AppPalette.ink)
+                        Text("Choose one Daily Go, Daily Classic, or standard coffee")
+                            .font(GlacialFont.caption())
+                            .foregroundStyle(AppPalette.muted)
+
+                        if eligibleRewardLines.isEmpty {
+                            Text("Add an eligible item to the cart.")
+                                .font(GlacialFont.caption(.semibold))
+                                .foregroundStyle(AppPalette.red)
+                        } else {
+                            ForEach(eligibleRewardLines) { line in
+                                Button {
+                                    selectedRewardLineID = line.id
+                                    clearRewardQuote()
+                                    Haptics.selectionChanged()
+                                } label: {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: selectedRewardLineID == line.id ? "checkmark.circle.fill" : "circle")
+                                            .foregroundStyle(selectedRewardLineID == line.id ? accentColor : AppPalette.muted)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(line.product.name)
+                                                .font(GlacialFont.caption(.semibold))
+                                                .foregroundStyle(AppPalette.ink)
+                                            Text("\(Int(line.product.price).formatted()) VND base")
+                                                .font(GlacialFont.caption2())
+                                                .foregroundStyle(AppPalette.muted)
+                                        }
+                                        Spacer()
+                                    }
+                                    .padding(10)
+                                    .background(selectedRewardLineID == line.id ? accentColor.opacity(0.10) : AppPalette.card, in: RoundedRectangle(cornerRadius: 8))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .padding(12)
+                    .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                    )
+
+                    if let activeRewardQuote {
+                        VStack(spacing: 8) {
+                            POSCheckoutTotalRow(title: "subtotal", value: activeRewardQuote.subtotal)
+                            POSCheckoutTotalRow(title: "free fitbites", value: -activeRewardQuote.rewardDiscount, tint: accentColor)
+                            if activeRewardQuote.manualDiscount > 0 {
+                                POSCheckoutTotalRow(title: "manual discount", value: -activeRewardQuote.manualDiscount, tint: accentColor)
+                            }
+                            if activeRewardQuote.paidAddOns > 0 {
+                                POSCheckoutTotalRow(title: "paid add-ons", value: activeRewardQuote.paidAddOns)
+                            }
+                            HStack(alignment: .firstTextBaseline) {
+                                Text("PAYABLE")
+                                    .font(GlacialFont.caption(.bold))
+                                    .tracking(1.7)
+                                    .foregroundStyle(AppPalette.muted)
+                                Spacer()
+                                Text("\(Int(activeRewardQuote.finalPayableTotal).formatted()) VND")
+                                    .font(GlacialFont.title3(.semibold))
+                                    .foregroundStyle(AppPalette.ink)
+                            }
+                        }
+                        .padding(12)
+                        .background(.white, in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
+                        )
+                    } else {
+                        Text("Preview required before payment.")
+                            .font(GlacialFont.caption(.semibold))
+                            .foregroundStyle(AppPalette.muted)
+                    }
+                }
+
+                if activeRewardRedemption != nil {
+                    Button {
+                        Task { await previewRewardTotal() }
+                    } label: {
+                        HStack {
+                            if isQuotingReward {
+                                ProgressView()
+                                    .tint(.white)
+                            } else {
+                                Image(systemName: "checkmark.seal")
+                            }
+                            Text(isQuotingReward ? "PREVIEWING" : "PREVIEW PAYABLE TOTAL")
+                        }
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.6)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .foregroundStyle(.white)
+                        .background(AppPalette.ink, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isQuotingReward || lines.isEmpty)
+                }
+
+                Button {
+                    isRewardScannerOpen = true
+                    rewardRedemptionError = nil
+                } label: {
+                    HStack {
+                        Image(systemName: "qrcode.viewfinder")
+                        Text(activeRewardRedemption == nil ? "SCAN REWARD QR" : "SCAN ANOTHER QR")
+                    }
+                    .font(GlacialFont.caption(.bold))
+                    .tracking(1.6)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .foregroundStyle(.white)
+                    .background(accentColor, in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .disabled(isScanningReward)
+
+                if isScanningReward || isQuotingReward {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .tint(accentColor)
+                        Text(isQuotingReward ? "Previewing total with Laravel..." : "Checking reward with Laravel...")
+                            .font(GlacialFont.caption())
+                            .foregroundStyle(AppPalette.muted)
+                    }
+                }
+
+                if let rewardRedemptionError {
+                    Text(rewardRedemptionError)
+                        .font(GlacialFont.caption(.semibold))
+                        .foregroundStyle(AppPalette.red)
+                }
+            }
+        }
+    }
+
     private var paymentSelector: some View {
         POSCheckoutChoiceGroup(title: "payment") {
             HStack(spacing: 10) {
@@ -8957,7 +10224,7 @@ private struct POSCheckoutSheet: View {
         if paymentMethod == .cash {
             POSCheckoutChoiceGroup(title: "cash back") {
                 VStack(alignment: .leading, spacing: 12) {
-                    POSMoneyField(title: "cash received", placeholder: "\(Int(finalTotal).formatted())", text: $cashReceived)
+                    POSMoneyField(title: "cash received", placeholder: "\(Int(payableTotal).formatted())", text: $cashReceived)
 
                     HStack(alignment: .firstTextBaseline) {
                         Text(cashChangeText.title)
@@ -9148,6 +10415,9 @@ private struct POSCheckoutSheet: View {
                         RoundedRectangle(cornerRadius: 8)
                             .stroke(AppPalette.line.opacity(0.72), lineWidth: 1)
                     )
+                    .onChange(of: discountPercent) { _, _ in
+                        clearRewardQuote()
+                    }
                 Text("%")
                     .font(GlacialFont.subheadline(.semibold))
                     .foregroundStyle(AppPalette.muted)
@@ -9176,6 +10446,8 @@ private struct POSCheckoutSheet: View {
         POSCheckoutPill(title: source.label, isSelected: orderSource == source, accentColor: accentColor) {
             withAnimation(.smooth(duration: 0.24)) {
                 orderSource = source
+                selectedRewardLineID = nil
+                clearRewardQuote()
             }
         }
     }
@@ -9183,6 +10455,8 @@ private struct POSCheckoutSheet: View {
     private func paymentPill(_ method: POSPaymentMethod) -> some View {
         POSCheckoutPill(title: method.label, isSelected: paymentMethod == method, accentColor: accentColor) {
             paymentMethod = method
+            selectedRewardLineID = nil
+            clearRewardQuote()
         }
     }
 
@@ -9235,6 +10509,7 @@ private struct POSCheckoutSheet: View {
     }
 
     private func attachCustomer(_ customer: POSCustomer) {
+        clearRewardQuote()
         customerSearchTask?.cancel()
         selectedCustomer = customer
         customerResults = []
@@ -9244,6 +10519,7 @@ private struct POSCheckoutSheet: View {
     }
 
     private func clearSelectedCustomer() {
+        clearRewardQuote()
         customerSearchTask?.cancel()
         selectedCustomer = nil
         customerSearch = ""
@@ -9284,6 +10560,75 @@ private struct POSCheckoutSheet: View {
         }
 
         isCreatingCustomer = false
+    }
+
+    @MainActor
+    private func redeemScannedRewardToken(_ token: String) async {
+        guard !isScanningReward else { return }
+
+        isRewardScannerOpen = false
+        isScanningReward = true
+        rewardRedemptionError = nil
+
+        do {
+            try await scanRewardToken(token)
+            Haptics.notification(.success)
+        } catch {
+            rewardRedemptionError = error.localizedDescription
+            Haptics.notification(.error)
+        }
+
+        isScanningReward = false
+    }
+
+    @MainActor
+    private func previewRewardTotal() async {
+        guard !isQuotingReward else { return }
+        guard activeRewardRedemption != nil else {
+            rewardRedemptionError = "Scan a reward QR first."
+            return
+        }
+
+        let eligibleLines = eligibleRewardLines
+        let rewardLineKey: String?
+        if eligibleLines.isEmpty {
+            rewardRedemptionError = "Add one Daily Go, Daily Classic, or standard coffee."
+            return
+        } else if eligibleLines.count == 1 {
+            rewardLineKey = selectedRewardLineID ?? eligibleLines[0].id
+            selectedRewardLineID = rewardLineKey
+        } else if let selectedRewardLineID, eligibleLines.contains(where: { $0.id == selectedRewardLineID }) {
+            rewardLineKey = selectedRewardLineID
+        } else {
+            rewardRedemptionError = "Choose which item receives this reward."
+            return
+        }
+
+        if isMarketplaceOrder && trimmedExternalReference.isEmpty {
+            checkoutValidationMessage = "Enter the \(orderSource.label) reference before previewing."
+            return
+        }
+
+        isQuotingReward = true
+        rewardRedemptionError = nil
+
+        do {
+            _ = try await quoteRewardSale(
+                paymentMethod,
+                orderSource,
+                trimmedExternalReference,
+                checkoutCustomerForSubmission,
+                parsedDiscountPercent,
+                notes,
+                rewardLineKey
+            )
+            Haptics.notification(.success)
+        } catch {
+            rewardRedemptionError = error.localizedDescription
+            Haptics.notification(.error)
+        }
+
+        isQuotingReward = false
     }
 }
 
@@ -9336,6 +10681,144 @@ private enum POSCartResetAction: Identifiable {
         switch self {
         case .clearCart:
             clearCart()
+        }
+    }
+}
+
+private struct POSRewardScannerSheet: View {
+    let accentColor: Color
+    let onToken: (String) async -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ZStack(alignment: .bottom) {
+                POSQRCodeScannerView { code in
+                    Task {
+                        dismiss()
+                        await onToken(code)
+                    }
+                }
+                .ignoresSafeArea()
+
+                VStack(spacing: 10) {
+                    Image(systemName: "qrcode.viewfinder")
+                        .font(.system(size: 44, weight: .semibold))
+                    Text("Scan Free Reward QR")
+                        .font(GlacialFont.title3(.semibold))
+                    Text("The reward is reserved by Laravel for this checkout only.")
+                        .font(GlacialFont.caption())
+                        .multilineTextAlignment(.center)
+                }
+                .foregroundStyle(.white)
+                .padding(18)
+                .frame(maxWidth: .infinity)
+                .background(.black.opacity(0.52))
+            }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .foregroundStyle(accentColor)
+                }
+            }
+        }
+    }
+}
+
+private struct POSQRCodeScannerView: UIViewControllerRepresentable {
+    let onCode: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onCode: onCode)
+    }
+
+    func makeUIViewController(context: Context) -> ScannerViewController {
+        ScannerViewController(coordinator: context.coordinator)
+    }
+
+    func updateUIViewController(_ uiViewController: ScannerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, AVCaptureMetadataOutputObjectsDelegate {
+        private let onCode: (String) -> Void
+        private var didCapture = false
+
+        init(onCode: @escaping (String) -> Void) {
+            self.onCode = onCode
+        }
+
+        func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
+            guard !didCapture,
+                  let object = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+                  object.type == .qr,
+                  let value = object.stringValue else { return }
+
+            didCapture = true
+            onCode(value)
+        }
+    }
+
+    final class ScannerViewController: UIViewController {
+        private let session = AVCaptureSession()
+        private let coordinator: Coordinator
+        private var previewLayer: AVCaptureVideoPreviewLayer?
+
+        init(coordinator: Coordinator) {
+            self.coordinator = coordinator
+            super.init(nibName: nil, bundle: nil)
+        }
+
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            view.backgroundColor = .black
+            configureSession()
+        }
+
+        override func viewDidLayoutSubviews() {
+            super.viewDidLayoutSubviews()
+            previewLayer?.frame = view.bounds
+        }
+
+        override func viewWillAppear(_ animated: Bool) {
+            super.viewWillAppear(animated)
+            guard !session.isRunning else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.session.startRunning()
+            }
+        }
+
+        override func viewWillDisappear(_ animated: Bool) {
+            super.viewWillDisappear(animated)
+            guard session.isRunning else { return }
+            session.stopRunning()
+        }
+
+        private func configureSession() {
+            guard
+                let device = AVCaptureDevice.default(for: .video),
+                let input = try? AVCaptureDeviceInput(device: device),
+                session.canAddInput(input)
+            else { return }
+
+            session.addInput(input)
+
+            let output = AVCaptureMetadataOutput()
+            guard session.canAddOutput(output) else { return }
+
+            session.addOutput(output)
+            output.setMetadataObjectsDelegate(coordinator, queue: .main)
+            output.metadataObjectTypes = [.qr]
+
+            let layer = AVCaptureVideoPreviewLayer(session: session)
+            layer.videoGravity = .resizeAspectFill
+            layer.frame = view.bounds
+            view.layer.insertSublayer(layer, at: 0)
+            previewLayer = layer
         }
     }
 }
@@ -11076,6 +12559,7 @@ private struct SettingsView: View {
     @ObservedObject var store: KitchenStore
     @ObservedObject var posStore: POSStore
     @ObservedObject var printStore: PrintBridgeStore
+    var isConnectionOnly = false
     var onClose: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @AppStorage("POSProductDisplayStyle") private var posProductDisplayStyleRaw = POSProductDisplayStyle.productCard.rawValue
@@ -11145,284 +12629,8 @@ private struct SettingsView: View {
                         }
                     }
 
-                    SettingsDisclosureCard(
-                        title: "Sound",
-                        subtitle: store.chimeTone.label,
-                        icon: "speaker.wave.2",
-                        isExpanded: $soundOpen,
-                        accentColor: selectedPOSAccentColor.color
-                    ) {
-                        VStack(spacing: 0) {
-                            ForEach(Array(KitchenChimeTone.allCases.enumerated()), id: \.element.id) { index, tone in
-                                ChimeToneRow(
-                                    tone: tone,
-                                    isSaved: tone == store.chimeTone,
-                                    isPreviewing: tone == previewTone,
-                                    accentColor: selectedPOSAccentColor.color
-                                ) {
-                                    if previewTone == tone, store.chimeTone != tone {
-                                        store.saveChimeTone(tone)
-                                    } else {
-                                        previewTone = tone
-                                        store.previewChimeTone(tone)
-                                    }
-                                }
-
-                                if index < KitchenChimeTone.allCases.count - 1 {
-                                    SettingsDivider()
-                                }
-                            }
-
-                            SettingsDivider()
-
-                            Button("Stop preview") {
-                                previewTone = nil
-                                store.stopChime()
-                            }
-                            .font(GlacialFont.subheadline(.semibold))
-                            .foregroundStyle(AppPalette.red)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 12)
-                        }
-                    }
-
-                    SettingsDisclosureCard(
-                        title: "Print",
-                        subtitle: printStore.autoPrint ? "Auto-print on · \(printStore.printerHost)" : "Auto-print off · \(printStore.printerHost)",
-                        icon: "printer",
-                        isExpanded: $printOpen,
-                        accentColor: selectedPOSAccentColor.color
-                    ) {
-                        VStack(spacing: 0) {
-                            SettingsTextFieldRow(title: "Server URL", text: $printServerURL, isSecure: false)
-                            SettingsDivider()
-                            SettingsTextFieldRow(title: "Print Key", text: $printToken, isSecure: true)
-                            SettingsDivider()
-                            SettingsTextFieldRow(title: "Printer IP", text: $printerHost, isSecure: false)
-                            SettingsDivider()
-
-                            HStack(spacing: 12) {
-                                SettingsCompactTextField(title: "Port", text: $printerPort, keyboard: .numberPad)
-                                SettingsCompactTextField(title: "Paper", text: $printerPaperWidth, keyboard: .numberPad)
-                            }
-                            .padding(.vertical, 12)
-
-                            SettingsDivider()
-
-                            Toggle(isOn: $autoPrint) {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "bolt.badge.automatic")
-                                        .font(.headline.weight(.semibold))
-                                        .foregroundStyle(selectedPOSAccentColor.color)
-                                        .frame(width: 28)
-
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text("Auto-print")
-                                            .font(GlacialFont.body(.semibold))
-                                            .foregroundStyle(AppPalette.ink)
-
-                                        Text("Print receipt jobs when this iPad is open.")
-                                            .font(GlacialFont.caption())
-                                            .foregroundStyle(AppPalette.muted)
-                                    }
-                                }
-                            }
-                            .tint(selectedPOSAccentColor.color)
-                            .padding(.vertical, 12)
-
-                            SettingsDivider()
-
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("PRINT SOURCES")
-                                    .font(GlacialFont.caption(.bold))
-                                    .tracking(1.8)
-                                    .foregroundStyle(AppPalette.muted)
-
-                                VStack(spacing: 0) {
-                                    PrintSourceToggleRow(title: "STORE", subtitle: "Native POS and counter sales", isOn: $printStoreSource, accentColor: selectedPOSAccentColor.color)
-                                    SettingsDivider()
-                                    PrintSourceToggleRow(title: "WEBSITE", subtitle: "Online pickup and delivery", isOn: $printWebsiteSource, accentColor: selectedPOSAccentColor.color)
-                                    SettingsDivider()
-                                    PrintSourceToggleRow(title: "GRAB", subtitle: "Marketplace orders", isOn: $printGrabSource, accentColor: selectedPOSAccentColor.color)
-                                    SettingsDivider()
-                                    PrintSourceToggleRow(title: "SHOPEE", subtitle: "Marketplace orders", isOn: $printShopeeSource, accentColor: selectedPOSAccentColor.color)
-                                }
-                            }
-                            .padding(.vertical, 12)
-
-                            SettingsDivider()
-
-                            HStack(spacing: 12) {
-                                Image(systemName: printStore.isConnected ? "checkmark.circle" : "exclamationmark.triangle")
-                                    .font(.headline.weight(.semibold))
-                                    .foregroundStyle(printStore.isConnected ? AppPalette.green : AppPalette.red)
-
-                                Text(printStore.statusMessage)
-                                    .font(GlacialFont.caption(.semibold))
-                                    .foregroundStyle(AppPalette.muted)
-                                    .lineLimit(2)
-
-                                Spacer()
-                            }
-                            .padding(.vertical, 12)
-
-                            Button {
-                                savePrintSettings()
-                                Task { await printStore.printTestReceipt() }
-                            } label: {
-                                HStack(spacing: 10) {
-                                    if printStore.isPrinting {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                            .tint(.white)
-                                    } else {
-                                        Image(systemName: "printer.filled.and.paper")
-                                    }
-
-                                    Text("TEST PRINT")
-                                        .tracking(1.8)
-                                }
-                                .font(GlacialFont.caption(.bold))
-                                .foregroundStyle(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 13)
-                                .background(selectedPOSAccentColor.color, in: RoundedRectangle(cornerRadius: 8))
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(printStore.isPrinting)
-                        }
-                    }
-
-                    SettingsDisclosureCard(
-                        title: "POS Display",
-                        subtitle: "\(selectedPOSDisplayStyle.label) · \(selectedPOSAccentColor.label)",
-                        icon: "rectangle.grid.2x2",
-                        isExpanded: $displayOpen,
-                        accentColor: selectedPOSAccentColor.color
-                    ) {
-                        VStack(spacing: 0) {
-                            POSBrandLogoSettingsCard(
-                                logoURL: posStore.brandLogoOverrideURL,
-                                isHidden: $posBrandLogoHidden,
-                                scale: $posBrandLogoScale,
-                                accentColor: selectedPOSAccentColor.color
-                            ) { data in
-                                await posStore.setBrandLogoOverride(data: data)
-                            } onReset: {
-                                posStore.clearBrandLogoOverride()
-                                posBrandLogoHidden = false
-                                posBrandLogoScale = 1.0
-                            }
-
-                            SettingsDivider()
-                                .padding(.vertical, 4)
-
-                            ForEach(Array(POSProductDisplayStyle.allCases.enumerated()), id: \.element.id) { index, style in
-                                Button {
-                                    posProductDisplayStyleRaw = style.rawValue
-                                    Haptics.impact(.light)
-                                } label: {
-                                    HStack(spacing: 12) {
-                                        Image(systemName: style.icon)
-                                            .font(.headline.weight(.semibold))
-                                            .foregroundStyle(style == selectedPOSDisplayStyle ? selectedPOSAccentColor.color : AppPalette.muted)
-                                            .frame(width: 28, height: 28)
-
-                                        Text(style.label)
-                                            .font(GlacialFont.body(.semibold))
-                                            .foregroundStyle(AppPalette.ink)
-
-                                        Spacer()
-
-                                        if style == selectedPOSDisplayStyle {
-                                            Image(systemName: "checkmark")
-                                                .font(.headline.weight(.bold))
-                                                .foregroundStyle(selectedPOSAccentColor.color)
-                                        }
-                                    }
-                                    .padding(.vertical, 12)
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-
-                                if index < POSProductDisplayStyle.allCases.count - 1 {
-                                    SettingsDivider()
-                                }
-                            }
-
-                            SettingsDivider()
-                                .padding(.vertical, 4)
-
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("BUTTON COLOR")
-                                    .font(GlacialFont.caption(.bold))
-                                    .tracking(1.8)
-                                    .foregroundStyle(AppPalette.muted)
-
-                                HStack(spacing: 10) {
-                                    ForEach(POSAccentColor.allCases) { accent in
-                                        Button {
-                                            posAccentColorRaw = accent.rawValue
-                                            Haptics.selectionChanged()
-                                        } label: {
-                                            VStack(spacing: 6) {
-                                                ZStack {
-                                                    Circle()
-                                                        .fill(accent.color)
-                                                        .frame(width: 34, height: 34)
-                                                        .overlay(
-                                                            Circle()
-                                                                .stroke(.white, lineWidth: 2)
-                                                        )
-                                                        .shadow(color: accent.color.opacity(0.24), radius: 8, y: 4)
-
-                                                    if accent == selectedPOSAccentColor {
-                                                        Image(systemName: "checkmark")
-                                                            .font(.caption.weight(.bold))
-                                                            .foregroundStyle(.white)
-                                                    }
-                                                }
-
-                                                Text(accent.label.uppercased())
-                                                    .font(GlacialFont.caption2(.bold))
-                                                    .tracking(0.7)
-                                                    .foregroundStyle(accent == selectedPOSAccentColor ? AppPalette.ink : AppPalette.muted)
-                                                    .lineLimit(1)
-                                            }
-                                            .frame(maxWidth: .infinity)
-                                            .padding(.vertical, 8)
-                                            .background(
-                                                accent == selectedPOSAccentColor ? accent.color.opacity(0.10) : Color.clear,
-                                                in: RoundedRectangle(cornerRadius: 8)
-                                            )
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                            .padding(.top, 4)
-                        }
-                    }
-
-                    SettingsDisclosureCard(
-                        title: "POS Catalog",
-                        subtitle: "Pictures unlocked, inventory locked",
-                        icon: "shippingbox",
-                        isExpanded: $catalogOpen,
-                        accentColor: selectedPOSAccentColor.color
-                    ) {
-                        VStack(spacing: 14) {
-                            POSProductPictureSettingsList(posStore: posStore, accentColor: selectedPOSAccentColor.color)
-                            SettingsDivider()
-                            POSToppingCategoryOrderSettings(
-                                categories: toppingCategories,
-                                accentColor: selectedPOSAccentColor.color
-                            ) { category, offset in
-                                moveToppingCategory(category, offset: offset)
-                            }
-                            SettingsDivider()
-                            LockedCatalogSettingsCard(accentColor: selectedPOSAccentColor.color)
-                        }
+                    if !isConnectionOnly {
+                        fullSettingsSections
                     }
 
                     Button {
@@ -11453,6 +12661,7 @@ private struct SettingsView: View {
                 baseURL = store.baseURL
                 token = store.kitchenToken
                 studioToken = savedStudioToken
+                connectionOpen = isConnectionOnly || connectionOpen
                 printServerURL = printStore.serverURL
                 printToken = printStore.printToken
                 printerHost = printStore.printerHost
@@ -11463,6 +12672,289 @@ private struct SettingsView: View {
                 printWebsiteSource = printStore.enabledSources.website
                 printGrabSource = printStore.enabledSources.grab
                 printShopeeSource = printStore.enabledSources.shopee
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var fullSettingsSections: some View {
+        SettingsDisclosureCard(
+            title: "Sound",
+            subtitle: store.chimeTone.label,
+            icon: "speaker.wave.2",
+            isExpanded: $soundOpen,
+            accentColor: selectedPOSAccentColor.color
+        ) {
+            VStack(spacing: 0) {
+                ForEach(Array(KitchenChimeTone.allCases.enumerated()), id: \.element.id) { index, tone in
+                    ChimeToneRow(
+                        tone: tone,
+                        isSaved: tone == store.chimeTone,
+                        isPreviewing: tone == previewTone,
+                        accentColor: selectedPOSAccentColor.color
+                    ) {
+                        if previewTone == tone, store.chimeTone != tone {
+                            store.saveChimeTone(tone)
+                        } else {
+                            previewTone = tone
+                            store.previewChimeTone(tone)
+                        }
+                    }
+
+                    if index < KitchenChimeTone.allCases.count - 1 {
+                        SettingsDivider()
+                    }
+                }
+
+                SettingsDivider()
+
+                Button("Stop preview") {
+                    previewTone = nil
+                    store.stopChime()
+                }
+                .font(GlacialFont.subheadline(.semibold))
+                .foregroundStyle(AppPalette.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 12)
+            }
+        }
+
+        SettingsDisclosureCard(
+            title: "Print",
+            subtitle: printStore.autoPrint ? "Auto-print on · \(printStore.printerHost)" : "Auto-print off · \(printStore.printerHost)",
+            icon: "printer",
+            isExpanded: $printOpen,
+            accentColor: selectedPOSAccentColor.color
+        ) {
+            VStack(spacing: 0) {
+                SettingsTextFieldRow(title: "Server URL", text: $printServerURL, isSecure: false)
+                SettingsDivider()
+                SettingsTextFieldRow(title: "Print Key", text: $printToken, isSecure: true)
+                SettingsDivider()
+                SettingsTextFieldRow(title: "Printer IP", text: $printerHost, isSecure: false)
+                SettingsDivider()
+
+                HStack(spacing: 12) {
+                    SettingsCompactTextField(title: "Port", text: $printerPort, keyboard: .numberPad)
+                    SettingsCompactTextField(title: "Paper", text: $printerPaperWidth, keyboard: .numberPad)
+                }
+                .padding(.vertical, 12)
+
+                SettingsDivider()
+
+                Toggle(isOn: $autoPrint) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "bolt.badge.automatic")
+                            .font(.headline.weight(.semibold))
+                            .foregroundStyle(selectedPOSAccentColor.color)
+                            .frame(width: 28)
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Auto-print")
+                                .font(GlacialFont.body(.semibold))
+                                .foregroundStyle(AppPalette.ink)
+
+                            Text("Print receipt jobs when this iPad is open.")
+                                .font(GlacialFont.caption())
+                                .foregroundStyle(AppPalette.muted)
+                        }
+                    }
+                }
+                .tint(selectedPOSAccentColor.color)
+                .padding(.vertical, 12)
+
+                SettingsDivider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("PRINT SOURCES")
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.8)
+                        .foregroundStyle(AppPalette.muted)
+
+                    VStack(spacing: 0) {
+                        PrintSourceToggleRow(title: "STORE", subtitle: "Native POS and counter sales", isOn: $printStoreSource, accentColor: selectedPOSAccentColor.color)
+                        SettingsDivider()
+                        PrintSourceToggleRow(title: "WEBSITE", subtitle: "Online pickup and delivery", isOn: $printWebsiteSource, accentColor: selectedPOSAccentColor.color)
+                        SettingsDivider()
+                        PrintSourceToggleRow(title: "GRAB", subtitle: "Marketplace orders", isOn: $printGrabSource, accentColor: selectedPOSAccentColor.color)
+                        SettingsDivider()
+                        PrintSourceToggleRow(title: "SHOPEE", subtitle: "Marketplace orders", isOn: $printShopeeSource, accentColor: selectedPOSAccentColor.color)
+                    }
+                }
+                .padding(.vertical, 12)
+
+                SettingsDivider()
+
+                HStack(spacing: 12) {
+                    Image(systemName: printStore.isConnected ? "checkmark.circle" : "exclamationmark.triangle")
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(printStore.isConnected ? AppPalette.green : AppPalette.red)
+
+                    Text(printStore.statusMessage)
+                        .font(GlacialFont.caption(.semibold))
+                        .foregroundStyle(AppPalette.muted)
+                        .lineLimit(2)
+
+                    Spacer()
+                }
+                .padding(.vertical, 12)
+
+                Button {
+                    savePrintSettings()
+                    Task { await printStore.printTestReceipt() }
+                } label: {
+                    HStack(spacing: 10) {
+                        if printStore.isPrinting {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.white)
+                        } else {
+                            Image(systemName: "printer.filled.and.paper")
+                        }
+
+                        Text("TEST PRINT")
+                            .tracking(1.8)
+                    }
+                    .font(GlacialFont.caption(.bold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 13)
+                    .background(selectedPOSAccentColor.color, in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .disabled(printStore.isPrinting)
+            }
+        }
+
+        SettingsDisclosureCard(
+            title: "POS Display",
+            subtitle: "\(selectedPOSDisplayStyle.label) · \(selectedPOSAccentColor.label)",
+            icon: "rectangle.grid.2x2",
+            isExpanded: $displayOpen,
+            accentColor: selectedPOSAccentColor.color
+        ) {
+            VStack(spacing: 0) {
+                POSBrandLogoSettingsCard(
+                    logoURL: posStore.brandLogoOverrideURL,
+                    isHidden: $posBrandLogoHidden,
+                    scale: $posBrandLogoScale,
+                    accentColor: selectedPOSAccentColor.color
+                ) { data in
+                    await posStore.setBrandLogoOverride(data: data)
+                } onReset: {
+                    posStore.clearBrandLogoOverride()
+                    posBrandLogoHidden = false
+                    posBrandLogoScale = 1.35
+                }
+
+                SettingsDivider()
+                    .padding(.vertical, 4)
+
+                ForEach(Array(POSProductDisplayStyle.allCases.enumerated()), id: \.element.id) { index, style in
+                    Button {
+                        posProductDisplayStyleRaw = style.rawValue
+                        Haptics.impact(.light)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: style.icon)
+                                .font(.headline.weight(.semibold))
+                                .foregroundStyle(style == selectedPOSDisplayStyle ? selectedPOSAccentColor.color : AppPalette.muted)
+                                .frame(width: 28, height: 28)
+
+                            Text(style.label)
+                                .font(GlacialFont.body(.semibold))
+                                .foregroundStyle(AppPalette.ink)
+
+                            Spacer()
+
+                            if style == selectedPOSDisplayStyle {
+                                Image(systemName: "checkmark")
+                                    .font(.headline.weight(.bold))
+                                    .foregroundStyle(selectedPOSAccentColor.color)
+                            }
+                        }
+                        .padding(.vertical, 12)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    if index < POSProductDisplayStyle.allCases.count - 1 {
+                        SettingsDivider()
+                    }
+                }
+
+                SettingsDivider()
+                    .padding(.vertical, 4)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("BUTTON COLOR")
+                        .font(GlacialFont.caption(.bold))
+                        .tracking(1.8)
+                        .foregroundStyle(AppPalette.muted)
+
+                    HStack(spacing: 10) {
+                        ForEach(POSAccentColor.allCases) { accent in
+                            Button {
+                                posAccentColorRaw = accent.rawValue
+                                Haptics.selectionChanged()
+                            } label: {
+                                VStack(spacing: 6) {
+                                    ZStack {
+                                        Circle()
+                                            .fill(accent.color)
+                                            .frame(width: 34, height: 34)
+                                            .overlay(
+                                                Circle()
+                                                    .stroke(.white, lineWidth: 2)
+                                            )
+                                            .shadow(color: accent.color.opacity(0.24), radius: 8, y: 4)
+
+                                        if accent == selectedPOSAccentColor {
+                                            Image(systemName: "checkmark")
+                                                .font(.caption.weight(.bold))
+                                                .foregroundStyle(.white)
+                                        }
+                                    }
+
+                                    Text(accent.label.uppercased())
+                                        .font(GlacialFont.caption2(.bold))
+                                        .tracking(0.7)
+                                        .foregroundStyle(accent == selectedPOSAccentColor ? AppPalette.ink : AppPalette.muted)
+                                        .lineLimit(1)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(
+                                    accent == selectedPOSAccentColor ? accent.color.opacity(0.10) : Color.clear,
+                                    in: RoundedRectangle(cornerRadius: 8)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .padding(.top, 4)
+            }
+        }
+
+        SettingsDisclosureCard(
+            title: "POS Catalog",
+            subtitle: "Pictures unlocked, inventory locked",
+            icon: "shippingbox",
+            isExpanded: $catalogOpen,
+            accentColor: selectedPOSAccentColor.color
+        ) {
+            VStack(spacing: 14) {
+                POSProductPictureSettingsList(posStore: posStore, accentColor: selectedPOSAccentColor.color)
+                SettingsDivider()
+                POSToppingCategoryOrderSettings(
+                    categories: toppingCategories,
+                    accentColor: selectedPOSAccentColor.color
+                ) { category, offset in
+                    moveToppingCategory(category, offset: offset)
+                }
+                SettingsDivider()
+                LockedCatalogSettingsCard(accentColor: selectedPOSAccentColor.color)
             }
         }
     }
@@ -11741,7 +13233,7 @@ private struct POSBrandLogoSettingsCard: View {
                         .monospacedDigit()
                 }
 
-                Slider(value: $scale, in: 0.6...1.3, step: 0.05)
+                Slider(value: $scale, in: 0.6...1.8, step: 0.05)
                     .tint(accentColor)
                     .disabled(isHidden)
             }
@@ -11784,6 +13276,7 @@ private struct POSBrandLogoSettingsCard: View {
                 if let data = try? await item.loadTransferable(type: Data.self) {
                     await onPicked(data)
                     isHidden = false
+                    scale = max(scale, 1.35)
                 }
                 selectedPhoto = nil
             }
@@ -12227,7 +13720,7 @@ struct KitchenStatusRequest: Encodable {
 
 struct POSPinSessionRequest: Encodable {
     let pin: String
-    let openingCash: Double
+    let openingCash: Double?
     let deviceName: String
 
     enum CodingKeys: String, CodingKey {
@@ -12237,7 +13730,7 @@ struct POSPinSessionRequest: Encodable {
     }
 }
 
-struct POSPinSessionResponse: Decodable, Equatable {
+struct POSPinSessionResponse: Codable, Equatable {
     let message: String
     let `operator`: POSOperator
     let sessionToken: String
@@ -12258,7 +13751,7 @@ private struct POSPinWelcome: Equatable {
     let openingCash: Double
 }
 
-struct POSBootstrapResponse: Decodable, Equatable {
+struct POSBootstrapResponse: Codable, Equatable {
     let `operator`: POSOperator
     let catalog: POSCatalog
     let shift: POSShiftEnvelope
@@ -12373,7 +13866,7 @@ struct POSBestSeller: Identifiable, Decodable, Equatable {
     }
 }
 
-struct POSOperator: Decodable, Equatable {
+struct POSOperator: Codable, Equatable {
     let id: Int
     let name: String
     let role: String
@@ -12391,7 +13884,7 @@ struct POSOperator: Decodable, Equatable {
     }
 }
 
-struct POSCatalog: Decodable, Equatable {
+struct POSCatalog: Codable, Equatable {
     let categories: [POSCategory]
     let products: [POSProduct]
     let paymentMethods: [String]
@@ -12403,9 +13896,11 @@ struct POSCatalog: Decodable, Equatable {
         case paymentMethods = "payment_methods"
         case orderSources = "order_sources"
     }
+
+    static let empty = POSCatalog(categories: [], products: [], paymentMethods: [], orderSources: [])
 }
 
-struct POSCategory: Identifiable, Decodable, Equatable {
+struct POSCategory: Identifiable, Codable, Equatable {
     let name: String
     let sortOrder: Int
     let productIDs: [Int]
@@ -12419,7 +13914,7 @@ struct POSCategory: Identifiable, Decodable, Equatable {
     }
 }
 
-struct POSProduct: Identifiable, Decodable, Equatable {
+struct POSProduct: Identifiable, Codable, Equatable {
     let id: Int
     let name: String
     let sku: String?
@@ -12428,6 +13923,7 @@ struct POSProduct: Identifiable, Decodable, Equatable {
     let unit: String
     let category: String
     let inventoryCategory: String?
+    let freeRewardEligibility: String?
     let sortOrder: Int
     let description: String?
     let imageURLString: String?
@@ -12447,6 +13943,7 @@ struct POSProduct: Identifiable, Decodable, Equatable {
         case unit
         case category
         case inventoryCategory = "inventory_category"
+        case freeRewardEligibility = "free_reward_eligibility"
         case sortOrder = "sort_order"
         case description
         case imageURLString = "image_url"
@@ -12454,7 +13951,7 @@ struct POSProduct: Identifiable, Decodable, Equatable {
     }
 }
 
-struct POSTopping: Identifiable, Decodable, Equatable {
+struct POSTopping: Identifiable, Codable, Equatable {
     let id: Int
     let name: String
     let sku: String?
@@ -12472,7 +13969,7 @@ struct POSTopping: Identifiable, Decodable, Equatable {
     }
 }
 
-struct POSDraftTicket: Identifiable, Equatable {
+struct POSDraftTicket: Identifiable, Codable, Equatable {
     let id: UUID
     let number: Int
     var lines: [POSCartLine]
@@ -12496,7 +13993,7 @@ struct POSDraftTicket: Identifiable, Equatable {
     }
 }
 
-struct POSCartLine: Identifiable, Equatable {
+struct POSCartLine: Identifiable, Codable, Equatable {
     let id: String
     let product: POSProduct
     let toppings: [POSTopping]
@@ -12532,6 +14029,31 @@ struct POSCartLine: Identifiable, Equatable {
     static func makeID(product: POSProduct, toppings: [POSTopping]) -> String {
         let toppingKey = toppings.map(\.id).sorted().map(String.init).joined(separator: "-")
         return "\(product.id)|\(toppingKey)"
+    }
+}
+
+private struct POSDraftTicketSnapshot: Codable {
+    let tickets: [POSDraftTicket]
+    let activeTicketID: UUID
+    let nextTicketNumber: Int
+}
+
+private enum POSDraftTicketStore {
+    private static let key = "POSDraftTicketSnapshot"
+
+    static func load() -> POSDraftTicketSnapshot? {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder.kitchen.decode(POSDraftTicketSnapshot.self, from: data)
+    }
+
+    static func save(tickets: [POSDraftTicket], activeTicketID: UUID, nextTicketNumber: Int) {
+        let snapshot = POSDraftTicketSnapshot(
+            tickets: tickets,
+            activeTicketID: activeTicketID,
+            nextTicketNumber: nextTicketNumber
+        )
+        guard let data = try? JSONEncoder.kitchen.encode(snapshot) else { return }
+        UserDefaults.standard.set(data, forKey: key)
     }
 }
 
@@ -12641,7 +14163,7 @@ enum POSCashMovementType: String, Identifiable {
     }
 }
 
-struct POSCreateSaleRequest: Encodable {
+struct POSCreateSaleRequest: Codable {
     let cart: [POSSaleCartItem]
     let paymentMethod: String
     let orderSource: String
@@ -12649,6 +14171,9 @@ struct POSCreateSaleRequest: Encodable {
     let customerID: Int?
     let discountPercent: Double
     let notes: String?
+    let rewardRedemptionSessionID: String?
+    let rewardQuoteID: String?
+    let rewardLineKey: String?
     let checkoutToken: String
 
     enum CodingKeys: String, CodingKey {
@@ -12659,18 +14184,160 @@ struct POSCreateSaleRequest: Encodable {
         case customerID = "customer_id"
         case discountPercent = "discount_percent"
         case notes
+        case rewardRedemptionSessionID = "reward_redemption_session_id"
+        case rewardQuoteID = "reward_quote_id"
+        case rewardLineKey = "reward_line_key"
         case checkoutToken = "checkout_token"
     }
 }
 
-struct POSSaleCartItem: Encodable {
+struct POSRewardScanRequest: Codable {
+    let token: String
+}
+
+struct POSRewardQuoteRequest: Codable {
+    let cart: [POSSaleCartItem]
+    let paymentMethod: String
+    let orderSource: String
+    let externalOrderReference: String?
+    let customerID: Int?
+    let discountPercent: Double
+    let notes: String?
+    let rewardRedemptionSessionID: String
+    let rewardLineKey: String?
+    let checkoutToken: String
+
+    enum CodingKeys: String, CodingKey {
+        case cart
+        case paymentMethod = "payment_method"
+        case orderSource = "order_source"
+        case externalOrderReference = "external_order_reference"
+        case customerID = "customer_id"
+        case discountPercent = "discount_percent"
+        case notes
+        case rewardRedemptionSessionID = "reward_redemption_session_id"
+        case rewardLineKey = "reward_line_key"
+        case checkoutToken = "checkout_token"
+    }
+}
+
+struct POSRewardQuoteResponse: Decodable {
+    let rewardQuote: POSRewardQuote
+
+    enum CodingKeys: String, CodingKey {
+        case rewardQuote = "reward_quote"
+    }
+}
+
+struct POSRewardQuote: Identifiable, Decodable, Equatable {
+    let id: String
+    let expiresAt: String?
+    let eligibleProduct: EligibleProduct?
+    let subtotal: Double
+    let rewardDiscount: Double
+    let manualDiscount: Double
+    let paidAddOns: Double
+    let finalPayableTotal: Double
+
+    struct EligibleProduct: Decodable, Equatable {
+        let id: Int
+        let name: String
+        let lineKey: String?
+        let eligibility: String?
+        let baseUnitPrice: Double
+        let unitPrice: Double
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case name
+            case lineKey = "line_key"
+            case eligibility
+            case baseUnitPrice = "base_unit_price"
+            case unitPrice = "unit_price"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case expiresAt = "expires_at"
+        case eligibleProduct = "eligible_product"
+        case subtotal
+        case rewardDiscount = "reward_discount"
+        case manualDiscount = "manual_discount"
+        case paidAddOns = "paid_add_ons"
+        case finalPayableTotal = "final_payable_total"
+    }
+}
+
+struct POSRewardScanResponse: Decodable {
+    let session: Session
+    let reward: Reward
+    let customer: Customer?
+    let policy: Policy?
+
+    struct Session: Decodable {
+        let id: String
+        let status: String
+        let reservationExpiresAt: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case status
+            case reservationExpiresAt = "reservation_expires_at"
+        }
+    }
+
+    struct Reward: Decodable {
+        let id: String?
+        let name: String?
+        let status: String?
+    }
+
+    struct Customer: Decodable {
+        let id: Int?
+        let name: String?
+        let phone: String?
+    }
+
+    struct Policy: Decodable {
+        let description: String?
+    }
+}
+
+struct POSRewardRedemption: Identifiable, Equatable {
+    let id: String
+    let sessionID: String
+    let status: String
+    let reservationExpiresAt: String?
+    let rewardName: String
+    let customerID: Int?
+    let customerName: String?
+    let customerPhone: String?
+    let policyDescription: String?
+
+    init(response: POSRewardScanResponse) {
+        self.id = response.session.id
+        self.sessionID = response.session.id
+        self.status = response.session.status
+        self.reservationExpiresAt = response.session.reservationExpiresAt
+        self.rewardName = response.reward.name ?? "Free Reward"
+        self.customerID = response.customer?.id
+        self.customerName = response.customer?.name
+        self.customerPhone = response.customer?.phone
+        self.policyDescription = response.policy?.description
+    }
+}
+
+struct POSSaleCartItem: Codable {
     let id: Int
+    let lineKey: String
     let quantity: Int
     let toppings: [POSSaleTopping]
     let adjustedUnitPrice: Double?
 
     init(line: POSCartLine) {
         self.id = line.product.id
+        self.lineKey = line.id
         self.quantity = line.quantity
         self.toppings = line.toppings.map { POSSaleTopping(id: $0.id) }
         self.adjustedUnitPrice = line.adjustedUnitPrice
@@ -12678,13 +14345,14 @@ struct POSSaleCartItem: Encodable {
 
     enum CodingKeys: String, CodingKey {
         case id
+        case lineKey = "line_key"
         case quantity
         case toppings
         case adjustedUnitPrice = "adjusted_unit_price"
     }
 }
 
-struct POSSaleTopping: Encodable {
+struct POSSaleTopping: Codable {
     let id: Int
 }
 
@@ -12692,11 +14360,165 @@ struct POSCreateSaleResponse: Decodable {
     let message: String
     let saleID: Int
     let alreadyProcessed: Bool
+    let total: Double?
+    let discount: Double?
 
     enum CodingKeys: String, CodingKey {
         case message
         case saleID = "sale_id"
         case alreadyProcessed = "already_processed"
+        case total
+        case discount
+    }
+}
+
+fileprivate struct POSQueuedSale: Codable, Identifiable {
+    let id: UUID
+    let request: POSCreateSaleRequest
+    let createdAt: Date
+    let completionTotal: Double
+    let shouldPrintReceipt: Bool
+
+    init(
+        id: UUID = UUID(),
+        request: POSCreateSaleRequest,
+        createdAt: Date,
+        completionTotal: Double,
+        shouldPrintReceipt: Bool
+    ) {
+        self.id = id
+        self.request = request
+        self.createdAt = createdAt
+        self.completionTotal = completionTotal
+        self.shouldPrintReceipt = shouldPrintReceipt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case request
+        case createdAt
+        case completionTotal
+        case shouldPrintReceipt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        request = try container.decode(POSCreateSaleRequest.self, forKey: .request)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        completionTotal = try container.decodeIfPresent(Double.self, forKey: .completionTotal) ?? 0
+        shouldPrintReceipt = try container.decodeIfPresent(Bool.self, forKey: .shouldPrintReceipt) ?? true
+    }
+}
+
+private enum POSQueuedSaleStore {
+    private static let key = "POSQueuedSales"
+
+    static func load() -> [POSQueuedSale] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let queue = try? JSONDecoder.kitchen.decode([POSQueuedSale].self, from: data) else {
+            return []
+        }
+
+        return queue
+    }
+
+    static func save(_ queue: [POSQueuedSale]) {
+        guard let data = try? JSONEncoder.kitchen.encode(queue) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
+private struct POSFailedQueuedSale: Codable, Identifiable {
+    let id: UUID
+    let sale: POSQueuedSale
+    let failedAt: Date
+    let reason: String
+}
+
+private enum POSFailedQueuedSaleStore {
+    private static let key = "POSFailedQueuedSales"
+
+    static func load() -> [POSFailedQueuedSale] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let queue = try? JSONDecoder.kitchen.decode([POSFailedQueuedSale].self, from: data) else {
+            return []
+        }
+
+        return queue
+    }
+
+    static func append(_ sale: POSQueuedSale, reason: String) {
+        var failed = load()
+        failed.append(POSFailedQueuedSale(id: UUID(), sale: sale, failedAt: Date(), reason: reason))
+        guard let data = try? JSONEncoder.kitchen.encode(failed) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
+private struct POSQueuedShiftMutation: Codable, Identifiable {
+    enum Kind: String, Codable {
+        case start
+        case cashMovement
+        case end
+    }
+
+    let id: UUID
+    let kind: Kind
+    let createdAt: Date
+    let startRequest: POSStartShiftRequest?
+    let cashMovementRequest: POSCashMovementRequest?
+    let endRequest: POSEndShiftRequest?
+
+    static func start(_ request: POSStartShiftRequest) -> POSQueuedShiftMutation {
+        POSQueuedShiftMutation(
+            id: UUID(),
+            kind: .start,
+            createdAt: Date(),
+            startRequest: request,
+            cashMovementRequest: nil,
+            endRequest: nil
+        )
+    }
+
+    static func cashMovement(_ request: POSCashMovementRequest) -> POSQueuedShiftMutation {
+        POSQueuedShiftMutation(
+            id: UUID(),
+            kind: .cashMovement,
+            createdAt: Date(),
+            startRequest: nil,
+            cashMovementRequest: request,
+            endRequest: nil
+        )
+    }
+
+    static func end(_ request: POSEndShiftRequest) -> POSQueuedShiftMutation {
+        POSQueuedShiftMutation(
+            id: UUID(),
+            kind: .end,
+            createdAt: Date(),
+            startRequest: nil,
+            cashMovementRequest: nil,
+            endRequest: request
+        )
+    }
+}
+
+private enum POSQueuedShiftMutationStore {
+    private static let key = "POSQueuedShiftMutations"
+
+    static func load() -> [POSQueuedShiftMutation] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let queue = try? JSONDecoder.kitchen.decode([POSQueuedShiftMutation].self, from: data) else {
+            return []
+        }
+
+        return queue
+    }
+
+    static func save(_ queue: [POSQueuedShiftMutation]) {
+        guard let data = try? JSONEncoder.kitchen.encode(queue) else { return }
+        UserDefaults.standard.set(data, forKey: key)
     }
 }
 
@@ -12868,6 +14690,17 @@ struct PrintReceiptItem: Decodable {
     let lineTotal: Double
     let toppings: [PrintReceiptTopping]
 
+    var baseLineTotal: Double {
+        let toppingTotal = toppings.reduce(0) { $0 + $1.lineTotal }
+        let inferredBaseTotal = lineTotal - toppingTotal
+        if inferredBaseTotal >= 0, toppingTotal > 0 {
+            return inferredBaseTotal
+        }
+
+        let baseSubtotal = baseUnitPrice * Double(quantity)
+        return baseSubtotal > 0 ? baseSubtotal : lineTotal
+    }
+
     enum CodingKeys: String, CodingKey {
         case name
         case sku
@@ -12962,7 +14795,7 @@ struct POSCreateCustomerRequest: Encodable {
     let email: String?
 }
 
-struct POSStartShiftRequest: Encodable {
+struct POSStartShiftRequest: Codable {
     let openingCash: Double
     let notes: String?
 
@@ -12972,13 +14805,13 @@ struct POSStartShiftRequest: Encodable {
     }
 }
 
-struct POSCashMovementRequest: Encodable {
+struct POSCashMovementRequest: Codable {
     let type: String
     let amount: Double
     let reason: String
 }
 
-struct POSEndShiftRequest: Encodable {
+struct POSEndShiftRequest: Codable {
     let closingCash: Double?
     let notes: String?
 
@@ -12988,23 +14821,34 @@ struct POSEndShiftRequest: Encodable {
     }
 }
 
-struct POSShiftResponse: Decodable {
+struct POSShiftResponse: Codable {
     let shift: POSShiftEnvelope
 }
 
-struct POSShiftEnvelope: Decodable, Equatable {
+struct POSShiftEnvelope: Codable, Equatable {
     let isOpen: Bool
     let shift: POSShift?
     let recap: POSShiftRecap?
+    let activeOperator: POSOperator?
 
     enum CodingKeys: String, CodingKey {
         case isOpen = "is_open"
         case shift
         case recap
+        case activeOperator = "active_operator"
     }
+
+    init(isOpen: Bool, shift: POSShift?, recap: POSShiftRecap?, activeOperator: POSOperator? = nil) {
+        self.isOpen = isOpen
+        self.shift = shift
+        self.recap = recap
+        self.activeOperator = activeOperator
+    }
+
+    static let offline = POSShiftEnvelope(isOpen: false, shift: nil, recap: nil, activeOperator: nil)
 }
 
-struct POSShift: Decodable, Equatable {
+struct POSShift: Codable, Equatable {
     let id: Int
     let startedAt: Date?
     let endedAt: Date?
@@ -13024,7 +14868,7 @@ struct POSShift: Decodable, Equatable {
     }
 }
 
-struct POSShiftRecap: Decodable, Equatable {
+struct POSShiftRecap: Codable, Equatable {
     let orders: Int
     let revenue: Double
     let averageTicket: Double
@@ -13745,6 +15589,42 @@ enum KitchenAPIError: LocalizedError {
         case .serverMessage(let code, let path, let message): "Kitchen API error \(code) at \(path): \(message)"
         }
     }
+
+    var userFacingMessage: String {
+        switch self {
+        case .invalidURL:
+            return "Kitchen URL is invalid."
+        case .invalidResponse:
+            return "Kitchen API response was invalid."
+        case .unauthorized:
+            return "Kitchen token rejected."
+        case .server(let code, _):
+            return "Kitchen API error \(code)."
+        case .serverMessage(_, _, let message):
+            return message
+        }
+    }
+}
+
+private extension Error {
+    var isValidationFailure: Bool {
+        guard let apiError = self as? KitchenAPIError else { return false }
+
+        switch apiError {
+        case .server(let code, _), .serverMessage(let code, _, _):
+            return code == 422
+        default:
+            return false
+        }
+    }
+
+    var posReviewReason: String {
+        guard let apiError = self as? KitchenAPIError else {
+            return localizedDescription
+        }
+
+        return apiError.userFacingMessage
+    }
 }
 
 extension JSONDecoder {
@@ -13752,6 +15632,14 @@ extension JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return decoder
+    }
+}
+
+extension JSONEncoder {
+    static var kitchen: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
     }
 }
 
