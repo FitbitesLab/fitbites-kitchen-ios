@@ -862,7 +862,7 @@ struct ContentView: View {
                                 },
                                 isCompact: isCompactShell
                             )
-
+                            .environmentObject(printStore)
                             CompletedKitchenSection(
                                 tickets: store.completedTickets,
                                 accentColor: selectedPOSAccentColor.color,
@@ -871,6 +871,7 @@ struct ContentView: View {
                                 },
                                 isCompact: isCompactShell
                             )
+                            .environmentObject(printStore)
                         } else if selectedSection == .pos {
                             POSDashboardView(
                                 store: posStore,
@@ -1258,6 +1259,7 @@ struct ContentView: View {
             }
             .sheet(item: $selectedCompletedTicket) { ticket in
                 CompletedKitchenTicketDetailView(ticket: ticket, accentColor: selectedPOSAccentColor.color)
+                    .environmentObject(printStore)
                     .presentationDetents([.medium, .large])
                     .emberSheetChrome()
             }
@@ -1337,6 +1339,9 @@ struct ContentView: View {
                     },
                     defaultPrintReceipt: { source in
                         printStore.enabledSources.allows(source.receiptSourceKey)
+                    },
+                    printQuotation: { snapshot in
+                        await printStore.printQuotation(snapshot)
                     },
                     activeRewardRedemption: posStore.activeRewardRedemption,
                     activeRewardQuote: posStore.activeRewardQuote,
@@ -1479,10 +1484,13 @@ struct ContentView: View {
             }
             .sheet(isPresented: $isPOSEndShiftOpen) {
                 POSEndShiftSheet(
-                    shift: posStore.bootstrap?.shift,
                     isSubmitting: posStore.isShiftSubmitting,
                     errorMessage: posStore.errorMessage,
-                    accentColor: selectedPOSAccentColor.color
+                    accentColor: selectedPOSAccentColor.color,
+                    loadShift: {
+                        guard await ensurePOSStaffSession() else { return nil }
+                        return await posStore.prepareShiftClosing(baseURL: store.baseURL, token: store.kitchenToken)
+                    }
                 ) { closingCash, notes in
                     guard await ensurePOSStaffSession() else { return false }
                     let didClose = await posStore.endShift(baseURL: store.baseURL, token: store.kitchenToken, closingCash: closingCash, notes: notes)
@@ -1594,6 +1602,7 @@ private enum OnlineOrderAction: Identifiable {
 
 @MainActor
 final class PrintBridgeStore: ObservableObject {
+    @Published private(set) var isReprintingReceipt = false
     @Published var serverURL = UserDefaults.standard.string(forKey: "PrintBridgeServerURL") ?? "https://app.fitbites.com.vn"
     @Published var printToken = UserDefaults.standard.string(forKey: "PrintBridgeToken") ?? ""
     @Published var printerHost = UserDefaults.standard.string(forKey: "PrintBridgePrinterHost") ?? "192.168.1.92"
@@ -1710,6 +1719,42 @@ final class PrintBridgeStore: ObservableObject {
 
         UserDefaults.standard.set(Array(skippedSaleIDs), forKey: "PrintBridgeSkippedSaleIDs")
         UserDefaults.standard.set(Array(allowedSaleIDs), forKey: "PrintBridgeAllowedSaleIDs")
+    }
+
+    fileprivate func printQuotation(_ snapshot: POSQuotationSnapshot) async -> PrintReceiptResult {
+        guard !snapshot.items.isEmpty else { return .failed("The cart is empty.") }
+        guard !printerHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              (1...65535).contains(printerPort) else {
+            return .failed("Check the printer IP and port in Settings.")
+        }
+
+        // A quotation has no server print job or sale identity. Do not update receipt state.
+        do {
+            let data = try PrintReceiptFormatter.formatQuotation(snapshot, paperWidth: paperWidth, logoURL: receiptLogoURL, logoScale: receiptLogoScale)
+            try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
+            return .printed
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    fileprivate func reprintSaleReceipt(saleID: Int) async -> PrintReceiptResult {
+        guard !isReprintingReceipt else { return .failed("A receipt copy is already printing.") }
+        guard validateSettings() else { return .failed(statusMessage) }
+        guard (1...65535).contains(printerPort) else { return .failed("Check the printer port in Settings.") }
+        isReprintingReceipt = true
+        defer { isReprintingReceipt = false }
+
+        do {
+            // Read an existing receipt without claiming, retrying, or completing a print job.
+            let response = try await PrintJobAPIClient(baseURL: serverURL, token: printToken).fetchReceipt(saleID: saleID)
+            guard response.payload.receipt.saleID == saleID else { return .failed("The receipt does not match this sale.") }
+            let data = PrintReceiptFormatter.format(response.payload, paperWidth: paperWidth, logoURL: receiptLogoURL, logoScale: receiptLogoScale)
+            try await NetworkReceiptPrinter(host: printerHost, port: printerPort).print(data)
+            return .printed
+        } catch {
+            return .failed(error.localizedDescription)
+        }
     }
 
     fileprivate func printSaleReceiptNow(saleID: Int) async -> PrintReceiptResult {
@@ -1831,6 +1876,10 @@ struct PrintJobAPIClient {
     let baseURL: String
     let token: String
 
+    func fetchReceipt(saleID: Int) async throws -> PrintReceiptCopyResponse {
+        try await request(path: "/api/print-jobs/sale/\(saleID)/receipt", method: "GET", body: Optional<PrintClaimRequest>.none)
+    }
+
     func fetchPendingJobs() async throws -> PrintJobsResponse {
         try await request(path: "/api/print-jobs/pending", method: "GET", body: Optional<PrintClaimRequest>.none)
     }
@@ -1950,10 +1999,74 @@ struct NetworkReceiptPrinter {
     }
 }
 
+struct POSQuotationSnapshot {
+    typealias Item = PrintReceiptItem
+
+    let createdAt = Date()
+    let items: [Item]
+    let subtotal: Double
+    let discount: Double
+    let marketplaceDeduction: Double
+    let rewardDiscount: Double
+    let total: Double
+}
+
 enum PrintReceiptFormatter {
     private static let esc = UInt8(0x1b)
     private static let gs = UInt8(0x1d)
     private static let lf = UInt8(0x0a)
+
+    static func formatQuotation(_ snapshot: POSQuotationSnapshot, paperWidth: Int, logoURL: URL? = nil, logoScale: Double = 1) throws -> Data {
+        let columns = paperWidth == 58 ? 32 : 48
+        var data = Data()
+        append(&data, [esc, 0x40])
+        alignCenter(&data)
+        if !appendLogoIfAvailable(&data, logoURL: logoURL, paperWidth: paperWidth, logoScale: logoScale) {
+            bold(&data, true)
+            appendLine(&data, "FITBITES")
+            bold(&data, false)
+        }
+        let timestamp = DateFormatter()
+        timestamp.locale = Locale(identifier: "en_US_POSIX")
+        timestamp.timeZone = TimeZone(identifier: "Asia/Ho_Chi_Minh")
+        timestamp.dateFormat = "HH:mm dd/MM/yyyy"
+        appendLine(&data, timestamp.string(from: snapshot.createdAt))
+        bold(&data, true)
+        appendLine(&data, "For Order Review Only")
+        bold(&data, false)
+        alignLeft(&data)
+        divider(&data, columns: columns)
+        for item in snapshot.items {
+            wrappedAmountLines("\(item.quantity) x \(item.name)", amount: money(item.baseLineTotal), columns: columns)
+                .forEach { appendLine(&data, $0) }
+            for topping in item.toppings {
+                wrappedAmountLines("   + \(topping.name)", amount: money(topping.lineTotal), columns: columns)
+                    .forEach { appendLine(&data, $0) }
+            }
+            blank(&data)
+        }
+        divider(&data, columns: columns)
+        appendLine(&data, pair("Subtotal", money(snapshot.subtotal), columns: columns))
+        if snapshot.discount > 0 {
+            appendLine(&data, pair("Discount", "-\(money(snapshot.discount))", columns: columns))
+        }
+        if snapshot.marketplaceDeduction > 0 {
+            appendLine(&data, pair("Grab/Shopee deduction", "-\(money(snapshot.marketplaceDeduction))", columns: columns))
+        }
+        if snapshot.rewardDiscount > 0 {
+            appendLine(&data, pair("Free Fitbites", "-\(money(snapshot.rewardDiscount))", columns: columns))
+        }
+        divider(&data, columns: columns)
+        bold(&data, true)
+        appendLine(&data, pair("TOTAL", money(snapshot.total), columns: columns))
+        bold(&data, false)
+        alignCenter(&data)
+        appendLine(&data, "Not proof of payment.")
+        blank(&data)
+        blank(&data)
+        append(&data, [gs, 0x56, 0x42, 0x00])
+        return data
+    }
 
     static func format(_ payload: PrintReceiptPayload, paperWidth: Int, logoURL: URL? = nil, logoScale: Double = 1) -> Data {
         let columns = paperWidth == 58 ? 32 : 48
@@ -3484,8 +3597,40 @@ final class POSStore: ObservableObject {
         return true
     }
 
+    func prepareShiftClosing(baseURL: String, token: String) async -> POSShiftEnvelope? {
+        // Let in-flight updates finish before reading the authoritative drawer total.
+        await refreshTask?.value
+        await shiftSyncTask?.value
+        await saleSyncTask?.value
+
+        guard POSQueuedSaleStore.load().isEmpty, POSQueuedShiftMutationStore.load().isEmpty else {
+            errorMessage = "Sales or cash movements are still waiting to sync. Connect and retry before closing the shift."
+            return nil
+        }
+
+        errorMessage = nil
+        do {
+            let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken).fetchPOSShift()
+            guard response.shift.isOpen, response.shift.shift != nil, response.shift.recap != nil else {
+                errorMessage = "No active shift totals are available. Refresh your shift and try again."
+                return nil
+            }
+            applyLocalShift(response.shift)
+            isConnected = true
+            return response.shift
+        } catch {
+            errorMessage = "Could not load current drawer totals. \(error.localizedDescription)"
+            isConnected = false
+            return nil
+        }
+    }
+
     func endShift(baseURL: String, token: String, closingCash: Double?, notes: String) async -> Bool {
         guard !isShiftSubmitting else { return false }
+        guard POSQueuedSaleStore.load().isEmpty, POSQueuedShiftMutationStore.load().isEmpty else {
+            errorMessage = "Sales or cash movements are still waiting to sync. Retry after syncing before closing the shift."
+            return false
+        }
         guard bootstrap?.shift.shift != nil else {
             errorMessage = "No open shift to close."
             Haptics.notification(.error)
@@ -3643,7 +3788,7 @@ final class POSStore: ObservableObject {
 
             if POSLocalShiftStateStore.hasLocalDecision, let localShift {
                 let resolvedShift = localShift.isOpen
-                    ? localShift
+                    ? serverBootstrap.shift
                     : POSShiftEnvelope(
                         isOpen: false,
                         shift: nil,
@@ -3812,6 +3957,10 @@ struct KitchenAPIClient {
 
     func startPOSShift(_ shift: POSStartShiftRequest) async throws -> POSShiftResponse {
         try await request(path: "/api/pos/shift/start", method: "POST", body: shift)
+    }
+
+    func fetchPOSShift() async throws -> POSShiftResponse {
+        try await request(path: "/api/pos/shift", method: "GET", body: Optional<KitchenStatusRequest>.none)
     }
 
     func recordPOSCashMovement(_ movement: POSCashMovementRequest) async throws -> POSShiftResponse {
@@ -6294,6 +6443,8 @@ private struct CompletedKitchenChannelCard: View {
                         CompletedKitchenReceiptRow(ticket: ticket, accentColor: accentColor) {
                             onSelect(ticket)
                         }
+                        KitchenReceiptReprintButton(saleID: ticket.id)
+                            .padding(.bottom, 8)
 
                         if index < min(channel.tickets.count, 7) - 1 {
                             SettingsDivider()
@@ -6309,6 +6460,38 @@ private struct CompletedKitchenChannelCard: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(AppPalette.green.opacity(0.24), lineWidth: 1)
         )
+    }
+}
+
+private struct KitchenReceiptReprintButton: View {
+    let saleID: Int
+    @EnvironmentObject private var printStore: PrintBridgeStore
+    @State private var isSending = false
+    @State private var message: String?
+
+    var body: some View {
+        Button {
+            isSending = true
+            Task {
+                let result = await printStore.reprintSaleReceipt(saleID: saleID)
+                switch result {
+                case .printed: message = "Receipt copy sent to the printer."
+                case .failed(let reason): message = "Could not reprint receipt. \(reason)"
+                case .skipped: message = "Receipt was not printed."
+                }
+                isSending = false
+            }
+        } label: {
+            Label(isSending ? "Printing…" : "Reprint Receipt", systemImage: "printer")
+                .font(GlacialFont.caption(.semibold))
+        }
+        .buttonStyle(.bordered)
+        .disabled(isSending || printStore.isReprintingReceipt)
+        .alert("Reprint Receipt", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
+            Button("OK", role: .cancel) { message = nil }
+        } message: {
+            Text(message ?? "")
+        }
     }
 }
 
@@ -8129,12 +8312,14 @@ private struct POSCashMovementSheet: View {
 }
 
 private struct POSEndShiftSheet: View {
-    let shift: POSShiftEnvelope?
     let isSubmitting: Bool
     let errorMessage: String?
     let accentColor: Color
+    let loadShift: () async -> POSShiftEnvelope?
     let submit: (Double?, String) async -> Bool
     @Environment(\.dismiss) private var dismiss
+    @State private var shift: POSShiftEnvelope?
+    @State private var isLoadingShift = true
     @State private var closingCash = ""
     @State private var notes = ""
 
@@ -8142,13 +8327,21 @@ private struct POSEndShiftSheet: View {
         POSShiftFormShell(
             title: "CLOSE SHIFT",
             isSubmitting: isSubmitting,
-            canSubmit: closingCash.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || parsedClosingCash != nil,
+            canSubmit: !isLoadingShift && shift != nil && (closingCash.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || parsedClosingCash != nil),
             errorMessage: errorMessage,
             accentColor: accentColor,
             submit: {
                 await submit(parsedClosingCash, notes)
             }
         ) {
+            if isLoadingShift {
+                ProgressView("Loading current drawer totals…")
+            } else if shift == nil {
+                Button("Retry loading drawer totals") {
+                    Task { await refreshShift() }
+                }
+                .tint(accentColor)
+            }
             if let drawerSummary {
                 VStack(spacing: 8) {
                     POSDrawerSummaryRow(title: "opening cash", amount: drawerSummary.openingCash)
@@ -8165,6 +8358,15 @@ private struct POSEndShiftSheet: View {
             POSMoneyField(title: "closing cash", placeholder: "Optional", text: $closingCash)
             POSNotesField(title: "notes", placeholder: "Optional", text: $notes)
         }
+        .task { await refreshShift() }
+    }
+
+    @MainActor
+    private func refreshShift() async {
+        isLoadingShift = true
+        shift = nil
+        shift = await loadShift()
+        isLoadingShift = false
     }
 
     private var drawerSummary: POSDrawerSummary? {
@@ -9462,6 +9664,7 @@ private struct POSCheckoutSheet: View {
     let onNewTicket: () -> Void
     let onSwitchTicket: (POSDraftTicket) -> Void
     let defaultPrintReceipt: (POSOrderSource) -> Bool
+    let printQuotation: (POSQuotationSnapshot) async -> PrintReceiptResult
     let activeRewardRedemption: POSRewardRedemption?
     let activeRewardQuote: POSRewardQuote?
     let onMarketplacePriceChange: (POSCartLine, Double?) -> Void
@@ -9480,6 +9683,8 @@ private struct POSCheckoutSheet: View {
     @State private var notes = ""
     @State private var selectedCustomer: POSCustomer?
     @State private var shouldPrintReceipt = true
+    @State private var isPrintingQuotation = false
+    @State private var quotationMessage: String?
     @State private var customerSearch = ""
     @State private var customerResults: [POSCustomer] = []
     @State private var customerError: String?
@@ -9583,6 +9788,7 @@ private struct POSCheckoutSheet: View {
 
                         ticketSwitcher
                         recapSection
+                        quotationSection
                         customerSection
                         rewardRedemptionSection
                         printReceiptSection
@@ -9964,6 +10170,70 @@ private struct POSCheckoutSheet: View {
             }
         }
         .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
+    private var quotationSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                // Capture values before starting the task; editing remains independent of printing.
+                let snapshot = POSQuotationSnapshot(
+                    items: lines.map { line in
+                        POSQuotationSnapshot.Item(
+                            name: line.product.name,
+                            sku: nil,
+                            category: nil,
+                            quantity: line.quantity,
+                            baseUnitPrice: line.product.price,
+                            unitPrice: line.unitPrice(for: orderSource),
+                            lineTotal: line.lineTotal(for: orderSource),
+                            toppings: line.toppings.map { topping in
+                                PrintReceiptTopping(
+                                    name: topping.name,
+                                    sku: nil,
+                                    category: nil,
+                                    quantity: line.quantity,
+                                    unitPrice: topping.price,
+                                    lineTotal: topping.price * Double(line.quantity)
+                                )
+                            }
+                        )
+                    },
+                    subtotal: checkoutSubtotal,
+                    discount: activeRewardQuote?.manualDiscount ?? discountAmount,
+                    marketplaceDeduction: marketplaceDeduction,
+                    rewardDiscount: activeRewardQuote?.rewardDiscount ?? 0,
+                    total: payableTotal
+                )
+                isPrintingQuotation = true
+                quotationMessage = nil
+                Task {
+                    let result = await printQuotation(snapshot)
+                    switch result {
+                    case .printed:
+                        quotationMessage = "Quotation sent to printer."
+                    case .skipped:
+                        quotationMessage = "Quotation not printed."
+                    case .failed(let message):
+                        quotationMessage = "Quotation not printed. \(message)"
+                    }
+                    isPrintingQuotation = false
+                }
+            } label: {
+                Label(isPrintingQuotation ? "Printing Quotation…" : "Print Quotation", systemImage: "printer")
+                    .font(GlacialFont.subheadline(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(12)
+            }
+            .buttonStyle(.bordered)
+            .tint(accentColor)
+            .disabled(lines.isEmpty || isPrintingQuotation)
+
+            if let quotationMessage {
+                Text(quotationMessage)
+                    .font(GlacialFont.caption())
+                    .foregroundStyle(AppPalette.muted)
+            }
+        }
     }
 
     private var printReceiptSection: some View {
@@ -11301,6 +11571,7 @@ private struct OrderCard: View {
 
             Spacer(minLength: 0)
 
+            KitchenReceiptReprintButton(saleID: order.id)
             HStack(spacing: 8) {
                 ForEach(order.visibleActions) { status in
                     statusButton(status)
@@ -11571,6 +11842,11 @@ private struct CompletedKitchenTicketDetailView: View {
             .background(AppPalette.background)
             .navigationTitle("Completed")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    KitchenReceiptReprintButton(saleID: ticket.id)
+                }
+            }
         }
     }
 }
@@ -14556,6 +14832,10 @@ struct PrintJob: Identifiable, Decodable {
         case payload
         case createdAt = "created_at"
     }
+}
+
+struct PrintReceiptCopyResponse: Decodable {
+    let payload: PrintReceiptPayload
 }
 
 struct PrintReceiptPayload: Decodable {
