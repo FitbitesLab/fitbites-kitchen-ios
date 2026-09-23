@@ -340,6 +340,8 @@ struct ContentView: View {
                 await store.markOnlineOrderPaid(order)
             case .sendToKitchen(let order):
                 await store.sendOnlineOrderToKitchen(order)
+                await posStore.refreshAfterExternalSaleMutation(baseURL: store.baseURL, token: store.kitchenToken)
+                await posStore.refreshRecap(baseURL: store.baseURL, token: store.kitchenToken)
             case .decline(let order):
                 await store.rejectOnlineOrder(order)
             }
@@ -1571,6 +1573,9 @@ private enum OnlineOrderAction: Identifiable {
         case .markPaid(let order):
             return "Mark QR payment received for \(order.orderNumber)?"
         case .sendToKitchen(let order):
+            if order.paymentMethod == "pay_at_counter" {
+                return "Confirm cash collected for \(order.orderNumber)? Sending to Kitchen records this payment in the open cash drawer."
+            }
             return "Send \(order.orderNumber) into the kitchen queue now?"
         case .decline(let order):
             return "Are you sure you want to decline the order \(order.orderNumber)?"
@@ -2562,6 +2567,13 @@ final class KitchenStore: ObservableObject {
         }
 
         await performRefresh(forceChime: forceChime)
+    }
+
+    func refreshAfterExternalSaleMutation(baseURL: String, token: String) async {
+        // A normal coalesced refresh may have started before the cancellation. Wait for it,
+        // then perform a guaranteed post-mutation read for the cash drawer.
+        await refreshTask?.value
+        await performRefresh(baseURL: baseURL, token: token)
     }
 
     private func performRefresh(forceChime: Bool) async {
