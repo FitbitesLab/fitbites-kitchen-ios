@@ -2436,7 +2436,7 @@ struct PrintSourceSelection: Equatable {
 }
 
 private enum KitchenConnectionDefaults {
-    static let productionBaseURL = "https://app.fitbites.com.vn"
+    static let productionBaseURL = "https://fitbites.com.vn"
 
     static func savedBaseURL() -> String {
         normalizedBaseURL(UserDefaults.standard.string(forKey: "KitchenBaseURL") ?? productionBaseURL)
@@ -2446,6 +2446,11 @@ private enum KitchenConnectionDefaults {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return productionBaseURL }
         guard !isLocalDevelopmentURL(trimmed) else { return productionBaseURL }
+        if var components = URLComponents(string: trimmed), components.host?.lowercased() == "app.fitbites.com.vn" {
+            components.scheme = "https"
+            components.host = "fitbites.com.vn"
+            return components.string ?? productionBaseURL
+        }
         return trimmed
     }
 
@@ -10988,7 +10993,7 @@ private struct POSRewardScannerSheet: View {
                         .font(.system(size: 44, weight: .semibold))
                     Text("Scan Free Reward QR")
                         .font(GlacialFont.title3(.semibold))
-                    Text("The reward is reserved by Laravel for this checkout only.")
+                    Text("Point the camera at the customer’s reward QR.")
                         .font(GlacialFont.caption())
                         .multilineTextAlignment(.center)
                 }
@@ -11009,98 +11014,215 @@ private struct POSRewardScannerSheet: View {
     }
 }
 
+private enum POSRewardQRToken {
+    nonisolated static func normalized(_ raw: String) -> String? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "mfb-reward-v1."
+        guard value.hasPrefix(prefix) else { return nil }
+        let secret = value.dropFirst(prefix.count)
+        guard secret.utf8.count == 48,
+              secret.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) }) else { return nil }
+        return value
+    }
+}
+
+// Capture configuration, start and stop all run on one serial queue.
+private final class POSRewardCamera: @unchecked Sendable {
+    nonisolated let session = AVCaptureSession()
+    nonisolated private let queue = DispatchQueue(label: "vn.com.fitbites.reward-camera")
+    nonisolated(unsafe) private var configured = false
+
+    nonisolated func start(delegate: AVCaptureMetadataOutputObjectsDelegate & Sendable, completion: @escaping @Sendable (String?) -> Void) {
+        queue.async { [self] in
+            if !configured {
+                session.beginConfiguration()
+                do {
+                    guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+                            ?? AVCaptureDevice.default(for: .video) else {
+                        throw NSError(domain: "RewardCamera", code: 1, userInfo: [NSLocalizedDescriptionKey: "No camera is available on this device."])
+                    }
+                    let input = try AVCaptureDeviceInput(device: device)
+                    guard session.canAddInput(input) else {
+                        throw NSError(domain: "RewardCamera", code: 2, userInfo: [NSLocalizedDescriptionKey: "The camera could not be opened. Please try again."])
+                    }
+                    session.addInput(input)
+                    let output = AVCaptureMetadataOutput()
+                    guard session.canAddOutput(output) else {
+                        throw NSError(domain: "RewardCamera", code: 3, userInfo: [NSLocalizedDescriptionKey: "QR scanning is unavailable. Please try again."])
+                    }
+                    session.addOutput(output)
+                    guard output.availableMetadataObjectTypes.contains(.qr) else {
+                        throw NSError(domain: "RewardCamera", code: 4, userInfo: [NSLocalizedDescriptionKey: "This camera does not support QR scanning."])
+                    }
+                    output.setMetadataObjectsDelegate(delegate, queue: .main)
+                    output.metadataObjectTypes = [.qr]
+                    configured = true
+                    session.commitConfiguration()
+                } catch {
+                    session.inputs.forEach { session.removeInput($0) }
+                    session.outputs.forEach { session.removeOutput($0) }
+                    session.commitConfiguration()
+                    completion(error.localizedDescription)
+                    return
+                }
+            }
+            if !session.isRunning { session.startRunning() }
+            completion(session.isRunning ? nil : "The camera is unavailable. Close other camera apps and try again.")
+        }
+    }
+
+    nonisolated func stop() {
+        queue.async { [self] in
+            if session.isRunning { session.stopRunning() }
+        }
+    }
+}
+
 private struct POSQRCodeScannerView: UIViewControllerRepresentable {
     let onCode: (String) -> Void
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onCode: onCode)
-    }
-
-    func makeUIViewController(context: Context) -> ScannerViewController {
-        ScannerViewController(coordinator: context.coordinator)
-    }
-
+    func makeCoordinator() -> Coordinator { Coordinator(onCode: onCode) }
+    func makeUIViewController(context: Context) -> ScannerViewController { ScannerViewController(coordinator: context.coordinator) }
     func updateUIViewController(_ uiViewController: ScannerViewController, context: Context) {}
+    static func dismantleUIViewController(_ uiViewController: ScannerViewController, coordinator: Coordinator) { uiViewController.stopCamera() }
 
-    final class Coordinator: NSObject, AVCaptureMetadataOutputObjectsDelegate {
+    final class Coordinator: NSObject, AVCaptureMetadataOutputObjectsDelegate, @unchecked Sendable {
         private let onCode: (String) -> Void
-        private var didCapture = false
-
-        init(onCode: @escaping (String) -> Void) {
-            self.onCode = onCode
-        }
+        private(set) var didCapture = false
+        var onInvalidCode: (() -> Void)?
+        init(onCode: @escaping (String) -> Void) { self.onCode = onCode }
 
         func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
-            guard !didCapture,
-                  let object = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
-                  object.type == .qr,
-                  let value = object.stringValue else { return }
-
+            guard !didCapture else { return }
+            let codes = metadataObjects.compactMap { ($0 as? AVMetadataMachineReadableCodeObject)?.stringValue }
+            guard !codes.isEmpty else { return }
+            guard let token = codes.compactMap(POSRewardQRToken.normalized).first else { onInvalidCode?(); return }
             didCapture = true
-            onCode(value)
+            onCode(token)
         }
     }
 
     final class ScannerViewController: UIViewController {
-        private let session = AVCaptureSession()
+        private let camera = POSRewardCamera()
         private let coordinator: Coordinator
         private var previewLayer: AVCaptureVideoPreviewLayer?
+        private var visible = false
+        private var starting = false
+        private let status = UILabel()
+        private let retryButton = UIButton(type: .system)
+        private let settingsButton = UIButton(type: .system)
+        private let panel = UIStackView()
 
         init(coordinator: Coordinator) {
             self.coordinator = coordinator
             super.init(nibName: nil, bundle: nil)
         }
-
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
-        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
         override func viewDidLoad() {
             super.viewDidLoad()
             view.backgroundColor = .black
-            configureSession()
+            let preview = AVCaptureVideoPreviewLayer(session: camera.session)
+            preview.videoGravity = .resizeAspectFill
+            view.layer.insertSublayer(preview, at: 0)
+            previewLayer = preview
+            status.textColor = .white
+            status.numberOfLines = 0
+            status.textAlignment = .center
+            retryButton.setTitle("Try again", for: .normal)
+            retryButton.addTarget(self, action: #selector(startCamera), for: .touchUpInside)
+            settingsButton.setTitle("Open Settings", for: .normal)
+            settingsButton.addTarget(self, action: #selector(openSettings), for: .touchUpInside)
+            panel.axis = .vertical
+            panel.spacing = 16
+            panel.backgroundColor = UIColor.black.withAlphaComponent(0.8)
+            panel.layer.cornerRadius = 16
+            panel.isLayoutMarginsRelativeArrangement = true
+            panel.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 20, leading: 20, bottom: 20, trailing: 20)
+            [status, retryButton, settingsButton].forEach { panel.addArrangedSubview($0) }
+            panel.translatesAutoresizingMaskIntoConstraints = false
+            view.addSubview(panel)
+            NSLayoutConstraint.activate([
+                panel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                panel.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -50),
+                panel.widthAnchor.constraint(lessThanOrEqualToConstant: 360),
+                panel.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 24),
+                panel.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            ])
+            coordinator.onInvalidCode = { [weak self] in self?.showStatus("Scan a Fitbites reward QR.", retry: false) }
+            let center = NotificationCenter.default
+            center.addObserver(self, selector: #selector(startCamera), name: UIApplication.didBecomeActiveNotification, object: nil)
+            center.addObserver(self, selector: #selector(pauseCamera), name: UIApplication.willResignActiveNotification, object: nil)
+            center.addObserver(self, selector: #selector(cameraInterrupted), name: AVCaptureSession.wasInterruptedNotification, object: camera.session)
+            center.addObserver(self, selector: #selector(cameraResumed), name: AVCaptureSession.interruptionEndedNotification, object: camera.session)
+            center.addObserver(self, selector: #selector(cameraFailed), name: AVCaptureSession.runtimeErrorNotification, object: camera.session)
         }
-
+        deinit { NotificationCenter.default.removeObserver(self) }
         override func viewDidLayoutSubviews() {
             super.viewDidLayoutSubviews()
             previewLayer?.frame = view.bounds
-        }
-
-        override func viewWillAppear(_ animated: Bool) {
-            super.viewWillAppear(animated)
-            guard !session.isRunning else { return }
-            DispatchQueue.global(qos: .userInitiated).async {
-                self.session.startRunning()
+            if let connection = previewLayer?.connection, connection.isVideoOrientationSupported {
+                switch view.window?.windowScene?.interfaceOrientation {
+                case .landscapeLeft: connection.videoOrientation = .landscapeLeft
+                case .landscapeRight: connection.videoOrientation = .landscapeRight
+                case .portraitUpsideDown: connection.videoOrientation = .portraitUpsideDown
+                default: connection.videoOrientation = .portrait
+                }
             }
         }
-
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            visible = true
+            startCamera()
+        }
         override func viewWillDisappear(_ animated: Bool) {
             super.viewWillDisappear(animated)
-            guard session.isRunning else { return }
-            session.stopRunning()
+            stopCamera()
         }
-
-        private func configureSession() {
-            guard
-                let device = AVCaptureDevice.default(for: .video),
-                let input = try? AVCaptureDeviceInput(device: device),
-                session.canAddInput(input)
-            else { return }
-
-            session.addInput(input)
-
-            let output = AVCaptureMetadataOutput()
-            guard session.canAddOutput(output) else { return }
-
-            session.addOutput(output)
-            output.setMetadataObjectsDelegate(coordinator, queue: .main)
-            output.metadataObjectTypes = [.qr]
-
-            let layer = AVCaptureVideoPreviewLayer(session: session)
-            layer.videoGravity = .resizeAspectFill
-            layer.frame = view.bounds
-            view.layer.insertSublayer(layer, at: 0)
-            previewLayer = layer
+        func stopCamera() { visible = false; camera.stop() }
+        @objc private func pauseCamera() { camera.stop() }
+        @objc private func cameraInterrupted() { DispatchQueue.main.async { [weak self] in self?.showStatus("Camera interrupted. Scanning resumes when the camera is available.", retry: true) } }
+        @objc private func cameraFailed() { DispatchQueue.main.async { [weak self] in self?.showStatus("The camera stopped. Please try again.", retry: true) } }
+        @objc private func cameraResumed() { DispatchQueue.main.async { [weak self] in self?.startCamera() } }
+        @objc private func openSettings() {
+            guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+            UIApplication.shared.open(url)
+        }
+        private func showStatus(_ message: String, retry: Bool, settings: Bool = false) {
+            status.text = message
+            retryButton.isHidden = !retry
+            settingsButton.isHidden = !settings
+            panel.isHidden = false
+        }
+        @objc private func startCamera() {
+            guard visible, !starting, !coordinator.didCapture, UIApplication.shared.applicationState == .active else { return }
+            switch AVCaptureDevice.authorizationStatus(for: .video) {
+            case .notDetermined:
+                starting = true
+                showStatus("Allow camera access to scan rewards.", retry: false)
+                AVCaptureDevice.requestAccess(for: .video) { [weak self] _ in
+                    DispatchQueue.main.async {
+                        self?.starting = false
+                        self?.startCamera()
+                    }
+                }
+            case .denied, .restricted:
+                showStatus("Camera access is off. Enable it in Settings to scan reward QR codes.", retry: false, settings: true)
+            case .authorized:
+                starting = true
+                showStatus("Opening camera…", retry: false)
+                camera.start(delegate: coordinator) { [weak self] error in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        self.starting = false
+                        guard self.visible, UIApplication.shared.applicationState == .active else { self.camera.stop(); return }
+                        if let error { self.showStatus(error, retry: true) }
+                        else { self.panel.isHidden = true }
+                    }
+                }
+            @unknown default:
+                showStatus("Camera access is unavailable.", retry: true)
+            }
         }
     }
 }
