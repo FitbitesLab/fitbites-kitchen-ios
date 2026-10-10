@@ -60,7 +60,7 @@ extension String { var nilIfBlank: String? { isEmpty ? nil : self } }
   Server.resolve(1,"new")
   _ = try await second.value
   Server.resolve(0,"old")
-  do { _ = try await first.value; assertionFailure("Old response accepted") } catch is CancellationError {} 
+  do { _ = try await first.value; assertionFailure("Old response accepted") } catch is CancellationError {}
   assert(store.activeRewardQuote?.id == "new")
   assert(Server.requests[1].cart[0].id == 2)
   let cancelled=Task { try await store.quote() }

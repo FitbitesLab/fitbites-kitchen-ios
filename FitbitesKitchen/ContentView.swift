@@ -1347,6 +1347,7 @@ struct ContentView: View {
                     },
                     activeRewardRedemption: posStore.activeRewardRedemption,
                     activeRewardQuote: posStore.activeRewardQuote,
+                    submissionError: posStore.errorMessage,
                     onMarketplacePriceChange: { line, price in
                         posStore.setMarketplaceUnitPrice(line: line, price: price)
                     },
@@ -2854,6 +2855,7 @@ final class POSStore: ObservableObject {
     private var shiftSyncTask: Task<Void, Never>?
     private var staffSessionToken = ""
     private var rewardCheckoutToken: String?
+    private var rewardQuoteRevision = UUID()
     private let imageOverridesDirectoryName = "POSProductImageOverrides"
     private let brandLogoFileName = "pos-brand-logo.png"
     private var nextTicketNumber = 1
@@ -3307,6 +3309,7 @@ final class POSStore: ObservableObject {
         clearSaleMessage()
         let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken)
             .scanRewardToken(POSRewardScanRequest(token: rawToken))
+        rewardQuoteRevision = UUID()
         activeRewardRedemption = POSRewardRedemption(response: response)
         activeRewardQuote = nil
         rewardCheckoutToken = "native-pos-reward-\(UUID().uuidString)"
@@ -3343,8 +3346,14 @@ final class POSStore: ObservableObject {
             checkoutToken: currentRewardCheckoutToken()
         )
 
+        let revision = UUID()
+        rewardQuoteRevision = revision
         let response = try await KitchenAPIClient(baseURL: baseURL, token: token, posSessionToken: staffSessionToken)
             .quoteRewardSale(request)
+        guard !Task.isCancelled, rewardQuoteRevision == revision,
+              self.activeRewardRedemption?.sessionID == request.rewardRedemptionSessionID else {
+            throw CancellationError()
+        }
         activeRewardQuote = response.rewardQuote
         isConnected = true
         showSaleMessage("Reward total previewed by Laravel.")
@@ -3362,6 +3371,7 @@ final class POSStore: ObservableObject {
     }
 
     private func invalidateRewardQuote(clearRedemption: Bool = false) {
+        rewardQuoteRevision = UUID()
         activeRewardQuote = nil
 
         if clearRedemption {
@@ -9684,6 +9694,7 @@ private struct POSCheckoutSheet: View {
     let printQuotation: (POSQuotationSnapshot) async -> PrintReceiptResult
     let activeRewardRedemption: POSRewardRedemption?
     let activeRewardQuote: POSRewardQuote?
+    let submissionError: String?
     let onMarketplacePriceChange: (POSCartLine, Double?) -> Void
     let onToppingsChange: (POSCartLine, [POSTopping]) -> Void
     let scanRewardToken: (String) async throws -> Void
@@ -9717,6 +9728,7 @@ private struct POSCheckoutSheet: View {
     @State private var isRewardScannerOpen = false
     @State private var isScanningReward = false
     @State private var isQuotingReward = false
+    @State private var submissionFailed = false
     @State private var rewardRedemptionError: String?
     @State private var selectedRewardLineID: String?
     @State private var checkoutValidationMessage: String?
@@ -9777,6 +9789,28 @@ private struct POSCheckoutSheet: View {
 
     private var eligibleRewardLines: [POSCartLine] {
         lines.filter { $0.product.freeRewardEligibility != nil }
+    }
+
+    // Only inputs that affect the server preview trigger a refresh. Notes and cash tender do not.
+    private var rewardPreviewContext: Data? {
+        guard let reward = activeRewardRedemption else { return nil }
+        let selected = eligibleRewardLines.contains(where: { $0.id == selectedRewardLineID })
+            ? selectedRewardLineID : (eligibleRewardLines.count == 1 ? eligibleRewardLines.first?.id : nil)
+        let request = POSRewardQuoteRequest(
+            cart: lines.map { POSSaleCartItem(line: $0) }, paymentMethod: paymentMethod.rawValue,
+            orderSource: orderSource.rawValue, externalOrderReference: trimmedExternalReference,
+            customerID: checkoutCustomerForSubmission?.id ?? reward.customerID,
+            discountPercent: parsedDiscountPercent, notes: nil,
+            rewardRedemptionSessionID: reward.sessionID, rewardLineKey: selected, checkoutToken: ""
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return try? encoder.encode(request)
+    }
+
+    private var checkoutBlockingMessage: String? {
+        rewardRedemptionError ?? checkoutValidationMessage
+            ?? (submissionFailed ? (submissionError ?? "Sale could not be completed. Please try again.") : nil)
     }
 
     private var selectedRewardLineKeyForSubmission: String? {
@@ -9841,7 +9875,19 @@ private struct POSCheckoutSheet: View {
                         }
                     }
 
+                    if let message = checkoutBlockingMessage {
+                        Text(message)
+                            .font(GlacialFont.caption(.semibold))
+                            .foregroundStyle(AppPalette.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .accessibilityIdentifier("pos-checkout-error")
+                    }
+                    if isQuotingReward {
+                        Label("Updating reward total…", systemImage: "clock")
+                            .font(GlacialFont.caption())
+                    }
                     Button {
+                        guard !isQuotingReward, !isScanningReward, !isSubmitting else { return }
                         guard canCompleteCheckout else {
                             checkoutValidationMessage = "Enter the \(orderSource.label) reference before completing."
                             Haptics.notification(.error)
@@ -9849,12 +9895,12 @@ private struct POSCheckoutSheet: View {
                         }
 
                         guard activeRewardRedemption == nil || activeRewardQuote != nil else {
-                            rewardRedemptionError = "Preview the reward total before completing."
-                            Haptics.notification(.error)
+                            Task { await previewRewardTotal() }
                             return
                         }
 
                         checkoutValidationMessage = nil
+                        submissionFailed = false
                         Task {
                             let attachedCustomer = checkoutCustomerForSubmission
                             let didSubmit = await submit(
@@ -9871,11 +9917,13 @@ private struct POSCheckoutSheet: View {
                             )
                             if didSubmit {
                                 dismiss()
+                            } else {
+                                submissionFailed = true
                             }
                         }
                     } label: {
                         POSRectActionLabel(
-                            title: isSubmitting ? "COMPLETING" : "COMPLETE",
+                            title: isSubmitting ? "COMPLETING" : (isQuotingReward ? "UPDATING TOTAL" : (activeRewardRedemption != nil && activeRewardQuote == nil ? "REVIEW REWARD TOTAL" : "COMPLETE")),
                             tint: accentColor,
                             isPrimary: true,
                             isLoading: isSubmitting,
@@ -9883,8 +9931,8 @@ private struct POSCheckoutSheet: View {
                         )
                     }
                     .buttonStyle(.plain)
-                    .disabled(isSubmitting)
-                    .opacity(isSubmitting ? 0.72 : 1)
+                    .disabled(isSubmitting || isQuotingReward || isScanningReward)
+                    .opacity(isSubmitting || isQuotingReward || isScanningReward ? 0.72 : 1)
                 }
                 .padding(20)
                 .background(.white)
@@ -9948,6 +9996,21 @@ private struct POSCheckoutSheet: View {
 
                 selectedRewardLineID = nil
                 shouldPrintReceipt = defaultPrintReceipt(newSource)
+            }
+            .task(id: rewardPreviewContext) {
+                submissionFailed = false
+                rewardRedemptionError = nil
+                guard activeRewardRedemption != nil else { return }
+                clearRewardQuote()
+                do {
+                    try await Task.sleep(for: .milliseconds(300))
+                    while isQuotingReward || isScanningReward {
+                        try await Task.sleep(for: .milliseconds(50))
+                    }
+                    try Task.checkCancellation()
+                    guard activeRewardQuote == nil else { return }
+                    await previewRewardTotal(automatic: true)
+                } catch { /* A newer checkout state owns the next preview. */ }
             }
             .onAppear {
                 shouldPrintReceipt = defaultPrintReceipt(orderSource)
@@ -10365,6 +10428,7 @@ private struct POSCheckoutSheet: View {
                         } else {
                             ForEach(eligibleRewardLines) { line in
                                 Button {
+                                    guard selectedRewardLineID != line.id else { return }
                                     selectedRewardLineID = line.id
                                     clearRewardQuote()
                                     Haptics.selectionChanged()
@@ -10732,6 +10796,7 @@ private struct POSCheckoutSheet: View {
     private func sourcePill(_ source: POSOrderSource) -> some View {
         POSCheckoutPill(title: source.label, isSelected: orderSource == source, accentColor: accentColor) {
             withAnimation(.smooth(duration: 0.24)) {
+                guard orderSource != source else { return }
                 orderSource = source
                 selectedRewardLineID = nil
                 clearRewardQuote()
@@ -10741,8 +10806,8 @@ private struct POSCheckoutSheet: View {
 
     private func paymentPill(_ method: POSPaymentMethod) -> some View {
         POSCheckoutPill(title: method.label, isSelected: paymentMethod == method, accentColor: accentColor) {
+            guard paymentMethod != method else { return }
             paymentMethod = method
-            selectedRewardLineID = nil
             clearRewardQuote()
         }
     }
@@ -10869,7 +10934,7 @@ private struct POSCheckoutSheet: View {
     }
 
     @MainActor
-    private func previewRewardTotal() async {
+    private func previewRewardTotal(automatic: Bool = false) async {
         guard !isQuotingReward else { return }
         guard activeRewardRedemption != nil else {
             rewardRedemptionError = "Scan a reward QR first."
@@ -10882,7 +10947,7 @@ private struct POSCheckoutSheet: View {
             rewardRedemptionError = "Add one Daily Go, Daily Classic, or standard coffee."
             return
         } else if eligibleLines.count == 1 {
-            rewardLineKey = selectedRewardLineID ?? eligibleLines[0].id
+            rewardLineKey = eligibleLines[0].id
             selectedRewardLineID = rewardLineKey
         } else if let selectedRewardLineID, eligibleLines.contains(where: { $0.id == selectedRewardLineID }) {
             rewardLineKey = selectedRewardLineID
@@ -10897,6 +10962,7 @@ private struct POSCheckoutSheet: View {
         }
 
         isQuotingReward = true
+        clearRewardQuote()
         rewardRedemptionError = nil
 
         do {
@@ -10909,10 +10975,12 @@ private struct POSCheckoutSheet: View {
                 notes,
                 rewardLineKey
             )
-            Haptics.notification(.success)
+            if !automatic { Haptics.notification(.success) }
         } catch {
-            rewardRedemptionError = error.localizedDescription
-            Haptics.notification(.error)
+            if !Task.isCancelled && !(error is CancellationError) {
+                rewardRedemptionError = error.localizedDescription
+                if !automatic { Haptics.notification(.error) }
+            }
         }
 
         isQuotingReward = false
