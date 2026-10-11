@@ -2575,13 +2575,6 @@ final class KitchenStore: ObservableObject {
         await performRefresh(forceChime: forceChime)
     }
 
-    func refreshAfterExternalSaleMutation(baseURL: String, token: String) async {
-        // A normal coalesced refresh may have started before the cancellation. Wait for it,
-        // then perform a guaranteed post-mutation read for the cash drawer.
-        await refreshTask?.value
-        await performRefresh(baseURL: baseURL, token: token)
-    }
-
     private func performRefresh(forceChime: Bool) async {
         guard !kitchenToken.isEmpty else {
             errorMessage = "Add the kitchen token in Settings."
@@ -2630,6 +2623,19 @@ final class KitchenStore: ObservableObject {
             onlineOrders = onlinePayload.onlineOrders
             orders = kitchenPayload.orders.filter { $0.status != .completed && $0.status != .cancelled }
             summary = kitchenPayload.summary
+            if let completedOrders = kitchenPayload.completedOrders {
+                // The server also includes sales completed without passing through this iPad's queue.
+                completedTickets = completedOrders.map { order in
+                    let previousTicket = completedTickets.first { $0.id == order.id }
+                    return CompletedKitchenTicket(
+                        order: order,
+                        onlineDetails: onlineOrderDetailsBySaleID[order.id],
+                        archivedAt: previousTicket?.archivedAt ?? order.updatedAt ?? order.createdAt ?? Date(),
+                        previousTicket: previousTicket
+                    )
+                }
+                CompletedKitchenTicketStore.save(completedTickets)
+            }
             pruneCompletedTickets()
             knownOrderIDs = incomingIDs
             knownOnlineOrderIDs = incomingOnlineIDs
@@ -3791,6 +3797,13 @@ final class POSStore: ObservableObject {
 
         await refreshTask?.value
         refreshTask = nil
+    }
+
+    func refreshAfterExternalSaleMutation(baseURL: String, token: String) async {
+        // A normal coalesced refresh may have started before the cancellation. Wait for it,
+        // then perform a guaranteed post-mutation read for the cash drawer.
+        await refreshTask?.value
+        await performRefresh(baseURL: baseURL, token: token)
     }
 
     private func performRefresh(baseURL: String, token: String) async {
@@ -6536,6 +6549,14 @@ private struct CompletedKitchenReceiptRow: View {
                         .tracking(1.2)
                         .foregroundStyle(AppPalette.ink)
 
+                    Text(ticket.customerName)
+                        .font(GlacialFont.caption(.medium))
+                        .foregroundStyle(AppPalette.ink)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    CompletedKitchenLoyaltyView(ticket: ticket, accentColor: accentColor)
+
                     Text("\(ticket.completedTimeText) · \(ticket.paymentText)")
                         .font(GlacialFont.caption2(.medium))
                         .foregroundStyle(AppPalette.muted)
@@ -6555,6 +6576,30 @@ private struct CompletedKitchenReceiptRow: View {
             .padding(.vertical, 9)
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct CompletedKitchenLoyaltyView: View {
+    let ticket: CompletedKitchenTicket
+    let accentColor: Color
+
+    var body: some View {
+        if let stamps = ticket.loyaltyStamps {
+            let target = max(1, min(ticket.loyaltyTarget ?? 9, 12))
+            let balance = max(0, min(stamps, target))
+            HStack(spacing: 3) {
+                ForEach(0..<target, id: \.self) { index in
+                    Image(systemName: index < balance ? "star.fill" : "star")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(index < balance ? accentColor : AppPalette.muted.opacity(0.42))
+                }
+                Text("\(balance)/\(target) stamps")
+                    .font(GlacialFont.caption2(.medium))
+                    .foregroundStyle(AppPalette.muted)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Loyalty: \(balance) of \(target) stamps")
+        }
     }
 }
 
@@ -11997,11 +12042,14 @@ private struct CompletedKitchenTicketDetailView: View {
                         }
 
                         DetailInfoList(rows: [
+                            DetailInfoRow(title: "CUSTOMER", value: ticket.customerName),
                             DetailInfoRow(title: "DATE", value: ticket.completedDateText),
                             DetailInfoRow(title: "TIME", value: ticket.completedTimeText),
                             DetailInfoRow(title: "TYPE", value: ticket.typeText),
                             DetailInfoRow(title: "PAYMENT", value: ticket.paymentText)
                         ])
+
+                        CompletedKitchenLoyaltyView(ticket: ticket, accentColor: accentColor)
 
                         VStack(spacing: 0) {
                             ForEach(Array(ticket.items.enumerated()), id: \.element.id) { index, item in
@@ -14184,8 +14232,14 @@ struct KitchenSendOnlineOrderToKitchenResponse: Decodable {
 }
 
 struct KitchenOrdersResponse: Decodable {
+    let completedOrders: [KitchenOrder]?
     let orders: [KitchenOrder]
     let summary: KitchenSummary
+
+    enum CodingKeys: String, CodingKey {
+        case orders, summary
+        case completedOrders = "completed_orders"
+    }
 }
 
 struct KitchenOrderResponse: Decodable {
@@ -15659,6 +15713,8 @@ struct CompletedKitchenTicket: Identifiable, Codable, Equatable {
     let source: String
     let customerName: String
     let customerPhone: String?
+    let loyaltyStamps: Int?
+    let loyaltyTarget: Int?
     let fulfillmentMethod: String?
     let deliveryAddress: String?
     let pickupTime: String?
@@ -15668,15 +15724,24 @@ struct CompletedKitchenTicket: Identifiable, Codable, Equatable {
     let items: [CompletedKitchenTicketItem]
     let archivedAt: Date
 
-    init(order: KitchenOrder, onlineDetails: KitchenOnlineOrder?, archivedAt: Date) {
+    init(order: KitchenOrder, onlineDetails: KitchenOnlineOrder?, archivedAt: Date, previousTicket: CompletedKitchenTicket? = nil) {
         id = order.id
         orderNumber = order.orderNumber
         source = order.source.shortLabel
-        customerName = order.customerDisplay
-        customerPhone = onlineDetails?.customer.phone ?? order.customer.phone
-        fulfillmentMethod = onlineDetails?.fulfillmentMethod
-        deliveryAddress = onlineDetails?.deliveryAddress
-        pickupTime = onlineDetails?.pickupTime
+        customerName = order.customer.name?.nilIfBlank
+            ?? onlineDetails?.customer.name?.nilIfBlank
+            ?? previousTicket?.customerName.nilIfBlank
+            ?? "Guest order"
+        customerPhone = onlineDetails?.customer.phone ?? order.customer.phone ?? previousTicket?.customerPhone
+        loyaltyStamps = order.customer.loyaltyStamps
+            ?? onlineDetails?.customer.loyaltyStamps
+            ?? previousTicket?.loyaltyStamps
+        loyaltyTarget = order.customer.loyaltyTarget
+            ?? onlineDetails?.customer.loyaltyTarget
+            ?? previousTicket?.loyaltyTarget
+        fulfillmentMethod = onlineDetails?.fulfillmentMethod ?? previousTicket?.fulfillmentMethod
+        deliveryAddress = onlineDetails?.deliveryAddress ?? previousTicket?.deliveryAddress
+        pickupTime = onlineDetails?.pickupTime ?? previousTicket?.pickupTime
         paymentMethod = order.paymentMethod ?? onlineDetails?.paymentMethod
         notes = onlineDetails?.notes ?? order.notes
         total = order.totals?.total ?? onlineDetails?.totals.total
@@ -15886,6 +15951,14 @@ struct KitchenOrder: Identifiable, Decodable, Equatable {
 struct KitchenCustomer: Decodable, Equatable {
     let name: String?
     let phone: String?
+    let loyaltyStamps: Int?
+    let loyaltyTarget: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case name, phone
+        case loyaltyStamps = "loyalty_stamps"
+        case loyaltyTarget = "loyalty_target"
+    }
 }
 
 struct KitchenItem: Identifiable, Decodable, Equatable {
