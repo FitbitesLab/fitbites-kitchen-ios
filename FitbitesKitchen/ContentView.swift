@@ -1309,6 +1309,7 @@ struct ContentView: View {
             .sheet(isPresented: $isPOSCheckoutOpen) {
                 POSCheckoutSheet(
                     lines: posStore.cartLines,
+                    rewardEligibleProductIDs: Set((posStore.bootstrap?.catalog.products ?? []).filter { $0.freeRewardEligibility != nil }.map(\.id)),
                     tickets: posStore.tickets,
                     activeTicketID: posStore.activeTicketID,
                     total: posStore.cartTotal,
@@ -9719,6 +9720,7 @@ private struct POSCartLineRow: View {
 
 private struct POSCheckoutSheet: View {
     let lines: [POSCartLine]
+    let rewardEligibleProductIDs: Set<Int>
     let tickets: [POSDraftTicket]
     let activeTicketID: UUID
     let total: Double
@@ -9833,7 +9835,7 @@ private struct POSCheckoutSheet: View {
     }
 
     private var eligibleRewardLines: [POSCartLine] {
-        lines.filter { $0.product.freeRewardEligibility != nil }
+        lines.filter { rewardEligibleProductIDs.contains($0.product.id) }
     }
 
     // Only inputs that affect the server preview trigger a refresh. Notes and cash tender do not.
@@ -10462,7 +10464,7 @@ private struct POSCheckoutSheet: View {
                             .font(GlacialFont.caption(.bold))
                             .tracking(1.6)
                             .foregroundStyle(AppPalette.ink)
-                        Text("Choose one Daily Go, Daily Classic, or standard coffee")
+                        Text("Choose one Daily Go, Greek Yogurt with Fruit Coulis, or Protein Crepe")
                             .font(GlacialFont.caption())
                             .foregroundStyle(AppPalette.muted)
 
@@ -10989,7 +10991,7 @@ private struct POSCheckoutSheet: View {
         let eligibleLines = eligibleRewardLines
         let rewardLineKey: String?
         if eligibleLines.isEmpty {
-            rewardRedemptionError = "Add one Daily Go, Daily Classic, or standard coffee."
+            rewardRedemptionError = "Add one Daily Go, Greek Yogurt with Fruit Coulis, or Protein Crepe."
             return
         } else if eligibleLines.count == 1 {
             rewardLineKey = eligibleLines[0].id
