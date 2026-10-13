@@ -1,6 +1,6 @@
 # Free reward menu
 
-The approved free base items are Daily Go, Daily Classic, Greek Yogurt with Fruit Coulis, and Protein Crepes (all flavours). Daily Tropical, coffee, Granola Delight, Sundae/Saturdae, ice cream, bundles, and standalone toppings are excluded. Added toppings remain chargeable; redemption still discounts only one base item.
+The approved free base items are Daily Go, Daily Classic, Greek Yogurt with Fruit Coulis, Protein Crepes (all flavours), and standard coffee (Espresso, Americano, Cappuccino, Latte). Daily Tropical, protein coffee, Granola Delight, Sundae/Saturdae, ice cream, bundles, and standalone toppings are excluded. Added toppings remain chargeable; redemption still discounts only one base item.
 
 The backend shares one policy between catalogue eligibility and quote/checkout enforcement. Existing unused reward QR tokens continue to work. Available rewards display the current menu without rewriting their issued benefit snapshots or redeemed history.
 
