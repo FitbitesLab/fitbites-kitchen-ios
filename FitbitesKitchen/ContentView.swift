@@ -10464,7 +10464,7 @@ private struct POSCheckoutSheet: View {
                             .font(GlacialFont.caption(.bold))
                             .tracking(1.6)
                             .foregroundStyle(AppPalette.ink)
-                        Text("Choose one Daily Go, Greek Yogurt with Fruit Coulis, or Protein Crepe")
+                        Text("Choose one Daily Go, Daily Classic, Greek Yogurt with Fruit Coulis, or Protein Crepe")
                             .font(GlacialFont.caption())
                             .foregroundStyle(AppPalette.muted)
 
@@ -10991,7 +10991,7 @@ private struct POSCheckoutSheet: View {
         let eligibleLines = eligibleRewardLines
         let rewardLineKey: String?
         if eligibleLines.isEmpty {
-            rewardRedemptionError = "Add one Daily Go, Greek Yogurt with Fruit Coulis, or Protein Crepe."
+            rewardRedemptionError = "Add one Daily Go, Daily Classic, Greek Yogurt with Fruit Coulis, or Protein Crepe."
             return
         } else if eligibleLines.count == 1 {
             rewardLineKey = eligibleLines[0].id
